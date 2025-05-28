@@ -1,18 +1,23 @@
-#-------ゲームのルール・判定ロジック-------
+# game/rules.py
 
-def compare_cards(card1, card2, revolution=False):
-    order = get_card_strength(card1, revolution)
-    return order - get_card_strength(card2, revolution)
+class RuleChecker:
+    def is_valid(self, current_field, card):
+        # 現在の場の最後のカードを取得
+        current_card = current_field[-1] if current_field else None
+        return self.is_valid_move(card, current_card)
 
-def get_card_strength(card, revolution):
-    if card.suit == "JOKER":
-        return 14 if not revolution else -1
-    base = card.rank if card.rank != 1 else 14  # A=14, 2=15
-    return 15 - base if revolution else base
+    def is_valid_move(self, card, current):
+        # 場にカードがない（リセットされている）場合は何でも出せる
+        if not current:
+            return True
 
-def is_valid_play(play, field_cards, revolution):
-    if not field_cards:
-        return True  # 場が空
-    if len(play) != len(field_cards):
-        return False
-    return all(compare_cards(p, f, revolution) > 0 for p, f in zip(play, field_cards))
+        # 出そうとしているカードがジョーカーなら必ず出せる
+        if card.is_joker:
+            return True
+
+        # 現在の場のカードがジョーカーなら、出せない
+        if current.is_joker:
+            return False
+
+        # 通常は、場のカードのランクより上でないと出せない
+        return card.rank > current.rank
