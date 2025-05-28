@@ -25,6 +25,7 @@ class Game:
         self.passed = [False] * self.num_players
         self.done = False
         self.last_player = None
+        self.rankings = []
         self._deal_cards()
 
         # ♠3を持っているプレイヤーを探して、その人にターンをセットし、場に♠3を出す
@@ -45,7 +46,7 @@ class Game:
 
         return self.get_state(self.turn)
 
-    # game.py または rules.py に追加（例）
+    
     def is_valid_play(self, card):
         """現在の場にこのカードが出せるかどうか"""
         if card is None:
@@ -96,17 +97,15 @@ class Game:
             self.last_player = self.turn
 
         # ゲーム終了条件：1人が上がる
-        if len(player.hand) == 0:
-            self.done = True
-            #return self.get_state(self.turn), 1.0, True  # 勝利したプレイヤーに報酬
-            if player_id not in self.rankings:
+        if len(self.players[player_id].hand) == 0 and player_id not in self.rankings:
                 self.rankings.append(player_id)
-            return self.get_state(self.turn), 1.0, True  # 勝利したプレイヤーに報酬
+            
 
         if len(self.rankings) == self.num_players - 1:
             last_player = [i for i in range(self.num_players) if i not in self.rankings][0]
             self.rankings.append(last_player)
             self.done = True
+            return self.get_state(self.turn), 1.0, True  # 勝利したプレイヤーに報酬
 
 
         # 場が流れる（全員パス）

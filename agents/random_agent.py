@@ -1,6 +1,6 @@
 #------ランダムな動作をするエージェント（デバッグ・学習比較用）------
 import random
-from game.environment import DaifugoEnvSimple
+#from game.environment import DaifugoEnvSimple
 
 class RandomAgent:
     def __init__(self, player_id):

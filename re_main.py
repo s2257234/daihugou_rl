@@ -19,8 +19,8 @@ if __name__ == "__main__":
         
         # ランダムに行動を選択（手札の中からランダムにカードを選ぶ）
         action = select_random_action(obs)
-        print("\n選択された行動:", action)
-
+        #print("\n選択された行動:", action)
+        print("\n")
         print("ターン数:", env.game.turn_count)
 
         # 選択した行動を実行し、次の状態・報酬・終了判定を取得
