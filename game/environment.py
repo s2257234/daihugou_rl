@@ -2,7 +2,6 @@ import random
 import numpy as np
 from game.game import Game
 
-
 class DaifugoSimpleEnv:
     def __init__(self, num_players=4):
         self.num_players = num_players
@@ -16,21 +15,45 @@ class DaifugoSimpleEnv:
         self.done = False
         return self._get_obs()
 
-    def step(self):
+    def step(self, return_info=False):
         player = self.game.players[self.game.turn]
+        hand = player.hand
 
-        # 出せるカードを探す（出せる最初のカードを選択）
-        action_card = None
-        for idx, card in enumerate(player.hand):
-            if self.game.is_valid_play(card):  # ルールに合うか確認
-                action_card = card
+        # 出せるカードセットを探す（最大3枚まで）
+        action_cards = None
+        for rank in range(1, 14):  # ランク1～13
+            same_rank_cards = [card for card in hand if not card.is_joker and card.rank == rank]
+            for count in range(3, 0, -1):  # 3枚, 2枚, 1枚の順にチェック
+                if len(same_rank_cards) >= count:
+                    candidate = same_rank_cards[:count]
+                    if self.game.is_valid_play(candidate):
+                        action_cards = candidate
+                        break
+            if action_cards:
                 break
 
-        # プレイ実行（出せるカードがなければ action_card=None → パス扱い）
-        valid, reward, _ = self.game.step(self.game.turn, action_card)
+        # ジョーカー単体を許可
+        if not action_cards:
+            jokers = [card for card in hand if card.is_joker]
+            if jokers and self.game.is_valid_play([jokers[0]]):
+                action_cards = [jokers[0]]
+
+        # 出せなければパス
+        if not action_cards:
+            action_cards = None
+
+        # プレイ実行（Noneならパス）
+        valid, reward, _ = self.game.step(self.game.turn, action_cards)
         self.done = self.game.done
         obs = self._get_obs()
-        return obs, reward, self.done
+
+        if return_info:
+            return obs, reward, self.done, {
+                "player_id": player.player_id,
+                "played_cards": action_cards
+            }
+        else:
+            return obs, reward, self.done
 
     def _encode_card(self, card):
         if card is None:

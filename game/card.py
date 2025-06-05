@@ -21,7 +21,14 @@ class Card:
         return f'{self.suit}{rank_str}'
 
     def __eq__(self, other):
-        # カード同士が同じかどうかを比較する（スート・ランク・ジョーカー属性が同じならTrue）
+        # --- ここからが修正箇所 ---
+        # 比較対象(other)がCardインスタンスでない場合は、Falseを返す
+        if not isinstance(other, Card):
+            return False
+        # --- 修正箇所ここまで ---
+
+        # 元の比較ロジック（スート・ランク・ジョーカー属性が同じならTrue）
+        # このロジックは、otherがCardインスタンスであればジョーカーも正しく扱えます
         return (
             self.suit == other.suit and
             self.rank == other.rank and

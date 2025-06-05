@@ -6,7 +6,7 @@ from .rules import RuleChecker
 class Game:
     def __init__(self, num_players=4):
         self.num_players = num_players
-        self.players = [Player(i) for i in range(num_players)]
+        self.players = [Player(player_id=i) for i in range(num_players)]
         self.deck = CardDeck()
         self.rule_checker = RuleChecker()
         self.current_field = []  # 場に出ているカード（最後に出されたカード）
@@ -46,13 +46,11 @@ class Game:
 
         return self.get_state(self.turn)
 
-    
-    def is_valid_play(self, card):
-        """現在の場にこのカードが出せるかどうか"""
-        if card is None:
+    def is_valid_play(self, cards):
+        """現在の場にこのカード群が出せるかどうか"""
+        if cards is None or len(cards) == 0:
             return True  # パスは常に有効
-        return self.rule_checker.is_valid(self.current_field, card)  # ルール判定
-
+        return self.rule_checker.is_valid(self.current_field, cards)  # ルール判定
 
     def _deal_cards(self):
         self.deck.shuffle()
@@ -68,73 +66,58 @@ class Game:
             'turn_count': self.turn_count,
         }
 
-    def step(self, player_id, action_card):
-        player = self.players[player_id]
+    def step(self, player_id, action_cards):
         player = self.players[self.turn]
         valid = False
 
-        if action_card is not None:
-            # 出そうとしたカードが手札にあるかチェック
-            for card in player.hand:
-                if str(card) == str(action_card):
-                    if self.rule_checker.is_valid_move(card, self.current_field[-1] if self.current_field else None):
-                        self.current_field = [card]
-                        player.hand.remove(card)
-                        self.passed = [False] * self.num_players
-                        valid = True
+        if action_cards:
+            # 出そうとしたカードがすべて手札にあるかチェック
+            card_objs = []
+            hand_card_strs = [str(c) for c in player.hand]
+            if all(str(card) in hand_card_strs for card in action_cards):
+                # 実際のCardオブジェクトを取得
+                card_objs = [next(c for c in player.hand if str(c) == str(card)) for card in action_cards]
 
-                        # ジョーカーを出したら場をリセット（流れる）＝次のターンへ
-                    if card.is_joker:
-                        self.just_played_card = card 
-                        self.field_was_reset = True   # 場が流れたかを記録
+                if self.rule_checker.is_valid_move(card_objs, self.current_field):
+                    self.current_field = card_objs[:]
+                    for card in card_objs:
+                        player.hand.remove(card)
+                    self.passed = [False] * self.num_players
+                    valid = True
+
+                    # ジョーカーが含まれていたら場を流す
+                    if any(card.is_joker for card in card_objs):
+                        self.field_was_reset = True
                         self.current_field = []
                         self.passed = [False] * self.num_players
-                    break
 
         if not valid:
             self.passed[self.turn] = True
         else:
             self.last_player = self.turn
 
-        # ゲーム終了条件：1人が上がる
-        if len(self.players[player_id].hand) == 0 and player_id not in self.rankings:
-                self.rankings.append(player_id)
-            
+        if len(player.hand) == 0 and player_id not in self.rankings:
+            self.rankings.append(player_id)
 
         if len(self.rankings) == self.num_players - 1:
             last_player = [i for i in range(self.num_players) if i not in self.rankings][0]
             self.rankings.append(last_player)
             self.done = True
-            return self.get_state(self.turn), 1.0, True  # 勝利したプレイヤーに報酬
+            return self.get_state(self.turn), 1.0, True
 
-
-        # 場が流れる（全員パス）
         if all(self.passed[i] or len(self.players[i].hand) == 0 for i in range(self.num_players)):
             self.current_field = []
             self.passed = [False] * self.num_players
-            if self.last_player is not None:
-                self.turn = self.last_player
-            else:
-                self.turn = (self.turn + 1) % self.num_players
-            self.turn_count += 1 
-        
-        # プレイヤーがカードを出したあとに手札が空なら勝ち抜け
-        if len(self.players[player_id].hand) == 0 and player_id not in self.rankings:
-            self.rankings.append(player_id)
+            self.turn = self.last_player if self.last_player is not None else (self.turn + 1) % self.num_players
+            self.turn_count += 1
 
-
-        # ターンを進める
         next_turn = (self.turn + 1) % self.num_players
         while len(self.players[next_turn].hand) == 0:
             next_turn = (next_turn + 1) % self.num_players
-            
 
-        # ターンが変わるときにカウント
         if next_turn != self.turn:
             self.turn_count += 1
-                    
+
         self.turn = next_turn
 
-        
-
-        return self.get_state(self.turn), 0.0, False  # 通常のステップ
+        return self.get_state(self.turn), 0.0, False
