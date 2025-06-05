@@ -13,15 +13,22 @@ def main():
         obs = env.reset()
         done = False
 
+        print(f"\n🃏 Episode {episode + 1} 開始")
+
         while not done:
-            obs, reward, done = env.step()
+            obs, reward, done, info = env.step(return_info=True)
+
+            # 出されたカード or パス を表示
+            if 'played_cards' in info:
+                if info['played_cards']:
+                    print(f"Player {info['player_id']} played: ", end="")
+                    print(", ".join(str(card) for card in info['played_cards']))
+                else:
+                    print(f"Player {info['player_id']} passed.")
 
         # ゲーム終了後の順位を取得して集計
         for rank, player_id in enumerate(env.game.rankings):
-            rank_stats[rank + 1][player_id] += 1  # 1位〜4位 の形式にする
-
-        if (episode + 1) % 100 == 0:
-            print(f"Episode {episode + 1} 完了")
+            rank_stats[rank + 1][player_id] += 1
 
     print(f"\n🎉 全 {NUM_EPISODES} エピソード終了！")
     print("\n📊 累計順位集計（プレイヤー別）:")
@@ -32,6 +39,6 @@ def main():
             count = rank_stats[rank].get(player_id, 0)
             print(f"{rank}位: {count}回 ", end="")
         print()  # 改行
-        
+
 if __name__ == "__main__":
     main()
