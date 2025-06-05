@@ -85,9 +85,17 @@ class Game:
                     self.passed = [False] * self.num_players
                     valid = True
 
-                    # ジョーカーが含まれていたら場を流す
+                    # 8切り判定
+                    if self.rule_checker.is_8cut(card_objs):
+                        print(f"8切り発動 by Player {self.turn}!")
+                        self.current_field = []  # 場を流す
+                        self.passed = [False] * self.num_players
+                        self.last_player = self.turn
+                        # ターン継続のためここで戻る（このプレイヤーがもう一度手番）
+                        return self.get_state(self.turn), 0.0, False
+
+                    # ジョーカーが含まれていたら場を流す（従来の処理）
                     if any(card.is_joker for card in card_objs):
-                        self.field_was_reset = True
                         self.current_field = []
                         self.passed = [False] * self.num_players
 
