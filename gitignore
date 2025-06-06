@@ -1,1 +1,8 @@
 __pycashe__/
+*.pyc
+
+# 環境管理
+.env
+.venv/
+env/
+venv/
