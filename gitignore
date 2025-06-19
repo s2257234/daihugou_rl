@@ -5,5 +5,5 @@ env/
 venv/
 
 # game, agents フォルダの __pycache__ ディレクトリを無視
-/game/__pycache__/
-/agents/__pycache__/
+**/__pycache__/**
+
