@@ -28,11 +28,15 @@ class RuleChecker:
                 return False
             if cards[0].suit != current_field[0].suit:
                 return False
-            # 革命時はmin、通常時はmaxで比較
+            # ジョーカーを補完した最大/最小ランクで比較
+            play_ranks = self.get_straight_ranks(cards)
+            field_ranks = self.get_straight_ranks(current_field)
+            if not play_ranks or not field_ranks:
+                return False
             if self.revolution:
-                return self.compare_strength(min(strengths), min(field_strengths))
+                return self.compare_strength(min(play_ranks), min(field_ranks))
             else:
-                return self.compare_strength(max(strengths), max(field_strengths))
+                return self.compare_strength(max(play_ranks), max(field_ranks))
 
         # 階段出し→通常出し、またはその逆は禁止
         if is_straight != field_is_straight:
@@ -80,18 +84,39 @@ class RuleChecker:
         return has_8 and has_normal
 
     def is_straight(self, cards):
-        """同じスートで連続したランクか判定"""
+        """
+        同じスートで連続したランクか判定（ジョーカーで間を埋めることも許可）
+        例: 4,ジョーカー,6 や Q,ジョーカー,A など
+        """
         if len(cards) < 3:
             return False
         suits = [card.suit for card in cards if not card.is_joker]
-        ranks = [card.rank for card in cards if not card.is_joker]
         if len(set(suits)) != 1:
             return False
-        ranks.sort()
-        for i in range(len(ranks) - 1):
-            if ranks[i+1] != ranks[i] + 1:
-                return False
-        return True
+        jokers = [c for c in cards if c.is_joker]
+        non_jokers = [c for c in cards if not c.is_joker]
+        ranks = sorted([c.rank for c in non_jokers])
+        num_jokers = len(jokers)
+        n = len(cards)
+        # ランクをループ（A,2,3...K,A,2...）として扱う
+        # 13→1→2のような連続も許可
+        # まず全ての開始点を試す
+        for start in range(1, 14):
+            expected = []
+            for i in range(n):
+                val = (start + i - 1) % 13 + 1
+                expected.append(val)
+            # expectedの中でnon_jokersのrankが何個一致するか
+            temp_ranks = ranks[:]
+            match = 0
+            for val in expected:
+                if val in temp_ranks:
+                    temp_ranks.remove(val)
+                    match += 1
+            # 残りはジョーカーで埋められるか
+            if n - match <= num_jokers:
+                return True
+        return False
 
     def check_revolution(self, cards):
         """
@@ -113,3 +138,32 @@ class RuleChecker:
         革命状態をリセット（場流し時など）
         """
         self.revolution = False
+
+    def get_straight_ranks(self, cards):
+        """
+        ジョーカーを補完した階段のランク列を返す（昇順）
+        例: 4,ジョーカー,6 → [4,5,6]
+        Q,ジョーカー,A → [12,13,1]
+        """
+        jokers = [c for c in cards if c.is_joker]
+        non_jokers = [c for c in cards if not c.is_joker]
+        n = len(cards)
+        if not non_jokers:
+            return []
+        ranks = sorted([c.rank for c in non_jokers])
+        num_jokers = len(jokers)
+        # 全ての開始点を試す
+        for start in range(1, 14):
+            expected = []
+            for i in range(n):
+                val = (start + i - 1) % 13 + 1
+                expected.append(val)
+            temp_ranks = ranks[:]
+            match = 0
+            for val in expected:
+                if val in temp_ranks:
+                    temp_ranks.remove(val)
+                    match += 1
+            if n - match <= num_jokers:
+                return expected
+        return ranks

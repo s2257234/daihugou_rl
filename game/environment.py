@@ -23,8 +23,8 @@ class DaifugoSimpleEnv:
 
         # 出せるカードセットを探す（最大4枚まで）
         action_cards = None
+        # 1. 同ランクセット（ペア・3枚・4枚）
         for rank in range(1, 14):  # ランク1～13
-            # 同じランクのカードを抽出
             same_rank_cards = [card for card in hand if not card.is_joker and card.rank == rank]
             for count in range(4, 0, -1):  #4枚 3枚, 2枚, 1枚の順にチェック
                 if len(same_rank_cards) >= count:
@@ -32,10 +32,51 @@ class DaifugoSimpleEnv:
                     if self.game.is_valid_play(candidate): #出せるか判定
                         action_cards = candidate
                         break
-
-            # 出せるカードが見つかったらループ終了
             if action_cards:
                 break
+
+        # 2. 階段（ストレート）セットも探索
+        if not action_cards:
+            # スートごとにカードを分ける
+            suit_map = {'♠': [], '♥': [], '♦': [], '♣': []}
+            for card in hand:
+                if not card.is_joker:
+                    suit_map[card.suit].append(card)
+            jokers = [card for card in hand if card.is_joker]
+            for suit, cards_in_suit in suit_map.items():
+                if len(cards_in_suit) + len(jokers) < 3:
+                    continue
+                ranks = sorted([c.rank for c in cards_in_suit])
+                n = len(cards_in_suit) + len(jokers)
+                for length in range(5, 2, -1):  # 5,4,3枚の階段
+                    for start in range(1, 15 - length):
+                        expected = [(start + i - 1) % 13 + 1 for i in range(length)]
+                        temp = []
+                        used_jokers = 0
+                        # コピーリストを作り、使ったカードはpopで消す
+                        available_cards = cards_in_suit[:]
+                        available_jokers = jokers[:]
+                        for val in expected:
+                            found = False
+                            for i, c in enumerate(available_cards):
+                                if c.rank == val:
+                                    temp.append(available_cards.pop(i))
+                                    found = True
+                                    break
+                            if not found:
+                                if used_jokers < len(available_jokers):
+                                    temp.append(available_jokers.pop(0))
+                                    used_jokers += 1
+                                else:
+                                    break
+                        if len(temp) == length:
+                            if self.game.is_valid_play(temp):
+                                action_cards = temp
+                                break
+                    if action_cards:
+                        break
+                if action_cards:
+                    break
 
         # ジョーカー単体を許可
         if not action_cards:
