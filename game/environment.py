@@ -21,12 +21,12 @@ class DaifugoSimpleEnv:
         player = self.game.players[self.game.turn]
         hand = player.hand
 
-        # 出せるカードセットを探す（最大3枚まで）
+        # 出せるカードセットを探す（最大4枚まで）
         action_cards = None
         for rank in range(1, 14):  # ランク1～13
             # 同じランクのカードを抽出
             same_rank_cards = [card for card in hand if not card.is_joker and card.rank == rank]
-            for count in range(3, 0, -1):  # 3枚, 2枚, 1枚の順にチェック
+            for count in range(4, 0, -1):  #4枚 3枚, 2枚, 1枚の順にチェック
                 if len(same_rank_cards) >= count:
                     candidate = same_rank_cards[:count]
                     if self.game.is_valid_play(candidate): #出せるか判定

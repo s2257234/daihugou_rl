@@ -31,6 +31,7 @@ class Game:
         self.last_player = None
         self.rankings = []
         self._deal_cards()
+        self.rule_checker.reset_revolution()  # 革命状態もリセット
 
         # ♠3を持っているプレイヤーを探して、その人にターンをセットし、場に♠3を出す
         spade_3 = None
@@ -98,6 +99,10 @@ class Game:
                     self.passed = [False] * self.num_players
                     valid = True
 
+                    # 革命判定
+                    if self.rule_checker.check_revolution(card_objs):
+                        print(f"革命発生! 現在の革命状態: {self.rule_checker.revolution}")
+
                     # 8切り判定：場を流して自分のターンを続ける
                     if self.rule_checker.is_8cut(card_objs):
                         print(f"8切り発動 by Player {self.turn}!")
@@ -111,6 +116,9 @@ class Game:
                     if any(card.is_joker for card in card_objs):
                         self.current_field = []
                         self.passed = [False] * self.num_players
+                        # self.rule_checker.reset_revolution()  # 革命リセットはしない
+                        # last_playerから新たに始める
+                        return self.get_state(self.last_player), 0.0, False
 
         if not valid:
             self.passed[self.turn] = True # パス状態にする
@@ -143,6 +151,8 @@ class Game:
             self.passed = [False] * self.num_players
             self.turn = self.last_player if self.last_player is not None else (self.turn + 1) % self.num_players
             self.turn_count += 1
+            # last_playerから新たに始める
+            return self.get_state(self.turn), 0.0, False
 
         # 次のプレイヤーにターンを渡す（上がっていたらスキップ）
         next_turn = (self.turn + 1) % self.num_players

@@ -28,7 +28,11 @@ class RuleChecker:
                 return False
             if cards[0].suit != current_field[0].suit:
                 return False
-            return self.compare_strength(max(strengths), max(field_strengths))
+            # 革命時はmin、通常時はmaxで比較
+            if self.revolution:
+                return self.compare_strength(min(strengths), min(field_strengths))
+            else:
+                return self.compare_strength(max(strengths), max(field_strengths))
 
         # 階段出し→通常出し、またはその逆は禁止
         if is_straight != field_is_straight:
@@ -42,12 +46,24 @@ class RuleChecker:
             return False
 
         # 強さ比較
-        field_strength = field_strengths[0] if field_strengths else -1
-        max_strength = max(strengths) if strengths else 0
-        return self.compare_strength(max_strength, field_strength)
+        if self.revolution:
+            field_strength = min(field_strengths) if field_strengths else -1
+            play_strength = min(strengths) if strengths else 0
+        else:
+            field_strength = field_strengths[0] if field_strengths else -1
+            play_strength = max(strengths) if strengths else 0
+        return self.compare_strength(play_strength, field_strength)
 
     def compare_strength(self, a, b):
-        """革命フラグに応じた強さ比較"""
+        """
+        革命フラグに応じた強さ比較。ただしジョーカーは常に最強
+        a, bはstrength値
+        """
+        JOKER_STRENGTH = 15
+        if a == JOKER_STRENGTH and b != JOKER_STRENGTH:
+            return True
+        if b == JOKER_STRENGTH and a != JOKER_STRENGTH:
+            return False
         return a < b if self.revolution else a > b
 
     def is_same_rank_or_joker(self, cards):
@@ -76,3 +92,24 @@ class RuleChecker:
             if ranks[i+1] != ranks[i] + 1:
                 return False
         return True
+
+    def check_revolution(self, cards):
+        """
+        革命発生条件を判定し、該当すればself.revolutionをTrueにする。
+        例: 同じランク4枚以上（ジョーカー含む場合は調整可）が出されたとき。
+        """
+        non_jokers = [c for c in cards if not c.is_joker]
+        if len(cards) >= 4:
+            # 4枚以上、かつ全て同じランク（ジョーカーは無視）
+            if len(non_jokers) > 0:
+                rank = non_jokers[0].rank
+                if all(c.rank == rank or c.is_joker for c in cards):
+                    self.revolution = not self.revolution  # 革命状態をトグル
+                    return True
+        return False
+
+    def reset_revolution(self):
+        """
+        革命状態をリセット（場流し時など）
+        """
+        self.revolution = False
