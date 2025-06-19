@@ -114,6 +114,15 @@ class Game:
 
         if not valid:
             self.passed[self.turn] = True # パス状態にする
+            # 自分以外全員がパスしていて、かつ自分が最後にカードを出した場合
+            others_passed = all(self.passed[i] or len(self.players[i].hand) == 0 for i in range(self.num_players) if i != self.turn)
+            if self.last_player == self.turn and others_passed:
+                # 場をリセットし、パス状態もリセット、自分のターンを継続
+                self.current_field = []
+                self.passed = [False] * self.num_players
+                # ターンカウントを進める（必要なら）
+                self.turn_count += 1
+                return self.get_state(self.turn), 0.0, False
         else:
             self.last_player = self.turn # 最後にカードを出したプレイヤーを更新
         
