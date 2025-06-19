@@ -1,8 +1,9 @@
-__pycashe__/
-*.pyc
-
 # 環境管理
 .env
 .venv/
 env/
 venv/
+
+# game, agents フォルダの __pycache__ ディレクトリを無視
+/game/__pycache__/
+/agents/__pycache__/
