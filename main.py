@@ -1,10 +1,15 @@
 from game.environment import DaifugoSimpleEnv
 from collections import defaultdict
+from agents.straight_agent import StraightAgent
+from agents.random_agent import RandomAgent
+from agents.rule_based_agent import RuleBasedAgent
 
 NUM_EPISODES = 10  # シミュレーションするゲームの回数
 
 def main():
-    env = DaifugoSimpleEnv(num_players=4)  # プレイヤー数4人で環境を初期化
+    # エージェントのクラスを指定
+    agent_classes = [StraightAgent, RandomAgent, RuleBasedAgent, StraightAgent]
+    env = DaifugoSimpleEnv(num_players=4, agent_classes=agent_classes)  # プレイヤー数4人で環境を初期化
 
     # 順位の集計用: {順位（1〜4）: {player_id: カウント数}}
     rank_stats = defaultdict(lambda: defaultdict(int))
@@ -29,6 +34,9 @@ def main():
                 else:
                     # パスした場合の表示
                     print(f"Player {info['player_id']} passed.")
+            # 場リセット発生時の表示
+            if info.get('reset_happened'):
+                print("--- 場がリセットされました ---")
 
         # ゲーム終了後：順位を取得して集計
         for rank, player_id in enumerate(env.game.rankings):

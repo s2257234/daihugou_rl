@@ -1,7 +1,0 @@
-# venvディレクトリを除外
-venv/
-
-# game, agents フォルダの __pycache__ ディレクトリを無視
-**/__pycache__/
-
-
