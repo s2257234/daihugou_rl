@@ -75,50 +75,42 @@ class Game:
         }
 
     def step(self, player_id, action_cards):
+        """
+        1ターン進める。action_cards: 出すカードリスト or None（パス）
+        戻り値: (状態, 報酬, 終了フラグ, 場リセットフラグ)
+        """
         player = self.players[self.turn]
         valid = False
-        next_turn = None
         reset_happened = False  # 場リセットフラグ
-        # 場が空ならパス判定をスキップ（新しいターンの最初の行動）
+
+        # --- 場が空（リセット直後 or ゲーム開始直後） ---
         if not self.current_field:
+            # カードを出す場合
             if action_cards:
-                card_objs = []
-                hand_card_strs = [str(c) for c in player.hand]
-                if all(str(card) in hand_card_strs for card in action_cards):
-                    card_objs = [next(c for c in player.hand if str(c) == str(card)) for card in action_cards]
-                    if self.rule_checker.is_valid_move(card_objs, self.current_field):
-                        if self.rule_checker.is_straight(card_objs):
-                            print(f"Player {self.turn} が階段を出しました: {[str(c) for c in card_objs]}")
-                        self.current_field = card_objs[:]
-                        for card in card_objs:
-                            for h in player.hand:
-                                if h == card:
-                                    player.hand.remove(h)
-                                    break
-                        self.passed = [False] * self.num_players
-                        valid = True
-                        if self.rule_checker.check_revolution(card_objs):
-                            print(f"革命発生! 現在の革命状態: {self.rule_checker.revolution}")
-                        if self.rule_checker.is_8cut(card_objs):
-                            print(f"8切り発動 by Player {self.turn}!")
-                            self.current_field = []
-                            self.passed = [False] * self.num_players
-                            self.last_player = self.turn
-                            self.turn_count += 1
-                            return self.get_state(self.turn), 0.0, False, True
-                        elif any(card.is_joker for card in card_objs):
-                            self.current_field = []
-                            self.passed = [False] * self.num_players
-                            self.turn_count += 1
-                            next_turn = (self.turn + 1) % self.num_players
-                            while len(self.players[next_turn].hand) == 0:
-                                next_turn = (next_turn + 1) % self.num_players
-                            self.turn = next_turn
-                            return self.get_state(self.turn), 0.0, False, True
-                        else:
-                            self.last_player = self.turn
+                card_objs = self._find_hand_cards(player, action_cards)
+                if card_objs and self.rule_checker.is_valid_move(card_objs, self.current_field):
+                    self._play_cards(player, card_objs)
+                    valid = True
+                    # 革命・8切り・階段等の特殊処理
+                    if self.rule_checker.check_revolution(card_objs):
+                        print(f"革命発生! 現在の革命状態: {self.rule_checker.revolution}")
+                    if self.rule_checker.is_straight(card_objs):
+                        print(f"Player {self.turn} が階段を出しました: {[str(c) for c in card_objs]}")
+                    if self.rule_checker.is_8cut(card_objs):
+                        print(f"8切り発動 by Player {self.turn}!")
+                        self._reset_field()
+                        reset_happened = True
+                        return self.get_state(self.turn), 0.0, False, reset_happened
+                    if any(card.is_joker for card in card_objs):
+                        self._reset_field()
+                        reset_happened = True
+                        self._advance_turn()
+                        return self.get_state(self.turn), 0.0, False, reset_happened
+                    self.last_player = self.turn
+            # カードを出さない（パス or ルール違反）
             if not valid:
-                action_cards = None  # ルール違反はパス扱い
+                action_cards = None
+            # 上がり判定
             if len(player.hand) == 0 and player_id not in self.rankings:
                 self.rankings.append(player_id)
             if len(self.rankings) == self.num_players - 1:
@@ -126,62 +118,46 @@ class Game:
                 self.rankings.append(last_player)
                 self.done = True
                 return self.get_state(self.turn), 1.0, True, False
-            next_turn = (self.turn + 1) % self.num_players
-            while len(self.players[next_turn].hand) == 0:
-                next_turn = (next_turn + 1) % self.num_players
-            if next_turn != self.turn:
-                self.turn_count += 1
-            self.turn = next_turn
+            # 次のプレイヤーへ
+            self._advance_turn()
             return self.get_state(self.turn), 0.0, False, False
+
+        # --- 場が空でない（通常ターン） ---
         if action_cards:
-            card_objs = []
-            hand_card_strs = [str(c) for c in player.hand]
-            if all(str(card) in hand_card_strs for card in action_cards):
-                card_objs = [next(c for c in player.hand if str(c) == str(card)) for card in action_cards]
-                if self.rule_checker.is_valid_move(card_objs, self.current_field):
-                    if self.rule_checker.is_straight(card_objs):
-                        print(f"Player {self.turn} が階段を出しました: {[str(c) for c in card_objs]}")
-                    self.current_field = card_objs[:]
-                    for card in card_objs:
-                        for h in player.hand:
-                            if h == card:
-                                player.hand.remove(h)
-                                break
-                    self.passed = [False] * self.num_players
-                    valid = True
-                    if self.rule_checker.check_revolution(card_objs):
-                        print(f"革命発生! 現在の革命状態: {self.rule_checker.revolution}")
-                    if self.rule_checker.is_8cut(card_objs):
-                        print(f"8切り発動 by Player {self.turn}!")
-                        self.current_field = []
-                        self.passed = [False] * self.num_players
-                        self.last_player = self.turn
-                        self.turn_count += 1
-                        return self.get_state(self.turn), 0.0, False, True
-                    if any(card.is_joker for card in card_objs):
-                        self.current_field = []
-                        self.passed = [False] * self.num_players
-                        self.turn_count += 1
-                        next_turn = (self.turn + 1) % self.num_players
-                        while len(self.players[next_turn].hand) == 0:
-                            next_turn = (next_turn + 1) % self.num_players
-                        self.turn = next_turn
-                        return self.get_state(self.turn), 0.0, False, True
-                    self.last_player = self.turn
+            card_objs = self._find_hand_cards(player, action_cards)
+            if card_objs and self.rule_checker.is_valid_move(card_objs, self.current_field):
+                self._play_cards(player, card_objs)
+                valid = True
+                # 革命・8切り・階段等の特殊処理
+                if self.rule_checker.check_revolution(card_objs):
+                    print(f"革命発生! 現在の革命状態: {self.rule_checker.revolution}")
+                if self.rule_checker.is_straight(card_objs):
+                    print(f"Player {self.turn} が階段を出しました: {[str(c) for c in card_objs]}")
+                if self.rule_checker.is_8cut(card_objs):
+                    print(f"8切り発動 by Player {self.turn}!")
+                    self._reset_field()
+                    reset_happened = True
+                    return self.get_state(self.turn), 0.0, False, reset_happened
+                if any(card.is_joker for card in card_objs):
+                    self._reset_field()
+                    reset_happened = True
+                    self._advance_turn()
+                    return self.get_state(self.turn), 0.0, False, reset_happened
+                self.last_player = self.turn
+        # パス or ルール違反
         if not valid:
-            action_cards = None  # ルール違反はパス扱い
+            action_cards = None
             self.passed[self.turn] = True
+            # 全員パス or 最後に出した人以外全員パス → 場リセット
             others_passed = all(self.passed[i] or len(self.players[i].hand) == 0 for i in range(self.num_players) if i != self.turn)
             if self.last_player == self.turn and others_passed:
-                self.current_field = []
-                self.passed = [False] * self.num_players
-                self.turn_count += 1
-                print("--- 場がリセットされました ---")
+                self._reset_field()
                 reset_happened = True
                 self.turn = self.last_player
                 return self.get_state(self.turn), 0.0, False, reset_happened
         else:
             self.last_player = self.turn
+        # 上がり判定
         if len(player.hand) == 0 and player_id not in self.rankings:
             self.rankings.append(player_id)
         if len(self.rankings) == self.num_players - 1:
@@ -189,18 +165,48 @@ class Game:
             self.rankings.append(last_player)
             self.done = True
             return self.get_state(self.turn), 1.0, True, False
+        # 全員パス or 全員上がりで場リセット
         if all(self.passed[i] or len(self.players[i].hand) == 0 for i in range(self.num_players)):
-            self.current_field = []
-            self.passed = [False] * self.num_players
-            self.turn_count += 1
-            print("--- 場がリセットされました ---")
+            self._reset_field()
             reset_happened = True
             self.turn = self.last_player
             return self.get_state(self.turn), 0.0, False, reset_happened
+        # 次のプレイヤーへ
+        self._advance_turn()
+        return self.get_state(self.turn), 0.0, False, False
+
+    # --- 補助メソッド ---
+    def _find_hand_cards(self, player, action_cards):
+        """手札からaction_cardsに該当するCardオブジェクトリストを返す"""
+        hand_card_strs = [str(c) for c in player.hand]
+        if all(str(card) in hand_card_strs for card in action_cards):
+            return [next(c for c in player.hand if str(c) == str(card)) for card in action_cards]
+        return None
+
+    def _play_cards(self, player, card_objs):
+        """カードを場に出し、手札から削除し、場の状態を更新"""
+        self.current_field = card_objs[:]
+        for card in card_objs:
+            for h in player.hand:
+                if h == card:
+                    player.hand.remove(h)
+                    break
+        self.passed = [False] * self.num_players
+
+    def _reset_field(self):
+        """場をリセットし、パス情報もリセット"""
+        self.current_field = []
+        self.passed = [False] * self.num_players
+        self.turn_count += 1
+        if self.last_player is not None:
+            self.turn = self.last_player  # 場リセット時に最後に出したプレイヤーから再開
+        print("--- 場がリセットされました ---")
+
+    def _advance_turn(self):
+        """次のプレイヤーにターンを進める（手札がない場合はスキップ）"""
         next_turn = (self.turn + 1) % self.num_players
         while len(self.players[next_turn].hand) == 0:
             next_turn = (next_turn + 1) % self.num_players
         if next_turn != self.turn:
             self.turn_count += 1
         self.turn = next_turn
-        return self.get_state(self.turn), 0.0, False, False
