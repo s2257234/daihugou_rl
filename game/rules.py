@@ -119,45 +119,44 @@ class RuleChecker:
         """
         同じスートで連続したランクか判定（ジョーカーで間を埋めることも許可）
         例: 4,ジョーカー,6 や Q,ジョーカー,A など
+        ただし2が末尾以外に来る階段（A,2,3や2,3,4等）は不可。K,A,2のみOK。
+        ジョーカー補完後も厳密に判定。
         """
         if len(cards) < 3:
             return False
         jokers = [card for card in cards if card.is_joker]
         non_jokers = [card for card in cards if not card.is_joker]
-        ranks = sorted([card.rank for card in non_jokers])
-        num_jokers = len(jokers)
         n = len(cards)
-        # スート候補を全て試す（non_jokersが空なら全スートを候補に）
         suit_candidates = set([card.suit for card in non_jokers]) if non_jokers else set(['♠', '♥', '♦', '♣'])
         for suit in suit_candidates:
-            # このスートで階段が作れるか
-            # ランクをループ（A,2,3...K,A,2...）として扱う
+            # 手札のランクリスト
+            hand_ranks = [card.rank for card in non_jokers if card.suit == suit]
             for start in range(1, 14):
-                expected = []
-                for i in range(n):
-                    val = (start + i - 1) % 13 + 1
-                    expected.append(val)
+                expected = [(start + i - 1) % 13 + 1 for i in range(n)]
                 # 2が含まれる場合は2が末尾でなければ不可
                 if 2 in expected and expected[-1] != 2:
                     continue
-                temp_ranks = ranks[:]
-                match = 0
+                temp_ranks = hand_ranks[:]
                 used_jokers = []
+                jokers_left = jokers[:]
+                match = 0
                 for idx, val in enumerate(expected):
-                    if idx < len(cards) and not cards[idx].is_joker and cards[idx].suit != suit:
-                        break  # スートが違うカードが混じっている
                     if val in temp_ranks:
                         temp_ranks.remove(val)
                         match += 1
                     else:
-                        used_jokers.append((idx, val))
-                # 残りはジョーカーで埋められるか
-                if n - match <= num_jokers:
-                    # ジョーカーの仮想ランク・スートをセット
-                    for j, (idx, val) in enumerate(used_jokers):
-                        if j < len(jokers):
-                            jokers[j].joker_as_rank = val
-                            jokers[j].joker_as_suit = suit
+                        if jokers_left:
+                            # ジョーカーをこのランク・スートに割り当て
+                            joker = jokers_left.pop(0)
+                            joker.joker_as_rank = val
+                            joker.joker_as_suit = suit
+                            used_jokers.append(joker)
+                        else:
+                            break
+                if match + len(used_jokers) == n:
+                    # 2が末尾以外に来る場合は不可
+                    if 2 in expected and expected[-1] != 2:
+                        continue
                     return True
         # 失敗時はリセット
         for joker in jokers:
@@ -165,20 +164,68 @@ class RuleChecker:
             joker.joker_as_suit = None
         return False
 
+    def get_straight_ranks(self, cards):
+        """
+        ジョーカーを補完した階段のランク列を返す（昇順）
+        例: 4,ジョーカー,6 → [4,5,6]
+        Q,ジョーカー,A → [12,13,1]
+        ただし2が末尾以外に来る階段（A,2,3や2,3,4等）は不可。K,A,2のみOK。
+        ジョーカー補完後も厳密に判定。
+        """
+        jokers = [c for c in cards if c.is_joker]
+        non_jokers = [c for c in cards if not c.is_joker]
+        n = len(cards)
+        if not non_jokers:
+            return []
+        suit_candidates = set([c.suit for c in non_jokers]) if non_jokers else set(['♠', '♥', '♦', '♣'])
+        for suit in suit_candidates:
+            hand_ranks = [c.rank for c in non_jokers if c.suit == suit]
+            for start in range(1, 14):
+                expected = [(start + i - 1) % 13 + 1 for i in range(n)]
+                if 2 in expected and expected[-1] != 2:
+                    continue
+                temp_ranks = hand_ranks[:]
+                used_jokers = []
+                jokers_left = jokers[:]
+                match = 0
+                for idx, val in enumerate(expected):
+                    if val in temp_ranks:
+                        temp_ranks.remove(val)
+                        match += 1
+                    else:
+                        if jokers_left:
+                            joker = jokers_left.pop(0)
+                            joker.joker_as_rank = val
+                            joker.joker_as_suit = suit
+                            used_jokers.append(joker)
+                        else:
+                            break
+                if match + len(used_jokers) == n:
+                    if 2 in expected and expected[-1] != 2:
+                        continue
+                    return expected
+        for joker in jokers:
+            joker.joker_as_rank = None
+            joker.joker_as_suit = None
+        return []
+
     def check_revolution(self, cards):
         """
-        現在は4枚のペア出しのみで革命発生
         革命発生条件を判定し、該当すればself.revolutionをTrueにする。
-        例: 同じランク4枚以上（ジョーカー含む場合は調整可）が出されたとき。
+        例: 同じランク4枚以上（ジョーカー含む場合は調整可）、または5枚以上の階段
         """
         non_jokers = [c for c in cards if not c.is_joker]
+        # 4枚以上、かつ全て同じランク（ジョーカーは無視）
         if len(cards) >= 4:
-            # 4枚以上、かつ全て同じランク（ジョーカーは無視）
             if len(non_jokers) > 0:
                 rank = non_jokers[0].rank
                 if all(c.rank == rank or c.is_joker for c in cards):
                     self.revolution = not self.revolution  # 革命状態をトグル
                     return True
+        # 5枚以上の階段
+        if len(cards) >= 5 and self.is_straight(cards):
+            self.revolution = not self.revolution
+            return True
         return False
 
     def reset_revolution(self):
@@ -186,48 +233,3 @@ class RuleChecker:
         革命状態をリセット（場流し時など）
         """
         self.revolution = False
-
-    def get_straight_ranks(self, cards):
-        """
-        ジョーカーを補完した階段のランク列を返す（昇順）
-        例: 4,ジョーカー,6 → [4,5,6]
-        Q,ジョーカー,A → [12,13,1]
-        """
-        jokers = [c for c in cards if c.is_joker]
-        non_jokers = [c for c in cards if not c.is_joker]
-        n = len(cards)
-        if not non_jokers:
-            return []
-        ranks = sorted([c.rank for c in non_jokers])
-        num_jokers = len(jokers)
-        suit_candidates = set([c.suit for c in non_jokers]) if non_jokers else set(['♠', '♥', '♦', '♣'])
-        for suit in suit_candidates:
-            for start in range(1, 14):
-                expected = []
-                for i in range(n):
-                    val = (start + i - 1) % 13 + 1
-                    expected.append(val)
-                # 2が含まれる場合は2が末尾でなければ不可
-                if 2 in expected and expected[-1] != 2:
-                    continue
-                temp_ranks = ranks[:]
-                match = 0
-                used_jokers = []
-                for idx, val in enumerate(expected):
-                    if idx < len(cards) and not cards[idx].is_joker and cards[idx].suit != suit:
-                        break
-                    if val in temp_ranks:
-                        temp_ranks.remove(val)
-                        match += 1
-                    else:
-                        used_jokers.append((idx, val))
-                if n - match <= num_jokers:
-                    for j, (idx, val) in enumerate(used_jokers):
-                        if j < len(jokers):
-                            jokers[j].joker_as_rank = val
-                            jokers[j].joker_as_suit = suit
-                    return expected
-        for joker in jokers:
-            joker.joker_as_rank = None
-            joker.joker_as_suit = None
-        return ranks
