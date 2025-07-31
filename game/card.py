@@ -37,13 +37,27 @@ class Card:
                     return 14
                 else:
                     return self.joker_as_rank - 2
-            return 15  # Jokerは最強
+            return 15  # Joker単体は最強
         elif self.rank == 1:  # A
             return 13
         elif self.rank == 2:
             return 14
         else:
             return self.rank - 2  # 3→1, 4→2, ..., K→12
+
+    def set_joker_substitute(self, rank, suit):
+        """
+        ジョーカーを特定のランク・スートの代用として使う場合にセットする
+        """
+        self.joker_as_rank = rank
+        self.joker_as_suit = suit
+
+    def reset_joker_substitute(self):
+        """
+        ジョーカーの代用情報をリセット（手札に戻す場合など）
+        """
+        self.joker_as_rank = None
+        self.joker_as_suit = None
 
     def __lt__(self, other):
         # カードの強さに基づいて比較
