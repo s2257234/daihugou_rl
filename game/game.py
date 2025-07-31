@@ -23,17 +23,25 @@ class Game:
 
     def reset(self):
         """ゲームを初期状態にリセットする"""
+        # まず手札をリセット
+        for player in self.players:
+            player.hand = []
         self.current_field = []
         self.turn = 0
         self.turn_count = 0
         self.passed = [False] * self.num_players
         self.done = False
         self.last_player = None
+        # 前回の順位情報を一時保存
+        prev_rankings = self.rankings[:] if hasattr(self, 'rankings') else []
         self.rankings = []
-        self._deal_cards()
+        self._deal_cards()  # 新しい手札を配る
         self.rule_checker.reset_revolution()  # 革命状態もリセット
+        # 新しい手札が配られた後にカード交換を実施
+        if prev_rankings and len(prev_rankings) == self.num_players:
+            self.rule_checker.exchange_cards_by_rankings(self.players, prev_rankings)
 
-        # ♠3を持っているプレイヤーを探して、その人にターンをセットし、場に♠3を出す
+        # ♢3を持っているプレイヤーを探して、その人にターンをセットし、場に♢3を出す
         diamond_3 = None
         for i, player in enumerate(self.players):
             for card in player.hand:
@@ -45,8 +53,8 @@ class Game:
                 break
 
         if diamond_3:
-            self.current_field = [diamond_3]  # ♠3を場に出す
-            self.players[self.turn].hand.remove(diamond_3)  # 手札から♠3を削除
+            self.current_field = [diamond_3]  # ♢3を場に出す
+            self.players[self.turn].hand.remove(diamond_3)  # 手札から♢3を削除
             self.last_player = self.turn  # 最後にカードを出したプレイヤーをセット
 
         return self.get_state(self.turn)  # 最初の状態を返す

@@ -19,8 +19,8 @@ class DaifugoSimpleEnv:
         self.agents = [agent_classes[i](player_id=i) for i in range(num_players)]
 
     def reset(self):
-        # ゲームをリセット
-        self.game = Game(num_players=self.num_players)
+        # ゲームをリセット（インスタンスは使い回し、rankingsを維持）
+        self.game.reset()
         self.current_player = self.game.turn
         self.done = False
         return self._get_obs()

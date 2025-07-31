@@ -233,3 +233,49 @@ class RuleChecker:
         革命状態をリセット（場流し時など）
         """
         self.revolution = False
+
+    def exchange_cards_by_rankings(self, players, rankings):
+        """
+        大富豪ルールの順位に応じたカード交換を行う。
+        players: プレイヤーオブジェクトのリスト
+        rankings: [1位, 2位, ..., n位]のplayer_idリスト（0-indexed, 1位=大富豪, 最下位=大貧民）
+        デバッグ用に誰がどのカードをもらったかをprint出力
+        """
+        n = len(rankings)
+        if n < 4:
+            return  # 順位が確定していない場合は何もしない
+
+        daifugo = rankings[0]
+        fugo = rankings[1]
+        hinmin = rankings[-2]
+        dai_hinmin = rankings[-1]
+
+        # --- 大貧民→大富豪（2枚） ---　自分の最も強いカードを2枚渡す。
+        dai_hinmin_hand = sorted(players[dai_hinmin].hand, key=lambda c: c.strength(), reverse=True)
+        dai_hinmin_give = dai_hinmin_hand[:2]
+        for card in dai_hinmin_give:
+            players[dai_hinmin].hand.remove(card)
+        players[daifugo].hand.extend(dai_hinmin_give)
+        print(f"大貧民(Player {dai_hinmin})→大富豪(Player {daifugo}): {[str(c) for c in dai_hinmin_give]}")
+
+        # --- 大富豪→大貧民（2枚） ---　自分の最も弱いカードを2枚渡す。
+        daifugo_hand = sorted(players[daifugo].hand, key=lambda c: c.strength())
+        daifugo_give = daifugo_hand[:2]
+        for card in daifugo_give:
+            players[daifugo].hand.remove(card)
+        players[dai_hinmin].hand.extend(daifugo_give)
+        print(f"大富豪(Player {daifugo})→大貧民(Player {dai_hinmin}): {[str(c) for c in daifugo_give]}")
+
+        # --- 貧民→富豪（1枚） ---　自分の最も強いカードを1枚渡す。
+        hinmin_hand = sorted(players[hinmin].hand, key=lambda c: c.strength(), reverse=True)
+        hinmin_give = hinmin_hand[0]
+        players[hinmin].hand.remove(hinmin_give)
+        players[fugo].hand.append(hinmin_give)
+        print(f"貧民(Player {hinmin})→富豪(Player {fugo}): {hinmin_give}")
+
+        # --- 富豪→貧民（1枚） ---　自分の最も弱いカードを1枚渡す。
+        fugo_hand = sorted(players[fugo].hand, key=lambda c: c.strength())
+        fugo_give = fugo_hand[0]
+        players[fugo].hand.remove(fugo_give)
+        players[hinmin].hand.append(fugo_give)
+        print(f"富豪(Player {fugo})→貧民(Player {hinmin}): {fugo_give}")
