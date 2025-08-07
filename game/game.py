@@ -41,22 +41,19 @@ class Game:
         if prev_rankings and len(prev_rankings) == self.num_players:
             self.rule_checker.exchange_cards_by_rankings(self.players, prev_rankings)
 
-        # ♢3を持っているプレイヤーを探して、その人にターンをセットし、場に♢3を出す
-        diamond_3 = None
+        # ゲーム開始時はダイヤの3を持つ人が最初の権利を持つ（必ずしもダイヤの3を出す必要はない）
+        diamond3_player = None
         for i, player in enumerate(self.players):
             for card in player.hand:
                 if card.suit == '♢' and card.rank == 3:
-                    diamond_3 = card
-                    self.turn = i
+                    diamond3_player = i
                     break
-            if diamond_3:
+            if diamond3_player is not None:
                 break
 
-        if diamond_3:
-            self.current_field = [diamond_3]  # ♢3を場に出す
-            self.players[self.turn].hand.remove(diamond_3)  # 手札から♢3を削除
-            self.last_player = self.turn  # 最後にカードを出したプレイヤーをセット
-
+        if diamond3_player is not None:
+            self.turn = diamond3_player
+        # 場は空のまま、ダイヤ3を持つ人から自由に1枚出しでスタート
         return self.get_state(self.turn)  # 最初の状態を返す
 
     def is_valid_play(self, cards):
@@ -93,31 +90,39 @@ class Game:
 
         # --- 場が空（リセット直後 or ゲーム開始直後） ---
         if not self.current_field:
-            # カードを出す場合
+            # 直前のプレイヤーがいない（=最初の1ターン目）のときだけ自由に出せる
+            is_first_turn = self.turn_count == 0 and self.last_player is None
+
             if action_cards:
                 card_objs = self._find_hand_cards(player, action_cards)
-                if card_objs and self.rule_checker.is_valid_move(card_objs, self.current_field):
-                    self._play_cards(player, card_objs)
-                    valid = True
-                    # 革命・8切り・階段等の特殊処理
-                    if self.rule_checker.check_revolution(card_objs):
-                        print(f"革命発生! 現在の革命状態: {self.rule_checker.revolution}")
-                    if self.rule_checker.is_straight(card_objs):
-                        print(f"Player {self.turn} が階段を出しました: {[str(c) for c in card_objs]}")
-                    if self.rule_checker.is_8cut(card_objs):
-                        print(f"8切り発動 by Player {self.turn}!")
-                        self._reset_field()
-                        reset_happened = True
-                        return self.get_state(self.turn), 0.0, False, reset_happened
-                    if any(card.is_joker for card in card_objs):
-                        self._reset_field()
-                        reset_happened = True
-                        self._advance_turn()
-                        return self.get_state(self.turn), 0.0, False, reset_happened
-                    self.last_player = self.turn
-            # カードを出さない（パス or ルール違反）
+                if card_objs:
+                    # 最初の出し手はなんでも出せる、それ以外は current_field が空でも形はチェックする
+                    if is_first_turn or self.rule_checker.is_valid_move(card_objs, self.current_field):
+                        self._play_cards(player, card_objs)
+                        valid = True
+                        self.last_player = self.turn
+
+                        # 革命・8切り・階段等の特殊処理
+                        if self.rule_checker.check_revolution(card_objs):
+                            print(f"革命発生! 現在の革命状態: {self.rule_checker.revolution}")
+                        if self.rule_checker.is_straight(card_objs):
+                            print(f"Player {self.turn} が階段を出しました: {[str(c) for c in card_objs]}")
+                        if self.rule_checker.is_8cut(card_objs):
+                            print(f"8切り発動 by Player {self.turn}!")
+                            self.last_player = self.turn
+                            self._reset_field()
+                            reset_happened = True
+                            return self.get_state(self.turn), 0.0, False, reset_happened
+                        if any(card.is_joker for card in card_objs):
+                            self.last_player = self.turn
+                            self._reset_field()
+                            reset_happened = True
+                            return self.get_state(self.turn), 0.0, False, reset_happened
+
             if not valid:
                 action_cards = None
+                self.passed[self.turn] = True
+
             # 上がり判定
             if len(player.hand) == 0 and player_id not in self.rankings:
                 self.rankings.append(player_id)
@@ -126,14 +131,21 @@ class Game:
                 self.rankings.append(last_player)
                 self.done = True
                 return self.get_state(self.turn), 1.0, True, False
-            # 次のプレイヤーへ
+
+            # リセット直後は再度 same player に戻る
+            if reset_happened:
+                return self.get_state(self.turn), 0.0, False, True
+
             self._advance_turn()
             return self.get_state(self.turn), 0.0, False, False
 
         # --- 場が空でない（通常ターン） ---
         if action_cards:
             card_objs = self._find_hand_cards(player, action_cards)
-            if card_objs and self.rule_checker.is_valid_move(card_objs, self.current_field):
+            # 場の枚数と同じ枚数でなければ必ず無効
+            if not card_objs or len(card_objs) != len(self.current_field):
+                valid = False
+            elif self.rule_checker.is_valid_move(card_objs, self.current_field):
                 self._play_cards(player, card_objs)
                 valid = True
                 # 革命・8切り・階段等の特殊処理
@@ -143,13 +155,14 @@ class Game:
                     print(f"Player {self.turn} が階段を出しました: {[str(c) for c in card_objs]}")
                 if self.rule_checker.is_8cut(card_objs):
                     print(f"8切り発動 by Player {self.turn}!")
+                    self.last_player = self.turn
                     self._reset_field()
                     reset_happened = True
                     return self.get_state(self.turn), 0.0, False, reset_happened
                 if any(card.is_joker for card in card_objs):
+                    self.last_player = self.turn
                     self._reset_field()
                     reset_happened = True
-                    self._advance_turn()
                     return self.get_state(self.turn), 0.0, False, reset_happened
                 self.last_player = self.turn
         # パス or ルール違反
@@ -206,8 +219,9 @@ class Game:
         self.current_field = []
         self.passed = [False] * self.num_players
         self.turn_count += 1
+        # 場リセット時は必ず最後に出したプレイヤーから再開
         if self.last_player is not None:
-            self.turn = self.last_player  # 場リセット時に最後に出したプレイヤーから再開
+            self.turn = self.last_player
         print("--- 場がリセットされました ---")
 
     def _advance_turn(self):
