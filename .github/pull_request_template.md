@@ -1,0 +1,26 @@
+<!-- I want to review in Japanese. -->
+
+## 概要
+このプルリクエストの目的・背景を簡潔に記載してください。
+
+## 変更内容
+- 主な変更点や追加・修正内容を箇条書きで記載してください。
+
+## 動作確認
+- 動作確認手順や確認した内容を記載してください。
+
+## 補足
+その他、レビュワーに伝えたいことや注意点があれば記載してください。
+
+<!-- for GitHub Copilot review rule -->
+<!--
+レビューする際には、以下のprefix(接頭辞)をつけてください
+[must]  
+[imo] (in my opinion)  
+[nits](nitpick) 
+[ask]  
+[fyi]
+-->
+<!-- for GitHub Copilot review  rule-->
+
+<!-- I want to review in Japanese. -->
