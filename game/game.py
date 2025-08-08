@@ -7,6 +7,11 @@ from .rules import RuleChecker
 # 大富豪のゲーム本体クラス
 # -----------------------------
 class Game:
+    def _all_others_passed(self):
+        """
+        現在のターン以外の全員がパスまたは上がっているか判定
+        """
+        return all(self.passed[i] or len(self.players[i].hand) == 0 for i in range(self.num_players) if i != self.turn)
     def __init__(self, num_players=4):
         self.num_players = num_players
         self.players = [Player(player_id=i) for i in range(num_players)]
@@ -91,7 +96,6 @@ class Game:
         戻り値: (状態, 報酬, 終了フラグ, 場リセットフラグ)
         """
         player = self.players[self.turn]
-        reset_happened = False
         # 場が空
         if not self.current_field:
             return self._handle_action(player_id, player, action_cards, empty_field=True)
@@ -117,7 +121,7 @@ class Game:
         card_objs = self._find_hand_cards(player, action_cards) if action_cards else None
 
         # 出すカードの検証・ルール判定
-        if card_objs:
+        if card_objs is not None and len(card_objs) > 0:
             if empty_field:
                 valid = is_first_turn or self.rule_checker.is_valid_move(card_objs, self.current_field)
             else:
@@ -135,11 +139,12 @@ class Game:
             self.passed[self.turn] = True
             # 全員パス or 最後に出した人以外全員パス → 場リセット
             if not empty_field:
-                others_passed = all(self.passed[i] or len(self.players[i].hand) == 0 for i in range(self.num_players) if i != self.turn)
-                if self.last_player == self.turn and others_passed:
+                if self.last_player == self.turn and self._all_others_passed():
                     self._reset_field()
                     reset_happened = True
-                    self.turn = self.last_player
+                    # 場リセット時のみlast_playerから再開
+                    if self.last_player is not None:
+                        self.turn = self.last_player
                     return self.get_state(self.turn), 0.0, False, reset_happened
 
         # 上がり判定
@@ -147,10 +152,11 @@ class Game:
             return self.get_state(self.turn), 1.0, True, False
 
         # 全員パス or 全員上がりで場リセット
-        if not empty_field and all(self.passed[i] or len(self.players[i].hand) == 0 for i in range(self.num_players)):
+        if not empty_field and self._all_others_passed():
             self._reset_field()
             reset_happened = True
-            self.turn = self.last_player
+            if self.last_player is not None:
+                self.turn = self.last_player
             return self.get_state(self.turn), 0.0, False, reset_happened
 
         # リセット直後は再度 same player に戻る
