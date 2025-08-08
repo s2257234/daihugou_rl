@@ -21,6 +21,17 @@ class Game:
         self.rankings = []  # 上がった順に記録するリスト
         self._deal_cards()  # カードを配る
 
+    def _all_others_passed(self):
+        """
+        最後に出したプレイヤー以外が全員パスまたは上がりならTrue
+        """
+        if self.last_player is None:
+            return False
+        return all(
+            self.passed[i] or len(self.players[i].hand) == 0
+            for i in range(self.num_players) if i != self.last_player
+        )
+
     def reset(self):
         """ゲームを初期状態にリセットする"""
         # まず手札をリセット
@@ -169,9 +180,8 @@ class Game:
         if not valid:
             action_cards = None
             self.passed[self.turn] = True
-            # 全員パス or 最後に出した人以外全員パス → 場リセット
-            others_passed = all(self.passed[i] or len(self.players[i].hand) == 0 for i in range(self.num_players) if i != self.turn)
-            if self.last_player == self.turn and others_passed:
+            # 最後に出したプレイヤー以外が全員パス → 場リセット
+            if self._all_others_passed():
                 self._reset_field()
                 reset_happened = True
                 self.turn = self.last_player
