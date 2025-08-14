@@ -74,7 +74,7 @@ class RuleChecker:
             field_strength = min(field_strengths) if field_strengths else -1
             play_strength = min(strengths) if strengths else 0
         else:
-            field_strength = field_strengths[0] if field_strengths else -1
+            field_strength = max(field_strengths) if field_strengths else -1
             play_strength = max(strengths) if strengths else 0
         return self.compare_strength(play_strength, field_strength)
 

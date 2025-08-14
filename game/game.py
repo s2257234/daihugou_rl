@@ -7,11 +7,7 @@ from .rules import RuleChecker
 # 大富豪のゲーム本体クラス
 # -----------------------------
 class Game:
-    def _all_others_passed(self):
-        """
-        現在のターン以外の全員がパスまたは上がっているか判定
-        """
-        return all(self.passed[i] or len(self.players[i].hand) == 0 for i in range(self.num_players) if i != self.turn)
+    
     def __init__(self, num_players=4):
         self.num_players = num_players
         self.players = [Player(player_id=i) for i in range(num_players)]
@@ -191,12 +187,12 @@ class Game:
             self.log(f"8切り発動 by Player {self.turn}!")
             self.last_player = self.turn
             self._reset_field()
-            return True, (self.get_state(self.turn), True, True)
+            return True, (self.get_state(self.turn), False, True)
         # ジョーカー流し
         if any(card.is_joker for card in card_objs):
             self.last_player = self.turn
             self._reset_field()
-            return True, (self.get_state(self.turn), True, True)
+            return True, (self.get_state(self.turn), False, True)
         return False, None
 
     def _check_agari(self, player, player_id):
@@ -222,13 +218,19 @@ class Game:
         return None
 
     def _play_cards(self, player, card_objs):
-        """カードを場に出し、手札から削除し、場の状態を更新"""
+        """カードを場に出し、手札から削除し、場の状態を更新（str(card)一致で削除）"""
         self.current_field = card_objs[:]
+        # 手札のカードをstr一致で削除（同じカードが複数ある場合も1枚ずつ）
         for card in card_objs:
-            for h in player.hand:
-                if h == card:
-                    player.hand.remove(h)
+            found = False
+            for i, h in enumerate(player.hand):
+                if str(h) == str(card):
+                    del player.hand[i]
+                    found = True
                     break
+            if not found:
+                # デバッグ用: 一致しない場合は警告
+                self.log(f"[WARNING] 手札からカードが見つかりません: {str(card)}")
         self.passed = [False] * self.num_players
 
     def _reset_field(self):

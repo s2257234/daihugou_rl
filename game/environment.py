@@ -195,7 +195,6 @@ class DaifugoSimpleEnv:
             'hand': hand,
             'field': field
         }
-        # 場の役種を判定
         rule_checker = self.game.rule_checker
         is_field_straight = rule_checker.is_straight(field) if field else False
         is_field_pair = False
@@ -203,7 +202,6 @@ class DaifugoSimpleEnv:
             non_jokers = [c for c in field if not c.is_joker]
             if non_jokers and all(c.rank == non_jokers[0].rank or c.is_joker for c in field):
                 is_field_pair = True if len(field) >= 2 else False
-        # legal_actionsから場の役種に合わせてフィルタ
         filtered_actions = []
         if is_field_straight:
             for action in legal_actions:
@@ -213,7 +211,12 @@ class DaifugoSimpleEnv:
                 filtered_actions = [None]
         elif is_field_pair:
             for action in legal_actions:
-                if action is not None and rule_checker.is_same_rank_or_joker(action) and len(action) == len(field):
+                if (
+                    action is not None
+                    and rule_checker.is_same_rank_or_joker(action)
+                    and len(action) == len(field)
+                    and rule_checker.is_valid_move(action, field)
+                ):
                     filtered_actions.append(action)
             if not filtered_actions:
                 filtered_actions = [None]
@@ -224,15 +227,19 @@ class DaifugoSimpleEnv:
         # プレイ実行（Noneならパス）
         obs_, done, reset_happened = self.game.step(current_player_id, action_cards)
         self.done = self.game.done
+        # プレイ後の最新の場を取得
+        new_field = self.game.current_field[:]
+        # legal_actions/filtered_actionsを再生成（次のプレイヤーのための状態管理用）
+        # obsも再取得
         obs = self._get_obs()
         # 報酬設計（例: 上がりで+1, それ以外0）
         reward = self._calc_reward(player, done, reset_happened)
         if return_info:
-            # プレイヤーIDと出したカードの情報も返す
             return obs, reward, self.done, {
                 "player_id": player.player_id,
                 "played_cards": action_cards,
-                "reset_happened": reset_happened
+                "reset_happened": reset_happened,
+                "field_after_play": [str(c) for c in new_field]
             }
         else:
             return obs, reward, self.done
