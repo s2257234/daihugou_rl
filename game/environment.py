@@ -5,6 +5,7 @@ from agents.straight_agent import StraightAgent
 from game.card import Card
 
 
+
 class DaifugoSimpleEnv:
     def __init__(self, num_players=4, agent_classes=None):
         self.num_players = num_players   #プレイヤーの人数設定
@@ -15,6 +16,22 @@ class DaifugoSimpleEnv:
         if agent_classes is None:
             agent_classes = [StraightAgent] * num_players
         self.agents = [agent_classes[i](player_id=i) for i in range(num_players)]
+
+    def get_final_rewards(self):
+        """
+        エピソード終了時点で全プレイヤーの最終報酬を返す。
+        1位: +1.0, それ以外: -1.0
+        Returns:
+            dict: {player_id: reward, ...}
+        """
+        rewards = {pid: 0.0 for pid in range(self.num_players)}
+        if hasattr(self.game, "rankings") and self.game.rankings:
+            for i, pid in enumerate(self.game.rankings):
+                if i == 0:
+                    rewards[pid] = 1.0
+                else:
+                    rewards[pid] = -1.0
+        return rewards
 
     def _is_pair(self, cards):
         """
@@ -178,7 +195,6 @@ class DaifugoSimpleEnv:
             'hand': hand,
             'field': field
         }
-        # 場の役種を判定
         rule_checker = self.game.rule_checker
         is_field_straight = rule_checker.is_straight(field) if field else False
         is_field_pair = False
@@ -186,7 +202,6 @@ class DaifugoSimpleEnv:
             non_jokers = [c for c in field if not c.is_joker]
             if non_jokers and all(c.rank == non_jokers[0].rank or c.is_joker for c in field):
                 is_field_pair = True if len(field) >= 2 else False
-        # legal_actionsから場の役種に合わせてフィルタ
         filtered_actions = []
         if is_field_straight:
             for action in legal_actions:
@@ -196,7 +211,12 @@ class DaifugoSimpleEnv:
                 filtered_actions = [None]
         elif is_field_pair:
             for action in legal_actions:
-                if action is not None and rule_checker.is_same_rank_or_joker(action) and len(action) == len(field):
+                if (
+                    action is not None
+                    and rule_checker.is_same_rank_or_joker(action)
+                    and len(action) == len(field)
+                    and rule_checker.is_valid_move(action, field)
+                ):
                     filtered_actions.append(action)
             if not filtered_actions:
                 filtered_actions = [None]
@@ -205,18 +225,37 @@ class DaifugoSimpleEnv:
         action_cards = self.agents[current_player_id].select_action(obs, legal_actions=filtered_actions)
         # --- ここまで ---
         # プレイ実行（Noneならパス）
-        obs_, reward, done, reset_happened = self.game.step(current_player_id, action_cards)
+        obs_, done, reset_happened = self.game.step(current_player_id, action_cards)
         self.done = self.game.done
+        # プレイ後の最新の場を取得
+        new_field = self.game.current_field[:]
+        # legal_actions/filtered_actionsを再生成（次のプレイヤーのための状態管理用）
+        # obsも再取得
         obs = self._get_obs()
+        # 報酬設計（例: 上がりで+1, それ以外0）
+        reward = self._calc_reward(player, done, reset_happened)
         if return_info:
-            # プレイヤーIDと出したカードの情報も返す
             return obs, reward, self.done, {
                 "player_id": player.player_id,
                 "played_cards": action_cards,
-                "reset_happened": reset_happened
+                "reset_happened": reset_happened,
+                "field_after_play": [str(c) for c in new_field]
             }
         else:
             return obs, reward, self.done
+
+    def _calc_reward(self, player, done, reset_happened):
+        """
+        1位（最初に上がったプレイヤー）のみ+1.0、
+        それ以外の順位で上がった場合は-1.0、
+        途中経過は0.0
+        """
+        if done and player.player_id in self.game.rankings:
+            if self.game.rankings[0] == player.player_id:
+                return 1.0
+            else:
+                return -1.0
+        return 0.0
 
     # カード情報を数値に変換
     def _encode_card(self, card):

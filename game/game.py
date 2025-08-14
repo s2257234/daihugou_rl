@@ -7,11 +7,7 @@ from .rules import RuleChecker
 # 大富豪のゲーム本体クラス
 # -----------------------------
 class Game:
-    def _all_others_passed(self):
-        """
-        現在のターン以外の全員がパスまたは上がっているか判定
-        """
-        return all(self.passed[i] or len(self.players[i].hand) == 0 for i in range(self.num_players) if i != self.turn)
+    
     def __init__(self, num_players=4):
         self.num_players = num_players
         self.players = [Player(player_id=i) for i in range(num_players)]
@@ -104,7 +100,7 @@ class Game:
     def step(self, player_id, action_cards):
         """
         1ターン進める。action_cards: 出すカードリスト or None（パス）
-        戻り値: (状態, 報酬, 終了フラグ, 場リセットフラグ)
+        戻り値: (状態, 終了フラグ, 場リセットフラグ)
         """
         player = self.players[self.turn]
         # 場が空
@@ -153,12 +149,12 @@ class Game:
                 self._reset_field()
                 reset_happened = True
                 self.turn = self.last_player
-                return self.get_state(self.turn), 0.0, False, reset_happened
+                return self.get_state(self.turn), False, reset_happened
         if valid:
             self.last_player = self.turn
         # 上がり判定
         if self._check_agari(player, player_id):
-            return self.get_state(self.turn), 1.0, True, False
+            return self.get_state(self.turn), True, False
 
         # 全員パス or 全員上がりで場リセット
         if not empty_field and self._all_others_passed():
@@ -166,14 +162,14 @@ class Game:
             reset_happened = True
             if self.last_player is not None:
                 self.turn = self.last_player
-            return self.get_state(self.turn), 0.0, False, reset_happened
+            return self.get_state(self.turn), False, reset_happened
 
         # リセット直後は再度 same player に戻る
         if reset_happened:
-            return self.get_state(self.turn), 0.0, False, True
+            return self.get_state(self.turn), False, True
 
         self._advance_turn()
-        return self.get_state(self.turn), 0.0, False, False
+        return self.get_state(self.turn), False, False
 
     def _handle_special_rules(self, card_objs):
         """
@@ -191,12 +187,12 @@ class Game:
             self.log(f"8切り発動 by Player {self.turn}!")
             self.last_player = self.turn
             self._reset_field()
-            return True, (self.get_state(self.turn), 0.0, False, True)
+            return True, (self.get_state(self.turn), False, True)
         # ジョーカー流し
         if any(card.is_joker for card in card_objs):
             self.last_player = self.turn
             self._reset_field()
-            return True, (self.get_state(self.turn), 0.0, False, True)
+            return True, (self.get_state(self.turn), False, True)
         return False, None
 
     def _check_agari(self, player, player_id):
@@ -222,13 +218,19 @@ class Game:
         return None
 
     def _play_cards(self, player, card_objs):
-        """カードを場に出し、手札から削除し、場の状態を更新"""
+        """カードを場に出し、手札から削除し、場の状態を更新（str(card)一致で削除）"""
         self.current_field = card_objs[:]
+        # 手札のカードをstr一致で削除（同じカードが複数ある場合も1枚ずつ）
         for card in card_objs:
-            for h in player.hand:
-                if h == card:
-                    player.hand.remove(h)
+            found = False
+            for i, h in enumerate(player.hand):
+                if str(h) == str(card):
+                    del player.hand[i]
+                    found = True
                     break
+            if not found:
+                # デバッグ用: 一致しない場合は警告
+                self.log(f"[WARNING] 手札からカードが見つかりません: {str(card)}")
         self.passed = [False] * self.num_players
 
     def _reset_field(self):
