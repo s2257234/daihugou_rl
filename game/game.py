@@ -104,7 +104,7 @@ class Game:
     def step(self, player_id, action_cards):
         """
         1ターン進める。action_cards: 出すカードリスト or None（パス）
-        戻り値: (状態, 報酬, 終了フラグ, 場リセットフラグ)
+        戻り値: (状態, 終了フラグ, 場リセットフラグ)
         """
         player = self.players[self.turn]
         # 場が空
@@ -153,12 +153,12 @@ class Game:
                 self._reset_field()
                 reset_happened = True
                 self.turn = self.last_player
-                return self.get_state(self.turn), 0.0, False, reset_happened
+                return self.get_state(self.turn), False, reset_happened
         if valid:
             self.last_player = self.turn
         # 上がり判定
         if self._check_agari(player, player_id):
-            return self.get_state(self.turn), 1.0, True, False
+            return self.get_state(self.turn), True, False
 
         # 全員パス or 全員上がりで場リセット
         if not empty_field and self._all_others_passed():
@@ -166,14 +166,14 @@ class Game:
             reset_happened = True
             if self.last_player is not None:
                 self.turn = self.last_player
-            return self.get_state(self.turn), 0.0, False, reset_happened
+            return self.get_state(self.turn), False, reset_happened
 
         # リセット直後は再度 same player に戻る
         if reset_happened:
-            return self.get_state(self.turn), 0.0, False, True
+            return self.get_state(self.turn), False, True
 
         self._advance_turn()
-        return self.get_state(self.turn), 0.0, False, False
+        return self.get_state(self.turn), False, False
 
     def _handle_special_rules(self, card_objs):
         """
@@ -191,12 +191,12 @@ class Game:
             self.log(f"8切り発動 by Player {self.turn}!")
             self.last_player = self.turn
             self._reset_field()
-            return True, (self.get_state(self.turn), 0.0, False, True)
+            return True, (self.get_state(self.turn), True, True)
         # ジョーカー流し
         if any(card.is_joker for card in card_objs):
             self.last_player = self.turn
             self._reset_field()
-            return True, (self.get_state(self.turn), 0.0, False, True)
+            return True, (self.get_state(self.turn), True, True)
         return False, None
 
     def _check_agari(self, player, player_id):

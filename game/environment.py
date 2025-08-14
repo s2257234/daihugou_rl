@@ -5,6 +5,7 @@ from agents.straight_agent import StraightAgent
 from game.card import Card
 
 
+
 class DaifugoSimpleEnv:
     def __init__(self, num_players=4, agent_classes=None):
         self.num_players = num_players   #プレイヤーの人数設定
@@ -15,6 +16,22 @@ class DaifugoSimpleEnv:
         if agent_classes is None:
             agent_classes = [StraightAgent] * num_players
         self.agents = [agent_classes[i](player_id=i) for i in range(num_players)]
+
+    def get_final_rewards(self):
+        """
+        エピソード終了時点で全プレイヤーの最終報酬を返す。
+        1位: +1.0, それ以外: -1.0
+        Returns:
+            dict: {player_id: reward, ...}
+        """
+        rewards = {pid: 0.0 for pid in range(self.num_players)}
+        if hasattr(self.game, "rankings") and self.game.rankings:
+            for i, pid in enumerate(self.game.rankings):
+                if i == 0:
+                    rewards[pid] = 1.0
+                else:
+                    rewards[pid] = -1.0
+        return rewards
 
     def _is_pair(self, cards):
         """
@@ -205,9 +222,11 @@ class DaifugoSimpleEnv:
         action_cards = self.agents[current_player_id].select_action(obs, legal_actions=filtered_actions)
         # --- ここまで ---
         # プレイ実行（Noneならパス）
-        obs_, reward, done, reset_happened = self.game.step(current_player_id, action_cards)
+        obs_, done, reset_happened = self.game.step(current_player_id, action_cards)
         self.done = self.game.done
         obs = self._get_obs()
+        # 報酬設計（例: 上がりで+1, それ以外0）
+        reward = self._calc_reward(player, done, reset_happened)
         if return_info:
             # プレイヤーIDと出したカードの情報も返す
             return obs, reward, self.done, {
@@ -217,6 +236,19 @@ class DaifugoSimpleEnv:
             }
         else:
             return obs, reward, self.done
+
+    def _calc_reward(self, player, done, reset_happened):
+        """
+        1位（最初に上がったプレイヤー）のみ+1.0、
+        それ以外の順位で上がった場合は-1.0、
+        途中経過は0.0
+        """
+        if done and player.player_id in self.game.rankings:
+            if self.game.rankings[0] == player.player_id:
+                return 1.0
+            else:
+                return -1.0
+        return 0.0
 
     # カード情報を数値に変換
     def _encode_card(self, card):
