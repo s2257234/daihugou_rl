@@ -20,6 +20,8 @@ class DaifugoSimpleEnv:
         # 区間履歴バッファ
         self.stage_history = []  # 各区間のstep履歴（dictのリスト）
         self.already_won_players = set()  # 区間開始時点ですでに上がっていたプレイヤー
+        self.stage_id = 0  # 区間ID
+        self.turn_idx = 0  # ゲーム全体の手番番号
 
     def _is_pair(self, cards):
         """
@@ -125,6 +127,8 @@ class DaifugoSimpleEnv:
         self.done = False
         self.stage_history = []
         self.already_won_players = set()
+        self.stage_id = 0
+        self.turn_idx = 0
         return self._get_obs()
 
     def _generate_legal_actions(self, hand, field):
@@ -223,14 +227,60 @@ class DaifugoSimpleEnv:
         # obsも再取得
         obs = self._get_obs()
 
-        # --- 区間履歴に追加 ---
+        # --- 各手番のレコード生成 ---
+        # 各相手の残り枚数
+        others_hand_counts = [len(self.game.players[i].hand) for i in range(self.num_players)]
+        # 革命フラグ
+        is_revolution = getattr(self.game.rule_checker, 'revolution', False)
+        # 場の役種
+        field_type = 'empty'
+        if field:
+            if rule_checker.is_straight(field):
+                field_type = 'straight'
+            elif len(field) >= 2 and all((c.rank == field[0].rank or c.is_joker) for c in field):
+                field_type = 'pair'
+            else:
+                field_type = 'single'
+        # 合法手（カード集合のリスト）
+        legal_actions_list = [[str(c) for c in action] if action is not None else None for action in legal_actions]
+        # 選択行動（カード集合のリスト）
+        action_taken = [str(c) for c in action_cards] if action_cards is not None else None
+        # 区間開始時点のremaining_players, already_won
+        remaining_players = [i for i in range(self.num_players) if i not in self.already_won_players]
+        already_won = set(self.already_won_players)
+        # 区間内の手番番号
+        step_idx_in_stage = len(self.stage_history)
+        # レコード生成
         step_record = {
+            'game_id': None,  # ゲーム識別子（後で付与）
+            'stage_id': self.stage_id,
+            'turn_idx': self.turn_idx,
+            'step_idx_in_stage': step_idx_in_stage,
             'player_id': current_player_id,
-            'state': obs,  # 状態（必要に応じて変更可）
-            'action': action_cards,
-            'reward': None  # 後で一括付与
+            'remaining_players': remaining_players,
+            'already_won': already_won,
+            'obs': {
+                'hand': [str(c) for c in hand],
+                'field': [str(c) for c in field],
+                'revolution': is_revolution,
+                'others_hand_counts': others_hand_counts,
+                'field_type': field_type
+            },
+            'legal_actions': legal_actions_list,
+            'legal_actions_mask': None,  # MCTS未実装なのでNone
+            'policy_target': None,  # MCTS未実装なのでNone
+            'action_taken': action_taken,
+            'value_target': None,  # 後で一括付与
+            'value_weight': None,  # 後で一括付与
+            'is_terminal_in_stage': False,  # 後で一括付与
+            'stage_winner': None,  # 後で一括付与
+            'mcts_root_value': None,  # MCTS未実装なのでNone
+            'mcts_visits': None,  # MCTS未実装なのでNone
+            'exploration_meta': None,  # MCTS未実装なのでNone
+            'reason_tag': None  # 後で一括付与
         }
         self.stage_history.append(step_record)
+        self.turn_idx += 1
 
         # --- 誰かが上がったら区間の全履歴に一括で報酬付与 ---
         reward = 0.0
@@ -238,14 +288,15 @@ class DaifugoSimpleEnv:
         if new_winners:
             winner_id = new_winners[0]
             self.assign_stage_rewards(self.stage_history, winner_id, self.already_won_players)
-            # このstepのrewardを履歴から取得
-            reward = self.stage_history[-1]['reward']
+            # このstepのvalue_targetを履歴から取得
+            reward = self.stage_history[-1]['value_target']
             # デバッグ出力
             print(f"[DEBUG] 区間終了: winner={winner_id}, already_won={self.already_won_players}")
             for i, step in enumerate(self.stage_history):
-                print(f"  [DEBUG] step{i}: player={step['player_id']} reward={step['reward']}")
+                print(f"  [DEBUG] step{i}: player={step['player_id']} value_target={step['value_target']} value_weight={step['value_weight']} reason_tag={step['reason_tag']}")
             # 区間終了後、履歴をリセットし、すでに上がった人を更新
             self.already_won_players.update(new_winners)
+            self.stage_id += 1
             self.stage_history = []
         else:
             # 誰も上がっていなければrewardは0.0
@@ -264,18 +315,23 @@ class DaifugoSimpleEnv:
     def assign_stage_rewards(self, stage_history, winner_id, already_won_players):
         """
         区間内の全ステップに対して、次に上がった人だけ1.0、それ以外の残っていた人は0.0、既に上がっていた人は評価外(None)を付与
-        stage_history: 区間中のdictリスト（player_id, state, action, reward, ...）
-        winner_id: この区間で最初に上がったプレイヤーのID
-        already_won_players: 区間開始時点ですでに上がっていたプレイヤーの集合
+        value_weight, reason_tag, is_terminal_in_stage, stage_winnerも付与
         """
-        for step in stage_history:
+        n = len(stage_history)
+        for i, step in enumerate(stage_history):
             pid = step['player_id']
             if pid == winner_id:
-                step['reward'] = 1.0
+                step['value_target'] = 1.0
+                step['reason_tag'] = 'winner_in_stage'
             elif pid not in already_won_players:
-                step['reward'] = 0.0
+                step['value_target'] = 0.0
+                step['reason_tag'] = 'not_winner'
             else:
-                step['reward'] = None  # 評価外
+                step['value_target'] = None  # 評価外
+                step['reason_tag'] = 'already_won'
+            step['value_weight'] = 1.0 / n if n > 0 else 1.0
+            step['stage_winner'] = winner_id
+            step['is_terminal_in_stage'] = (i == n - 1)
 
     # カード情報を数値に変換
     def _encode_card(self, card):
