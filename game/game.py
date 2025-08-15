@@ -188,8 +188,8 @@ class Game:
             self.last_player = self.turn
             self._reset_field()
             return True, (self.get_state(self.turn), False, True)
-        # ジョーカー流し
-        if any(card.is_joker for card in card_objs):
+        # ジョーカー流し（ジョーカー1枚出しのみ）
+        if len(card_objs) == 1 and card_objs[0].is_joker:
             self.last_player = self.turn
             self._reset_field()
             return True, (self.get_state(self.turn), False, True)
