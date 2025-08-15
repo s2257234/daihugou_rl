@@ -1,8 +1,16 @@
-<!-- このプルリクエストの内容を日本語で記載してください。 -->
-## 概要
+<!-- I want to review in Japanese. -->
+## 内容
+xxxの改修をしました。
 
-## 変更内容
+<!-- for GitHub Copilot review rule -->
+<!--
+レビューする際には、以下のprefix(接頭辞)をつけてください
+[must]  
+[imo] (in my opinion)  
+[nits](nitpick) 
+[ask]  
+[fyi]
+-->
+<!-- for GitHub Copilot review  rule-->
 
-## 動作確認
-
-## その他
+<!-- I want to review in Japanese. -->
