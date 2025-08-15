@@ -1,3 +1,8 @@
-<!-- I want to review in Japanese. -->
+<!-- このプルリクエストの内容を日本語で記載してください。 -->
+## 概要
 
-<!-- I want to review in Japanese. -->
+## 変更内容
+
+## 動作確認
+
+## その他
