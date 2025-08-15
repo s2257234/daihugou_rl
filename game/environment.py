@@ -7,6 +7,7 @@ from game.card import Card
 
 
 class DaifugoSimpleEnv:
+
     def __init__(self, num_players=4, agent_classes=None):
         self.num_players = num_players   #プレイヤーの人数設定
         self.game = Game(num_players=self.num_players)  # Game クラスのインスタンス生成
@@ -16,22 +17,9 @@ class DaifugoSimpleEnv:
         if agent_classes is None:
             agent_classes = [StraightAgent] * num_players
         self.agents = [agent_classes[i](player_id=i) for i in range(num_players)]
-
-    def get_final_rewards(self):
-        """
-        エピソード終了時点で全プレイヤーの最終報酬を返す。
-        1位: +1.0, それ以外: -1.0
-        Returns:
-            dict: {player_id: reward, ...}
-        """
-        rewards = {pid: 0.0 for pid in range(self.num_players)}
-        if hasattr(self.game, "rankings") and self.game.rankings:
-            for i, pid in enumerate(self.game.rankings):
-                if i == 0:
-                    rewards[pid] = 1.0
-                else:
-                    rewards[pid] = -1.0
-        return rewards
+        # 区間履歴バッファ
+        self.stage_history = []  # 各区間のstep履歴（dictのリスト）
+        self.already_won_players = set()  # 区間開始時点ですでに上がっていたプレイヤー
 
     def _is_pair(self, cards):
         """
@@ -135,6 +123,8 @@ class DaifugoSimpleEnv:
         self.game.reset()
         self.current_player = self.game.turn
         self.done = False
+        self.stage_history = []
+        self.already_won_players = set()
         return self._get_obs()
 
     def _generate_legal_actions(self, hand, field):
@@ -232,8 +222,35 @@ class DaifugoSimpleEnv:
         # legal_actions/filtered_actionsを再生成（次のプレイヤーのための状態管理用）
         # obsも再取得
         obs = self._get_obs()
-        # 報酬設計（例: 上がりで+1, それ以外0）
-        reward = self._calc_reward(player, done, reset_happened)
+
+        # --- 区間履歴に追加 ---
+        step_record = {
+            'player_id': current_player_id,
+            'state': obs,  # 状態（必要に応じて変更可）
+            'action': action_cards,
+            'reward': None  # 後で一括付与
+        }
+        self.stage_history.append(step_record)
+
+        # --- 誰かが上がったら区間の全履歴に一括で報酬付与 ---
+        reward = 0.0
+        new_winners = [pid for pid in self.game.rankings if pid not in self.already_won_players]
+        if new_winners:
+            winner_id = new_winners[0]
+            self.assign_stage_rewards(self.stage_history, winner_id, self.already_won_players)
+            # このstepのrewardを履歴から取得
+            reward = self.stage_history[-1]['reward']
+            # デバッグ出力
+            print(f"[DEBUG] 区間終了: winner={winner_id}, already_won={self.already_won_players}")
+            for i, step in enumerate(self.stage_history):
+                print(f"  [DEBUG] step{i}: player={step['player_id']} reward={step['reward']}")
+            # 区間終了後、履歴をリセットし、すでに上がった人を更新
+            self.already_won_players.update(new_winners)
+            self.stage_history = []
+        else:
+            # 誰も上がっていなければrewardは0.0
+            reward = 0.0
+
         if return_info:
             return obs, reward, self.done, {
                 "player_id": player.player_id,
@@ -244,18 +261,21 @@ class DaifugoSimpleEnv:
         else:
             return obs, reward, self.done
 
-    def _calc_reward(self, player, done, reset_happened):
+    def assign_stage_rewards(self, stage_history, winner_id, already_won_players):
         """
-        1位（最初に上がったプレイヤー）のみ+1.0、
-        それ以外の順位で上がった場合は-1.0、
-        途中経過は0.0
+        区間内の全ステップに対して、次に上がった人だけ1.0、それ以外の残っていた人は0.0、既に上がっていた人は評価外(None)を付与
+        stage_history: 区間中のdictリスト（player_id, state, action, reward, ...）
+        winner_id: この区間で最初に上がったプレイヤーのID
+        already_won_players: 区間開始時点ですでに上がっていたプレイヤーの集合
         """
-        if done and player.player_id in self.game.rankings:
-            if self.game.rankings[0] == player.player_id:
-                return 1.0
+        for step in stage_history:
+            pid = step['player_id']
+            if pid == winner_id:
+                step['reward'] = 1.0
+            elif pid not in already_won_players:
+                step['reward'] = 0.0
             else:
-                return -1.0
-        return 0.0
+                step['reward'] = None  # 評価外
 
     # カード情報を数値に変換
     def _encode_card(self, card):

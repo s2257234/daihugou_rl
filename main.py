@@ -8,7 +8,7 @@ NUM_EPISODES = 10  # シミュレーションするゲームの回数
 
 def main():
     # エージェントのクラスを指定
-    agent_classes = [RandomAgent, RandomAgent, RuleBasedAgent, StraightAgent]
+    agent_classes = [RandomAgent, RandomAgent, RuleBasedAgent, RuleBasedAgent]
     env = DaifugoSimpleEnv(num_players=4, agent_classes=agent_classes)  # プレイヤー数4人で環境を初期化
 
     # 順位の集計用: {順位（1〜4）: {player_id: カウント数}}
