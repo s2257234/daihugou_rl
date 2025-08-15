@@ -69,6 +69,17 @@ class RuleChecker:
         if play_count != field_count:
             return False
 
+        # --- 2のペア＋ジョーカーの特殊判定 ---
+        # 場が2,ジョーカー(2)のペアなら、何も上書きできない
+        if (
+            play_count == 2 and field_count == 2
+            and self.is_same_rank_or_joker(current_field)
+            and any(card.is_joker for card in current_field)
+            and all((card.rank == 2 or card.is_joker) for card in current_field)
+        ):
+            # 2,ジョーカー(2)のペアが場に出ている場合は、どんなペアも不可
+            return False
+
         # 強さ比較
         if self.revolution:
             field_strength = min(field_strengths) if field_strengths else -1
