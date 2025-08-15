@@ -11,8 +11,6 @@ def main():
     agent_classes = [RandomAgent, RandomAgent, RuleBasedAgent, StraightAgent]
     env = DaifugoSimpleEnv(num_players=4, agent_classes=agent_classes)  # プレイヤー数4人で環境を初期化
 
-    # 各プレイヤーの累計報酬を集計
-    total_rewards = {pid: 0.0 for pid in range(env.num_players)}
     # 順位の集計用: {順位（1〜4）: {player_id: カウント数}}
     rank_stats = defaultdict(lambda: defaultdict(int))
 
@@ -38,20 +36,11 @@ def main():
             if info.get('reset_happened'):
                 print("--- 場がリセットされました ---")
 
-        # エピソード終了時に全プレイヤーの報酬を取得し加算
-        final_rewards = env.get_final_rewards()
-        print(f"Episode {episode + 1} Final Rewards: {final_rewards}")
-        for pid, rew in final_rewards.items():
-            total_rewards[pid] += rew
-            
+    
         # 順位集計
         for rank, player_id in enumerate(env.game.rankings):
             rank_stats[rank + 1][player_id] += 1  # 順位は1位〜で記録
 
-    # 全エピソード終了後の累計報酬を表示
-    print("\n📊 累計報酬（プレイヤー別）:")
-    for pid, rew in total_rewards.items():
-        print(f"Player {pid}: {rew}")
 
     # 全エピソード終了後の順位集計を表示
     print("\n📊 累計順位集計（プレイヤー別）:")
