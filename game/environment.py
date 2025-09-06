@@ -3,6 +3,7 @@ import numpy as np
 from game.game import Game
 from agents.straight_agent import StraightAgent
 from game.card import Card
+from agents.mcts import MCTSAgent
 
 
 
@@ -134,8 +135,7 @@ class DaifugoSimpleEnv:
     def _generate_legal_actions(self, hand, field):
         """
         現在の手札と場の状態から出せる全ての合法なカードセット（legal actions）を列挙する。
-        パス(None)も必ず含める。
-        場の状態に応じて出せる役種・枚数を限定する。
+        出せるカードがない場合のみパス(None)を含める。
         """
         rule_checker = self.game.rule_checker
         legal_actions = []
@@ -173,66 +173,98 @@ class DaifugoSimpleEnv:
             for card in hand:
                 if card.is_joker and rule_checker.is_valid_move([card], field):
                     legal_actions.append([card])
-        legal_actions.append(None)
+
+        # 出せるカードが1つもない場合のみパスを追加
+        if not legal_actions:
+            legal_actions.append(None)
+
         return self._remove_duplicate_actions(legal_actions)
 
-    def step(self, return_info=False):
-        # 現在のターンのプレイヤーIDを保存
+    def step(self, return_info=False, external_action=None, mcts_result=None, force_action=None, simulate=False):
+        rule_checker = self.game.rule_checker
         current_player_id = self.game.turn
         player = self.game.players[current_player_id]
         hand = player.hand
         field = self.game.current_field[:]
+
         # legal_actions生成
         legal_actions = self._generate_legal_actions(hand, field)
-        # --- ここからエージェントによる行動選択 ---
-        obs = {
-            'hand': hand,
-            'field': field
-        }
-        rule_checker = self.game.rule_checker
-        is_field_straight = rule_checker.is_straight(field) if field else False
-        is_field_pair = False
-        if field and not is_field_straight:
-            non_jokers = [c for c in field if not c.is_joker]
-            if non_jokers and all(c.rank == non_jokers[0].rank or c.is_joker for c in field):
-                is_field_pair = True if len(field) >= 2 else False
-        filtered_actions = []
-        if is_field_straight:
-            for action in legal_actions:
-                if action is not None and rule_checker.is_straight(action):
-                    filtered_actions.append(action)
-            if not filtered_actions:
-                filtered_actions = [None]
-        elif is_field_pair:
-            for action in legal_actions:
-                if (
-                    action is not None
-                    and rule_checker.is_same_rank_or_joker(action)
-                    and len(action) == len(field)
-                    and rule_checker.is_valid_move(action, field)
-                ):
-                    filtered_actions.append(action)
-            if not filtered_actions:
-                filtered_actions = [None]
+        obs = {'hand': hand, 'field': field}
+
+        # --- 行動選択 ---
+        if force_action is not None:
+            action_cards = force_action if force_action != [] else None
+            mcts_result = None
+        elif external_action is not None:
+            action_cards = external_action
         else:
-            filtered_actions = legal_actions
-        action_cards = self.agents[current_player_id].select_action(obs, legal_actions=filtered_actions)
-        # --- ここまで ---
-        # プレイ実行（Noneならパス）
-        obs_, done, reset_happened = self.game.step(current_player_id, action_cards)
+            is_field_straight = rule_checker.is_straight(field) if field else False
+            is_field_pair = False
+            if field and not is_field_straight:
+                non_jokers = [c for c in field if not c.is_joker]
+                if non_jokers and all(c.rank == non_jokers[0].rank or c.is_joker for c in field):
+                    is_field_pair = True if len(field) >= 2 else False
+
+            if is_field_straight:
+                filtered_actions = [a for a in legal_actions if a is not None and rule_checker.is_straight(a)]
+                if not filtered_actions:
+                    filtered_actions = [None]
+            elif is_field_pair:
+                filtered_actions = [a for a in legal_actions if a is not None
+                                    and rule_checker.is_same_rank_or_joker(a)
+                                    and len(a) == len(field)
+                                    and rule_checker.is_valid_move(a, field)]
+                if not filtered_actions:
+                    filtered_actions = [None]
+            else:
+                filtered_actions = legal_actions
+
+            if simulate and isinstance(self.agents[current_player_id], MCTSAgent):
+                legal_actions_filtered = [a for a in legal_actions if a is not None]
+                action_cards = np.random.choice(legal_actions_filtered + [None])
+            else:
+                action_cards = self.agents[current_player_id].select_action(obs, legal_actions=filtered_actions)
+
+        # パスの統一
+        if action_cards == []:
+            action_cards = None
+
+        # --- [REAL LOG] ---
+        if force_action is None and external_action is None:
+            # print(f"[REAL LOG] turn={self.turn_idx} player={current_player_id} action={action_cards} field_before={[str(c) for c in field]}")
+            pass
+
+        # --- プレイ実行 ---
+        obs_, done, reset_happened, reset_reason = self.game.step(current_player_id, action_cards)
+        # reset_reason を game.step で返すように修正しておく（"eight_cut" or "all_pass"）
         self.done = self.game.done
-        # プレイ後の最新の場を取得
         new_field = self.game.current_field[:]
-        # legal_actions/filtered_actionsを再生成（次のプレイヤーのための状態管理用）
-        # obsも再取得
+
+        if reset_happened:
+            if reset_reason == "eight_cut":
+                # 8切りの場合、出したプレイヤーが続行
+                # print(f"[LOG] 8切りによる場リセット - 続行プレイヤー: {current_player_id}")
+                pass
+            elif reset_reason == "all_pass":
+                # 全員パスの場合、最後に出したプレイヤーから続行
+                # print(f"[LOG] 全員パスによる場リセット - 続行プレイヤー: {self.game.turn}")
+                pass
+
+            # print(f"[LOG] reset_happened at turn={self.turn_idx} by player={current_player_id} action={action_cards}")
+            # print(f"[LOG] Field reset - next turn will be player {self.game.turn}")
+            pass
+
+        # --- [REAL LOG] ---
+        if force_action is None and external_action is None:
+            # print(f"[REAL LOG] field_after={[str(c) for c in new_field]} reset_happened={reset_happened}")
+            pass
+
+        # obs更新
         obs = self._get_obs()
 
-        # --- 各手番のレコード生成 ---
-        # 各相手の残り枚数
+        # --- 各手番の履歴記録 ---
         others_hand_counts = [len(self.game.players[i].hand) for i in range(self.num_players)]
-        # 革命フラグ
         is_revolution = getattr(self.game.rule_checker, 'revolution', False)
-        # 場の役種
         field_type = 'empty'
         if field:
             if rule_checker.is_straight(field):
@@ -241,18 +273,15 @@ class DaifugoSimpleEnv:
                 field_type = 'pair'
             else:
                 field_type = 'single'
-        # 合法手（カード集合のリスト）
+
         legal_actions_list = [[str(c) for c in action] if action is not None else None for action in legal_actions]
-        # 選択行動（カード集合のリスト）
         action_taken = [str(c) for c in action_cards] if action_cards is not None else None
-        # 区間開始時点のremaining_players, already_won
         remaining_players = [i for i in range(self.num_players) if i not in self.already_won_players]
         already_won = set(self.already_won_players)
-        # 区間内の手番番号
         step_idx_in_stage = len(self.stage_history)
-        # レコード生成
+
         step_record = {
-            'game_id': None,  # ゲーム識別子（後で付与）
+            'game_id': None,
             'stage_id': self.stage_id,
             'turn_idx': self.turn_idx,
             'step_idx_in_stage': step_idx_in_stage,
@@ -267,40 +296,31 @@ class DaifugoSimpleEnv:
                 'field_type': field_type
             },
             'legal_actions': legal_actions_list,
-            'legal_actions_mask': None,  # MCTS未実装なのでNone
-            'policy_target': None,  # MCTS未実装なのでNone
+            'legal_actions_mask': None,
+            'policy_target': mcts_result['policy_target'] if mcts_result else None,
             'action_taken': action_taken,
-            'value_target': None,  # 後で一括付与
-            'value_weight': None,  # 後で一括付与
-            'is_terminal_in_stage': False,  # 後で一括付与
-            'stage_winner': None,  # 後で一括付与
-            'mcts_root_value': None,  # MCTS未実装なのでNone
-            'mcts_visits': None,  # MCTS未実装なのでNone
-            'exploration_meta': None,  # MCTS未実装なのでNone
-            'reason_tag': None  # 後で一括付与
+            'value_target': None,
+            'value_weight': None,
+            'is_terminal_in_stage': False,
+            'stage_winner': None,
+            'mcts_root_value': mcts_result['mcts_root_value'] if mcts_result else None,
+            'mcts_visits': mcts_result['mcts_visits'] if mcts_result else None,
+            'exploration_meta': None,
+            'reason_tag': None
         }
         self.stage_history.append(step_record)
         self.turn_idx += 1
 
-        # --- 誰かが上がったら区間の全履歴に一括で報酬付与 ---
+        # --- 区間終了時の報酬付与 ---
         reward = 0.0
         new_winners = [pid for pid in self.game.rankings if pid not in self.already_won_players]
         if new_winners:
             winner_id = new_winners[0]
             self.assign_stage_rewards(self.stage_history, winner_id, self.already_won_players)
-            # このstepのvalue_targetを履歴から取得
             reward = self.stage_history[-1]['value_target']
-            # デバッグ出力
-            print(f"[DEBUG] 区間終了: winner={winner_id}, already_won={self.already_won_players}")
-            for i, step in enumerate(self.stage_history):
-                print(f"  [DEBUG] step{i}: player={step['player_id']} value_target={step['value_target']} value_weight={step['value_weight']} reason_tag={step['reason_tag']}")
-            # 区間終了後、履歴をリセットし、すでに上がった人を更新
             self.already_won_players.update(new_winners)
             self.stage_id += 1
             self.stage_history = []
-        else:
-            # 誰も上がっていなければrewardは0.0
-            reward = 0.0
 
         if return_info:
             return obs, reward, self.done, {
@@ -311,6 +331,8 @@ class DaifugoSimpleEnv:
             }
         else:
             return obs, reward, self.done
+        
+        
 
     def assign_stage_rewards(self, stage_history, winner_id, already_won_players):
         """

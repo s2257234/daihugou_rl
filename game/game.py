@@ -100,14 +100,16 @@ class Game:
     def step(self, player_id, action_cards):
         """
         1ターン進める。action_cards: 出すカードリスト or None（パス）
-        戻り値: (状態, 終了フラグ, 場リセットフラグ)
+        戻り値: (状態, 終了フラグ, 場リセットフラグ, リセット理由)
         """
         player = self.players[self.turn]
         # 場が空
         if not self.current_field:
-            return self._handle_action(player_id, player, action_cards, empty_field=True)
+            result = self._handle_action(player_id, player, action_cards, empty_field=True)
+            return result
         # 場が空でない
-        return self._handle_action(player_id, player, action_cards, empty_field=False)
+        result = self._handle_action(player_id, player, action_cards, empty_field=False)
+        return result
 
     def _handle_action(self, player_id, player, action_cards, empty_field):
         """
@@ -135,6 +137,9 @@ class Game:
                 valid = len(card_objs) == len(self.current_field) and self.rule_checker.is_valid_move(card_objs, self.current_field)
         # カードを出す処理
         if valid:
+            # ゲーム中の出力を「Player X played: ...」形式に
+            played_str = ', '.join([str(c) for c in action_cards]) if action_cards else ''
+            print(f"Player {self.turn} played: {played_str}")
             self._play_cards(player, card_objs)
             self.last_player = self.turn
             # 特殊ルール処理
@@ -142,6 +147,8 @@ class Game:
             if reset_happened:
                 return ret
         else:
+            # ゲーム中の出力を「Player X passed.」形式に
+            print(f"Player {self.turn} passed.")
             action_cards = None
             self.passed[self.turn] = True
             # 最後に出したプレイヤー以外が全員パス → 場リセット
@@ -149,12 +156,12 @@ class Game:
                 self._reset_field()
                 reset_happened = True
                 self.turn = self.last_player
-                return self.get_state(self.turn), False, reset_happened
+                return self.get_state(self.turn), False, reset_happened, "all_pass"
         if valid:
             self.last_player = self.turn
         # 上がり判定
         if self._check_agari(player, player_id):
-            return self.get_state(self.turn), True, False
+            return self.get_state(self.turn), True, False, None
 
         # 全員パス or 全員上がりで場リセット
         if not empty_field and self._all_others_passed():
@@ -162,14 +169,28 @@ class Game:
             reset_happened = True
             if self.last_player is not None:
                 self.turn = self.last_player
-            return self.get_state(self.turn), False, reset_happened
+            return self.get_state(self.turn), False, reset_happened, "all_pass"
 
         # リセット直後は再度 same player に戻る
         if reset_happened:
-            return self.get_state(self.turn), False, True
+            return self.get_state(self.turn), False, True, None
 
+        # どの分岐にも入らなかった場合、通常ターン進行
         self._advance_turn()
-        return self.get_state(self.turn), False, False
+        return self.get_state(self.turn), False, False, None
+
+    def _advance_turn(self):
+        """次のプレイヤーにターンを進める（手札がない場合はスキップ）"""
+        next_turn = (self.turn + 1) % self.num_players
+        skip_count = 0
+        while len(self.players[next_turn].hand) == 0:
+            next_turn = (next_turn + 1) % self.num_players
+            skip_count += 1
+            if skip_count > self.num_players:
+                break
+        if next_turn != self.turn:
+            self.turn_count += 1
+        self.turn = next_turn
 
     def _handle_special_rules(self, card_objs):
         """
@@ -187,12 +208,12 @@ class Game:
             self.log(f"8切り発動 by Player {self.turn}!")
             self.last_player = self.turn
             self._reset_field()
-            return True, (self.get_state(self.turn), False, True)
+            return True, (self.get_state(self.turn), False, True, "eight_cut")
         # ジョーカー流し（ジョーカー1枚出しのみ）
         if len(card_objs) == 1 and card_objs[0].is_joker:
             self.last_player = self.turn
             self._reset_field()
-            return True, (self.get_state(self.turn), False, True)
+            return True, (self.get_state(self.turn), False, True, "joker_cut")
         return False, None
 
     def _check_agari(self, player, player_id):
@@ -246,8 +267,12 @@ class Game:
     def _advance_turn(self):
         """次のプレイヤーにターンを進める（手札がない場合はスキップ）"""
         next_turn = (self.turn + 1) % self.num_players
+        skip_count = 0
         while len(self.players[next_turn].hand) == 0:
             next_turn = (next_turn + 1) % self.num_players
+            #skip_count += 1
+            if skip_count > self.num_players:
+                break
         if next_turn != self.turn:
             self.turn_count += 1
         self.turn = next_turn
