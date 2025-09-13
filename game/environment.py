@@ -46,19 +46,28 @@ class DaifugoSimpleEnv:
         for card in hand:
             if not card.is_joker:
                 rank_map.setdefault(card.rank, []).append(card)
-        for rank, cards in rank_map.items():
-            for k in range(field_count, min(len(cards) + len(jokers), 4) + 1):
-                for comb in itertools.combinations(cards, min(len(cards), k)):
+        for rank, cards_same_rank in rank_map.items():
+            max_size = min(len(cards_same_rank) + len(jokers), 4)
+            for k in range(field_count, max_size + 1):
+                # 実際の純粋カード部分の選択 (0..len(cards_same_rank))
+                for comb in itertools.combinations(cards_same_rank, min(len(cards_same_rank), k)):
                     needed_jokers = k - len(comb)
-                    if needed_jokers <= len(jokers):
-                        pair = list(comb)
-                        # ジョーカーを代用として追加
-                        for i in range(needed_jokers):
-                            joker_card = Card(is_joker=True)
-                            joker_card.set_joker_substitute(rank, pair[0].suit)
-                            pair.append(joker_card)
-                        if rule_checker.is_valid_move(pair, field):
-                            legal_actions.append(pair)
+                    if needed_jokers < 0 or needed_jokers > len(jokers):
+                        continue
+                    pair = list(comb)
+                    used_jokers_state = []
+                    # 必要数ジョーカーを実際の手札ジョーカーから利用 (複製せずに一時的に代用ランクをセット)
+                    for j_idx in range(needed_jokers):
+                        jk = jokers[j_idx]
+                        used_jokers_state.append((jk, jk.joker_as_rank, jk.joker_as_suit))
+                        jk.set_joker_substitute(rank, comb[0].suit if comb else jk.joker_as_suit or '♠')
+                        pair.append(jk)
+                    if rule_checker.is_valid_move(pair, field):
+                        legal_actions.append(list(pair))
+                    # ジョーカーの代用情報を元に戻す
+                    for jk, r_old, s_old in used_jokers_state:
+                        jk.joker_as_rank = r_old
+                        jk.joker_as_suit = s_old
         return legal_actions
 
     def _make_straight_sets(self, hand, jokers, field_count, rule_checker, field):
@@ -74,38 +83,47 @@ class DaifugoSimpleEnv:
         for suit, cards_in_suit in suit_map.items():
             for start in range(1, 15 - field_count):
                 expected = [(start + i - 1) % 13 + 1 for i in range(field_count)]
+                # 2は末尾以外に出現不可
                 if 2 in expected and expected[-1] != 2:
                     continue
-                temp = []
-                used_jokers = 0
-                available_cards = cards_in_suit[:]
-                available_jokers = jokers[:]
+                seq = []
+                used_jokers_state = []  # (joker, old_rank, old_suit)
+                success = True
+                # 手札コピー (破壊しない)
+                pool = cards_in_suit[:]
                 for val in expected:
-                    found = False
-                    for i, c in enumerate(available_cards):
+                    placed = False
+                    for i, c in enumerate(pool):
                         if c.rank == val:
-                            temp.append(available_cards.pop(i))
-                            found = True
+                            seq.append(pool.pop(i))
+                            placed = True
                             break
-                    if not found:
-                        if used_jokers < len(available_jokers):
-                            joker_card = available_jokers.pop(0)
-                            joker_card = Card(is_joker=True)
-                            joker_card.set_joker_substitute(val, suit)
-                            temp.append(joker_card)
-                            used_jokers += 1
+                    if not placed:
+                        # Joker で埋める
+                        joker_needed_idx = len(used_jokers_state)
+                        if joker_needed_idx < len(jokers):
+                            jk = jokers[joker_needed_idx]
+                            used_jokers_state.append((jk, jk.joker_as_rank, jk.joker_as_suit))
+                            jk.set_joker_substitute(val, suit)
+                            seq.append(jk)
                         else:
+                            success = False
                             break
-                if len(temp) == field_count:
-                    temp_sorted = []
+                if success and len(seq) == field_count:
+                    # 期待順に並べ替え (seq は既に順序通りだが安全のため)
+                    ordered = []
                     for v in expected:
-                        for c in temp:
+                        for c in seq:
                             rank = c.joker_as_rank if c.is_joker else c.rank
                             if rank == v:
-                                temp_sorted.append(c)
+                                ordered.append(c)
                                 break
-                    if rule_checker.is_valid_move(temp_sorted, field):
-                        legal_actions.append(temp_sorted)
+                    if rule_checker.is_valid_move(ordered, field):
+                        legal_actions.append(list(ordered))
+                # Joker 元に戻す
+                for jk, r_old, s_old in used_jokers_state:
+                    jk.joker_as_rank = r_old
+                    jk.joker_as_suit = s_old
         return legal_actions
 
     def _remove_duplicate_actions(self, legal_actions):
@@ -120,6 +138,36 @@ class DaifugoSimpleEnv:
         for action in legal_actions:
             unique[cardset_key(action)] = action
         return list(unique.values())
+
+    def _action_key(self, action_cards):
+        """
+        List[Card] / List[str] / None を順序非依存のキーへ正規化
+        """
+        if action_cards is None:
+            return (None,)
+        try:
+            return tuple(sorted(str(c) for c in action_cards))
+        except Exception:
+            return (None,)
+
+    def _normalize_action_input(self, action_cards):
+        """
+        A-1の契約に従い、受け取ったactionを None or List[str] に正規化
+        （List[Card] の場合はそのまま返す）
+        """
+        if action_cards == [] or action_cards == "pass":
+            return None
+        if isinstance(action_cards, str):
+            return [action_cards]
+        if isinstance(action_cards, tuple):
+            # MCTS(AlphaZero) のキー tuple(sorted(str(card))) を想定
+            try:
+                return list(action_cards)
+            except Exception:
+                return None
+        if action_cards is not None and not isinstance(action_cards, list):
+            return None
+        return action_cards
 
     def reset(self):
         # ゲームをリセット（インスタンスは使い回し、rankingsを維持）
@@ -139,46 +187,87 @@ class DaifugoSimpleEnv:
         """
         rule_checker = self.game.rule_checker
         legal_actions = []
-        field_count = len(field)
+        field_combo = rule_checker.classify_combo(field) if field else None
+        import itertools
+
+        # 候補生成: 1枚 / 同ランク集合(2-4) / 階段長(3-6) を網羅探索
+        # 1枚
+        for card in hand:
+            candidate = [card]
+            if rule_checker.is_valid_move(candidate, field):
+                legal_actions.append(candidate)
+
+        # 同ランク系
+        rank_map = {}
+        for card in hand:
+            if not card.is_joker:
+                rank_map.setdefault(card.rank, []).append(card)
         jokers = [c for c in hand if c.is_joker]
-        is_field_straight = rule_checker.is_straight(field) if field else False
-        is_field_pair = False
-        if field and not is_field_straight:
-            non_jokers = [c for c in field if not c.is_joker]
-            if non_jokers and all(c.rank == non_jokers[0].rank or c.is_joker for c in field):
-                is_field_pair = True if len(field) >= 2 else False
+        for rank, same_cards in rank_map.items():
+            base_len = len(same_cards)
+            for size in range(2, 5):  # 最大4枚
+                if base_len + len(jokers) < size:
+                    continue
+                # 実カード組合せ (0..base_len)
+                for r in range(max(1, size - len(jokers)), min(base_len, size) + 1):
+                    for comb in itertools.combinations(same_cards, r):
+                        needed_j = size - r
+                        if needed_j < 0 or needed_j > len(jokers):
+                            continue
+                        used_j = []
+                        cand = list(comb)
+                        for j in range(needed_j):
+                            jk = jokers[j]
+                            used_j.append((jk, jk.joker_as_rank, jk.joker_as_suit))
+                            jk.set_joker_substitute(rank, comb[0].suit if comb else '♠')
+                            cand.append(jk)
+                        if rule_checker.is_valid_move(cand, field):
+                            legal_actions.append(list(cand))
+                        for jk, r_old, s_old in used_j:
+                            jk.joker_as_rank = r_old
+                            jk.joker_as_suit = s_old
 
-        if not field:
-            # 1枚出し
-            for card in hand:
-                if rule_checker.is_valid_move([card], field):
-                    legal_actions.append([card])
-            # ペア・スリーカード・フォーカード
-            legal_actions += self._make_pair_sets(hand, jokers, 2, rule_checker, field)
-            # 階段
-            for length in range(3, 6):
-                legal_actions += self._make_straight_sets(hand, jokers, length, rule_checker, field)
-            # ジョーカー単体
-            for card in hand:
-                if card.is_joker and rule_checker.is_valid_move([card], field):
-                    legal_actions.append([card])
-        elif is_field_straight:
-            legal_actions += self._make_straight_sets(hand, jokers, field_count, rule_checker, field)
-        elif is_field_pair:
-            legal_actions += self._make_pair_sets(hand, jokers, field_count, rule_checker, field)
-        else:
-            for card in hand:
-                if rule_checker.is_valid_move([card], field):
-                    legal_actions.append([card])
-            for card in hand:
-                if card.is_joker and rule_checker.is_valid_move([card], field):
-                    legal_actions.append([card])
+        # 階段候補: スート別 → 長さ 3..6 を brute force (既存関数再利用)
+        for length in range(3, 7):
+            legal_actions += self._make_straight_sets(hand, jokers, length, rule_checker, field)
 
-        # 出せるカードが1つもない場合のみパスを追加
-        if not legal_actions:
-            legal_actions.append(None)
+        # Joker単体 (他ロジックと重複するが安全に明示)
+        for card in hand:
+            if card.is_joker and rule_checker.is_valid_move([card], field):
+                legal_actions.append([card])
 
-        return self._remove_duplicate_actions(legal_actions)
+        # フィルタ & 重複除去
+        hand_counts = {}
+        for c in hand:
+            hand_counts[str(c)] = hand_counts.get(str(c), 0) + 1
+        filtered = []
+        for act in legal_actions:
+            if not act:
+                continue
+            local = {}
+            ok = True
+            for c in act:
+                sc = str(c)
+                local[sc] = local.get(sc, 0) + 1
+                if local[sc] > hand_counts.get(sc, 0):
+                    ok = False
+                    break
+            if ok:
+                filtered.append(act)
+        filtered = self._remove_duplicate_actions(filtered)
+
+        # 場が存在する場合: type/size 不一致のものを削除
+        if field_combo:
+            keep = []
+            for a in filtered:
+                combo = rule_checker.classify_combo(a)
+                if combo and combo['type'] == field_combo['type'] and combo['size'] == field_combo['size'] and rule_checker.compare_combos(combo, field_combo):
+                    keep.append(a)
+            filtered = keep
+
+        if not filtered:
+            filtered = [None]
+        return filtered
 
     def step(self, return_info=False, external_action=None, mcts_result=None, force_action=None, simulate=False):
         rule_checker = self.game.rule_checker
@@ -193,10 +282,10 @@ class DaifugoSimpleEnv:
 
         # --- 行動選択 ---
         if force_action is not None:
-            action_cards = force_action if force_action != [] else None
+            action_cards = self._normalize_action_input(force_action)
             mcts_result = None
         elif external_action is not None:
-            action_cards = external_action
+            action_cards = self._normalize_action_input(external_action)
         else:
             is_field_straight = rule_checker.is_straight(field) if field else False
             is_field_pair = False
@@ -225,9 +314,14 @@ class DaifugoSimpleEnv:
             else:
                 action_cards = self.agents[current_player_id].select_action(obs, legal_actions=filtered_actions)
 
-        # パスの統一
-        if action_cards == []:
-            action_cards = None
+        # 入力正規化（A-1）
+        action_cards = self._normalize_action_input(action_cards)
+
+        # 合法手チェック（A-4）: 生成済み合法手に含まれない出しはパスへ降格
+        if action_cards is not None:
+            legal_keys = set(self._action_key(a) for a in legal_actions if a is not None)
+            if self._action_key(action_cards) not in legal_keys:
+                action_cards = None
 
         # --- [REAL LOG] ---
         if force_action is None and external_action is None:
@@ -236,7 +330,7 @@ class DaifugoSimpleEnv:
 
         # --- プレイ実行 ---
         obs_, done, reset_happened, reset_reason = self.game.step(current_player_id, action_cards)
-        # reset_reason を game.step で返すように修正しておく（"eight_cut" or "all_pass"）
+        # reset_reason は "eight_cut" | "joker_cut" | "all_pass" を取りうる
         self.done = self.game.done
         new_field = self.game.current_field[:]
 
@@ -244,6 +338,10 @@ class DaifugoSimpleEnv:
             if reset_reason == "eight_cut":
                 # 8切りの場合、出したプレイヤーが続行
                 # print(f"[LOG] 8切りによる場リセット - 続行プレイヤー: {current_player_id}")
+                pass
+            elif reset_reason == "joker_cut":
+                # ジョーカー単出し流しの場合も、出したプレイヤーが続行
+                # print(f"[LOG] ジョーカー流し - 続行プレイヤー: {current_player_id}")
                 pass
             elif reset_reason == "all_pass":
                 # 全員パスの場合、最後に出したプレイヤーから続行
@@ -327,6 +425,7 @@ class DaifugoSimpleEnv:
                 "player_id": player.player_id,
                 "played_cards": action_cards,
                 "reset_happened": reset_happened,
+                "reset_reason": reset_reason,
                 "field_after_play": [str(c) for c in new_field]
             }
         else:

@@ -2,92 +2,109 @@ class RuleChecker:
     def __init__(self):
         self.revolution = False  # 革命フラグ
 
+    # === 役分類 / 比較ユーティリティ =====================================
+    def classify_combo(self, cards):
+        """カード集合を役情報へ分類。無効なら None。
+        戻り dict 例:
+          {
+            'type': 'single'|'pair'|'triple'|'four'|'straight'|'joker_single',
+            'size': n,
+            'rank': 基本ランク(同ランク系非ジョーカー) or None,
+            'ranks': 階段ランク列(list) or [],
+            'jokers': ジョーカー枚数,
+            'strength': 比較用整数 (革命を考慮した基準値),
+            'raw_cards': cards,
+          }
+        """
+        if not cards:
+            return None
+        n = len(cards)
+        jokers = [c for c in cards if c.is_joker]
+        non_jokers = [c for c in cards if not c.is_joker]
+
+        # Joker単体
+        if n == 1 and jokers:
+            return {
+                'type': 'joker_single',
+                'size': 1,
+                'rank': None,
+                'ranks': [],
+                'jokers': 1,
+                'strength': 15,  # 最強扱い
+                'raw_cards': cards,
+            }
+
+        # 階段
+        if self.is_straight(cards):
+            straight_ranks = self.get_straight_ranks(cards)
+            if not straight_ranks:
+                return None
+            strength_ref = min(straight_ranks) if self.revolution else max(straight_ranks)
+            return {
+                'type': 'straight',
+                'size': n,
+                'rank': None,
+                'ranks': straight_ranks,
+                'jokers': len(jokers),
+                'strength': strength_ref,
+                'raw_cards': cards,
+            }
+
+        # 同ランク(ジョーカー含む) 系
+        if self.is_same_rank_or_joker(cards):
+            base_rank = non_jokers[0].rank if non_jokers else None
+            t = {1: 'single', 2: 'pair', 3: 'triple'}.get(n, 'four')
+            if non_jokers:
+                strengths = [c.strength() for c in non_jokers]
+                strength_ref = min(strengths) if self.revolution else max(strengths)
+            else:
+                strength_ref = 15  # 全ジョーカー -> 最大
+            return {
+                'type': t,
+                'size': n,
+                'rank': base_rank,
+                'ranks': [],
+                'jokers': len(jokers),
+                'strength': strength_ref,
+                'raw_cards': cards,
+            }
+
+        return None
+
+    def compare_combos(self, challenger, field_combo):
+        """challenger が field_combo を上回れるか。"""
+        if challenger is None:
+            return False
+        if field_combo is None:  # 場が空
+            return True
+        # Joker 単体同士 -> 後出し不可(引き分け)
+        if field_combo['type'] == 'joker_single':
+            return challenger['type'] == 'joker_single'  # 同種なら許容(流し目的)
+        if challenger['type'] != field_combo['type']:
+            return False
+        if challenger['size'] != field_combo['size']:
+            return False
+        # 階段 or 同ランク系 は strength 比較
+        return self._compare_strength_value(challenger['strength'], field_combo['strength'])
+
+    def _compare_strength_value(self, a, b):
+        if self.revolution:
+            return a < b
+        return a > b
+
     def is_valid(self, current_field, cards):
         if cards is None or len(cards) == 0:
             return True
         return self.is_valid_move(cards, current_field)
 
     def is_valid_move(self, cards, current_field):
-        play_count = len(cards)
-        strengths = [card.strength() for card in cards if not card.is_joker]
-
-        # 階段判定
-        is_straight = self.is_straight(cards)
-
-        # 場が空ならOK
+        # 新実装: classify & compare
+        # 場が空
         if not current_field:
             return True
-
-        field_count = len(current_field)
-        # ★場が空でなければ、出す枚数と場の枚数が一致しない場合はFalse
-        if play_count != field_count:
-            return False
-
-        field_strengths = [card.strength() for card in current_field if not card.is_joker]
-        field_is_straight = self.is_straight(current_field)
-
-        # ジョーカー単独出し特別ルール
-        if play_count == 1 and cards[0].is_joker:
-            # ジョーカーの仮想ランク・スートをリセット
-            cards[0].joker_as_rank = None
-            cards[0].joker_as_suit = None
-            # 場がジョーカー単独なら、次もジョーカー単独でしか出せない
-            if field_count == 1 and current_field[0].is_joker:
-                return True
-            # 革命時は3より強い、通常時は2より強い
-            if self.revolution:
-                # 3の強さは1
-                return (field_count == 1 and (not current_field[0].is_joker) and current_field[0].strength() < 2)
-            else:
-                # 2の強さは14
-                return (field_count == 1 and (not current_field[0].is_joker) and current_field[0].strength() < 15)
-
-        # 階段同士の比較
-        if is_straight and field_is_straight:
-            if play_count != field_count:
-                return False
-            if cards[0].suit != current_field[0].suit:
-                return False
-            # ジョーカーを補完した最大/最小ランクで比較
-            play_ranks = self.get_straight_ranks(cards)
-            field_ranks = self.get_straight_ranks(current_field)
-            if not play_ranks or not field_ranks:
-                return False
-            if self.revolution:
-                return self.compare_strength(min(play_ranks), min(field_ranks))
-            else:
-                return self.compare_strength(max(play_ranks), max(field_ranks))
-
-        # 階段出し→通常出し、またはその逆は禁止
-        if is_straight != field_is_straight:
-            return False
-
-        # 通常出し（同ランクのカード or ジョーカー）
-        if not self.is_same_rank_or_joker(cards):
-            return False
-
-        if play_count != field_count:
-            return False
-
-        # --- 2のペア＋ジョーカーの特殊判定 ---
-        # 場が2,ジョーカー(2)のペアなら、何も上書きできない
-        if (
-            play_count == 2 and field_count == 2
-            and self.is_same_rank_or_joker(current_field)
-            and any(card.is_joker for card in current_field)
-            and all((card.rank == 2 or card.is_joker) for card in current_field)
-        ):
-            # 2,ジョーカー(2)のペアが場に出ている場合は、どんなペアも不可
-            return False
-
-        # 強さ比較
-        if self.revolution:
-            field_strength = min(field_strengths) if field_strengths else -1
-            play_strength = min(strengths) if strengths else 0
-        else:
-            field_strength = max(field_strengths) if field_strengths else -1
-            play_strength = max(strengths) if strengths else 0
-        return self.compare_strength(play_strength, field_strength)
+        challenger = self.classify_combo(cards)
+        field_combo = self.classify_combo(current_field)
+        return self.compare_combos(challenger, field_combo)
 
     def compare_strength(self, a, b):
         """
@@ -113,12 +130,20 @@ class RuleChecker:
         rank = non_jokers[0].rank
         suit = non_jokers[0].suit
         valid = all(card.rank == rank or card.is_joker for card in cards)
-        # ジョーカーが含まれる場合は仮想ランク・スートをセット
-        for card in cards:
-            if card.is_joker:
-                card.joker_as_rank = rank
-                card.joker_as_suit = suit
-        return valid
+        if valid:
+            # ジョーカーが含まれる場合は仮想ランク・スートをセット
+            for card in cards:
+                if card.is_joker:
+                    card.joker_as_rank = rank
+                    card.joker_as_suit = suit
+            return True
+        else:
+            # 無効な場合は代用情報をクリアして副作用を残さない
+            for card in cards:
+                if card.is_joker:
+                    card.joker_as_rank = None
+                    card.joker_as_suit = None
+            return False
 
     def is_8cut(self, cards):
         """8が含まれていて、かつジョーカーだけではないとき、8切り発動"""

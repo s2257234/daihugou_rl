@@ -2,6 +2,24 @@ import copy
 import math
 import random
 
+"""MCTS 実装共通化モジュール
+
+提供要素:
+1) 既存のシンプルランダムロールアウト型 MCTSAgent (後方互換用)
+2) AlphaZero / PUCT 方式向けの軽量コア関数とノード定義 (drI_agent.py から再利用可能)
+
+多人数(大富豪 4人)対応メモ:
+ - シンプル版 MCTSAgent は従来通りロールアウト報酬をそのままバックアップします。
+ - PUCT 版(PUCTNode) では "符号反転" は行わず、value は常に root 視点 (または policy_value_fn が返す視点) のスカラーとして上方伝播。
+     複数プレイヤー時にプレイヤー視点変換を行いたい場合は policy_value_fn 側で root 視点に正規化してください。
+
+再利用ポイント (AlphaZero 連携):
+ - run_puct_mcts(...) を呼び出し policy_value_fn / get_legal_actions_fn を差し込む
+ - 戻り値 root から visit 分布を抽出し方策ターゲット π を生成
+
+注意: 既存コード互換のため MCTSAgent / environmentEnv は残す。
+"""
+
 class environmentEnv:
     def __init__(self):
         # 既存初期化
@@ -72,6 +90,176 @@ class MCTSNode:
         self.children = []     # 子ノードのリスト
         self.visits = 0        # このノードが訪問された回数
         self.value = 0         # このノードの累積価値（報酬の合計）
+
+
+# =============================================================
+# PUCT / AlphaZero 用 ノード
+# =============================================================
+class PUCTNode:
+    """PUCT (AlphaZero) 用ノード。
+
+    value_sum: 累積価値 (root 視点で加算)。平均値 = value_sum / visit_count。
+    prior: policy_value_fn が返した事前確率。
+    children: {action: PUCTNode}
+    to_play: 手番プレイヤーID (必要なら視点変換で利用)。
+    """
+
+    __slots__ = (
+        "parent", "prior", "visit_count", "value_sum", "children", "action", "to_play"
+    )
+
+    def __init__(self, prior: float, parent=None, action=None, to_play: int = 0):
+        self.parent = parent
+        self.prior = float(prior)
+        self.visit_count = 0
+        self.value_sum = 0.0
+        self.children = {}
+        self.action = action
+        self.to_play = to_play
+
+    # ---- 派生量 ----
+    @property
+    def value(self) -> float:
+        return 0.0 if self.visit_count == 0 else self.value_sum / self.visit_count
+
+    # ---- 展開 ----
+    def expand(self, to_play: int, policy_dict):
+        for act, p in policy_dict.items():
+            if act not in self.children:
+                self.children[act] = PUCTNode(prior=p, parent=self, action=act, to_play=to_play)
+
+    # ---- バックアップ (4人ゲーム想定: 符号反転しない) ----
+    def backup(self, leaf_value: float):
+        node = self
+        while node is not None:
+            node.visit_count += 1
+            node.value_sum += leaf_value
+            node = node.parent
+
+
+def _puct_select(node: PUCTNode, c_puct: float) -> PUCTNode:
+    """子ノードの中から PUCT スコア最大のものを返す"""
+    total_visits = max(1, sum(child.visit_count for child in node.children.values()))
+    best, best_score = None, -1e18
+    sqrt_total = math.sqrt(total_visits)
+    for child in node.children.values():
+        u = c_puct * child.prior * sqrt_total / (1 + child.visit_count)
+        score = child.value + u
+        if score > best_score:
+            best_score = score
+            best = child
+    return best
+
+
+def run_puct_mcts(root_env_copy,
+                  num_simulations: int,
+                  policy_value_fn,
+                  get_legal_actions_fn,
+                  c_puct: float = 1.4,
+                  add_dirichlet: bool = True,
+                  dirichlet_alpha: float = 0.3,
+                  dirichlet_epsilon: float = 0.25,
+                  root_player_id: int = 0):
+    """AlphaZero 風 PUCT MCTS 実行 (正規化 & 欠損補完対応版)。"""
+    # ルート合法手
+    legal_root = get_legal_actions_fn(root_env_copy)
+    if not legal_root:
+        legal_root = ["pass"]
+    policy_root, root_value = policy_value_fn(root_env_copy)
+    # policy_root を合法手に合わせて補完・正規化
+    if not policy_root:
+        policy_root = {a: 1.0 / len(legal_root) for a in legal_root}
+    else:
+        # 欠損を均等割当
+        missing = [a for a in legal_root if a not in policy_root]
+        total = sum(policy_root.values())
+        if total <= 0:
+            policy_root = {a: 1.0 / len(legal_root) for a in legal_root}
+        else:
+            for k in list(policy_root.keys()):
+                policy_root[k] /= total
+            if missing:
+                remain = max(0.0, 1.0 - sum(policy_root.values()))
+                add = remain / len(missing) if missing else 0.0
+                for m in missing:
+                    policy_root[m] = add
+            # 最終正規化
+            s2 = sum(policy_root.values())
+            if s2 > 0:
+                for k in list(policy_root.keys()):
+                    policy_root[k] /= s2
+
+    root = PUCTNode(prior=1.0, to_play=root_player_id)
+    root.expand(root_player_id, {a: policy_root[a] for a in legal_root if a in policy_root})
+    root.visit_count = 1
+    root.value_sum = root_value
+
+    # Dirichlet ノイズ
+    if add_dirichlet and root.children:
+        actions = list(root.children.keys())
+        noises = [random.gammavariate(dirichlet_alpha, 1.0) for _ in actions]
+        s = sum(noises)
+        noises = [n / s for n in noises]
+        for a, n in zip(actions, noises):
+            child = root.children[a]
+            child.prior = child.prior * (1 - dirichlet_epsilon) + n * dirichlet_epsilon
+
+    def _fast_clone(env):
+        # ルートと同じ軽量コピー方針: game の可変構造を手動複製
+        g = env.game
+        g_new = copy.copy(g)
+        new_players = []
+        for p in g.players:
+            p_new = copy.copy(p)
+            p_new.hand = list(p.hand)
+            new_players.append(p_new)
+        g_new.players = new_players
+        g_new.current_field = list(g.current_field)
+        g_new.passed = list(g.passed)
+        g_new.rankings = list(getattr(g, 'rankings', []))
+        env_new = copy.copy(env)
+        env_new.game = g_new
+        return env_new
+
+    for _ in range(num_simulations):
+        # env_copy = copy.deepcopy(root_env_copy)
+        env_copy = _fast_clone(root_env_copy)
+        node = root
+        # 選択フェーズ
+        while node.children:
+            node = _puct_select(node, c_puct)
+            try:
+                env_copy.step(external_action=node.action, simulate=True)
+            except TypeError:
+                env_copy.step(node.action)
+        # 葉ノード評価
+        policy_leaf, leaf_value = policy_value_fn(env_copy)
+        legal_leaf = get_legal_actions_fn(env_copy)
+        if not legal_leaf:
+            node.backup(leaf_value)
+            continue
+        if not policy_leaf:
+            policy_leaf = {a: 1.0 / len(legal_leaf) for a in legal_leaf}
+        else:
+            missing_l = [a for a in legal_leaf if a not in policy_leaf]
+            tot_l = sum(policy_leaf.values())
+            if tot_l <= 0:
+                policy_leaf = {a: 1.0 / len(legal_leaf) for a in legal_leaf}
+            else:
+                for k in list(policy_leaf.keys()):
+                    policy_leaf[k] /= tot_l
+                if missing_l:
+                    rem_l = max(0.0, 1.0 - sum(policy_leaf.values()))
+                    add_l = rem_l / len(missing_l) if missing_l else 0.0
+                    for m in missing_l:
+                        policy_leaf[m] = add_l
+                s3 = sum(policy_leaf.values())
+                if s3 > 0:
+                    for k in list(policy_leaf.keys()):
+                        policy_leaf[k] /= s3
+        node.expand(getattr(env_copy.game, 'turn', 0), {a: policy_leaf[a] for a in legal_leaf if a in policy_leaf})
+        node.backup(leaf_value)
+    return root
 
 
 class MCTSAgent:
@@ -177,3 +365,13 @@ class MCTSAgent:
             node.visits += 1
             node.value += reward
             node = node.parent
+
+
+# 後方互換エイリアス (既存 import 対応)
+__all__ = [
+    "environmentEnv",
+    "MCTSNode",
+    "MCTSAgent",
+    "PUCTNode",
+    "run_puct_mcts",
+]

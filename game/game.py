@@ -1,5 +1,5 @@
 import random
-from .card import CardDeck
+from .card import CardDeck, Card
 from .player import Player
 from .rules import RuleChecker 
 
@@ -57,7 +57,8 @@ class Game:
         diamond3_player = None
         for i, player in enumerate(self.players):
             for card in player.hand:
-                if card.suit == '♢' and card.rank == 3:
+                # ダイヤは黒塗りの♦が正しい（以前は白ダイヤ♢を誤使用）
+                if card.suit == '\u2666' and card.rank == 3:
                     diamond3_player = i
                     break
             if diamond3_player is not None:
@@ -95,6 +96,8 @@ class Game:
         """
         ログ出力用メソッド。将来的なUI/ログ管理のためprintを一元化。
         """
+        if getattr(self, 'silent', False):
+            return
         print(msg)
 
     def step(self, player_id, action_cards):
@@ -102,6 +105,15 @@ class Game:
         1ターン進める。action_cards: 出すカードリスト or None（パス）
         戻り値: (状態, 終了フラグ, 場リセットフラグ, リセット理由)
         """
+        # A-1: 入力正規化（パスは None、出しは List[str] or List[Card]）
+        if action_cards == [] or action_cards == "pass":
+            action_cards = None
+        elif isinstance(action_cards, str):
+            action_cards = [action_cards]
+        elif isinstance(action_cards, tuple):
+            action_cards = list(action_cards)
+        elif action_cards is not None and not isinstance(action_cards, list):
+            action_cards = None
         player = self.players[self.turn]
         # 場が空
         if not self.current_field:
@@ -137,9 +149,15 @@ class Game:
                 valid = len(card_objs) == len(self.current_field) and self.rule_checker.is_valid_move(card_objs, self.current_field)
         # カードを出す処理
         if valid:
-            # ゲーム中の出力を「Player X played: ...」形式に
-            played_str = ', '.join([str(c) for c in action_cards]) if action_cards else ''
-            print(f"Player {self.turn} played: {played_str}")
+            # 表示用に役を分類してジョーカー代用情報を確定させる（表示のため）
+            # classify_combo は必要に応じて joker_as_* を設定するが、場出しが確定してから行うので副作用は許容範囲
+            try:
+                _ = self.rule_checker.classify_combo(card_objs)
+            except Exception:
+                pass
+            # ゲーム中の出力を「Player X played: ...」形式に（解決済みの card_objs を使用）
+            played_str = ', '.join(str(c) for c in card_objs) if card_objs else ''
+            self.log(f"Player {self.turn} played: {played_str}")
             self._play_cards(player, card_objs)
             self.last_player = self.turn
             # 特殊ルール処理
@@ -148,7 +166,7 @@ class Game:
                 return ret
         else:
             # ゲーム中の出力を「Player X passed.」形式に
-            print(f"Player {self.turn} passed.")
+            self.log(f"Player {self.turn} passed.")
             action_cards = None
             self.passed[self.turn] = True
             # 最後に出したプレイヤー以外が全員パス → 場リセット
@@ -232,26 +250,84 @@ class Game:
 
     # --- 補助メソッド ---
     def _find_hand_cards(self, player, action_cards):
-        """手札からaction_cardsに該当するCardオブジェクトリストを返す"""
-        hand_card_strs = [str(c) for c in player.hand]
-        if all(str(card) in hand_card_strs for card in action_cards):
-            return [next(c for c in player.hand if str(c) == str(card)) for card in action_cards]
+        """
+        手札から action_cards に該当する Card オブジェクトのリストを原子的に解決して返す。
+        - action_cards は List[Card] もしくは List[str]（A-1 の前提）
+        - すべての枚数が手札に存在しない場合は None を返し、手札を一切変更しない（原子的）
+        """
+        if not action_cards:
+            return None
+
+        # ケース1: すでに手札中の Card オブジェクトが渡されている場合（同一インスタンスかを確認）
+        if all(isinstance(a, Card) for a in action_cards):
+            # 同一オブジェクトが重複参照されていないか確認
+            if len({id(a) for a in action_cards}) != len(action_cards):
+                return None
+            # 全カードが手札内のオブジェクトか確認（同一性 'is' で）
+            for a in action_cards:
+                if not any(h is a for h in player.hand):
+                    return None
+            # そのまま返す（呼び出し側で場に出す）
+            return list(action_cards)
+
+        # ケース2: 文字列指定の場合はマルチセットで厳密に確認
+        if all(isinstance(a, str) for a in action_cards):
+            # 手札側のカウント
+            hand_counts = {}
+            idx_map = {}
+            for idx, h in enumerate(player.hand):
+                key = str(h)
+                hand_counts[key] = hand_counts.get(key, 0) + 1
+                idx_map.setdefault(key, []).append(idx)
+
+            # 要求側のカウント
+            req_counts = {}
+            for a in action_cards:
+                req_counts[a] = req_counts.get(a, 0) + 1
+
+            # 不足があれば原子的に不可
+            for k, v in req_counts.items():
+                if v > hand_counts.get(k, 0):
+                    return None
+
+            # 実体へマッピング（各文字列ごとに必要数のインデックスを取得）
+            taken_indices = []
+            for a in action_cards:
+                taken_indices.append(idx_map[a].pop())
+            taken_objs = [player.hand[i] for i in taken_indices]
+            return taken_objs
+
+        # 想定外の型が混在している場合は無効
         return None
 
     def _play_cards(self, player, card_objs):
-        """カードを場に出し、手札から削除し、場の状態を更新（str(card)一致で削除）"""
-        self.current_field = card_objs[:]
-        # 手札のカードをstr一致で削除（同じカードが複数ある場合も1枚ずつ）
-        for card in card_objs:
-            found = False
+        """
+        カードを場に出し、手札から原子的に削除し、場の状態を更新。
+        - card_objs は手札中の実オブジェクト（_find_hand_cards で解決済み）
+        - 1枚でも存在しなければ削除は一切行わない（保険）
+        """
+        # まず手札内存在チェック（同一性）
+        indices = []
+        used = [False] * len(player.hand)
+        for co in card_objs:
+            found_idx = -1
             for i, h in enumerate(player.hand):
-                if str(h) == str(card):
-                    del player.hand[i]
-                    found = True
+                if not used[i] and (h is co):
+                    found_idx = i
+                    used[i] = True
                     break
-            if not found:
-                # デバッグ用: 一致しない場合は警告
-                self.log(f"[WARNING] 手札からカードが見つかりません: {str(card)}")
+            if found_idx == -1:
+                # 原子性のため、何もしない
+                self.log("[WARNING] 原子的削除失敗: 指定カードが手札に見つかりませんでした。処理を中止します。")
+                return
+            indices.append(found_idx)
+
+        # 場更新（表示用に浅いコピー）
+        self.current_field = card_objs[:]
+        # 実削除（後ろから）
+        for idx in sorted(indices, reverse=True):
+            del player.hand[idx]
+        # パス情報リセット
         self.passed = [False] * self.num_players
 
     def _reset_field(self):
@@ -263,16 +339,3 @@ class Game:
         if self.last_player is not None:
             self.turn = self.last_player
         self.log("--- 場がリセットされました ---")
-
-    def _advance_turn(self):
-        """次のプレイヤーにターンを進める（手札がない場合はスキップ）"""
-        next_turn = (self.turn + 1) % self.num_players
-        skip_count = 0
-        while len(self.players[next_turn].hand) == 0:
-            next_turn = (next_turn + 1) % self.num_players
-            #skip_count += 1
-            if skip_count > self.num_players:
-                break
-        if next_turn != self.turn:
-            self.turn_count += 1
-        self.turn = next_turn
