@@ -93,6 +93,11 @@ class AlphaZeroAgent:
         # 累積フェーズ勝利統計 (報酬可視化用)
         self.total_value_samples = 0  # value(=フェーズラベル)が確定したサンプル総数
         self.total_positive = 0       # そのうち勝者(=1)ラベル数
+        # フェーズ予測精度計測用
+        self.phase_total = 0          # 累積フェーズ数(評価対象)
+        self.phase_correct = 0        # そのうち value 予測(0.5閾値)が的中した数
+        self.episode_phase_total = 0  # エピソード内フェーズ数
+        self.episode_phase_correct = 0
 
     # ---------------- Public API ----------------
     def set_model(self, model):
@@ -160,7 +165,14 @@ class AlphaZeroAgent:
         # Store replay sample
         state_repr = self._extract_state(env)
         serialized_legal = [None if a == "pass" else (list(a) if isinstance(a, tuple) else a) for a in actions]
-        idx = self._store_sample(state_repr, serialized_legal, pi, None)
+        # ルート value 推論値を記録しておきフェーズ確定時に accuracy 計算に使用
+        # (self._run_mcts -> _policy_value で取得した root の value は _run_mcts 内では捨てられているため、
+        # ここでは再度 _policy_value を呼び出して取得する簡易実装)
+        try:
+            _, value_scalar_for_store = self._policy_value(env)
+        except Exception:
+            value_scalar_for_store = 0.5
+        idx = self._store_sample(state_repr, serialized_legal, pi, None, value_pred=value_scalar_for_store)
         self._phase_indices.append(idx)
         self.move_count += 1
         return action_env
@@ -320,13 +332,14 @@ class AlphaZeroAgent:
             return {"turn": 0}
 
     # ---------------- Replay buffer ----------------
-    def _store_sample(self, state, legal_actions, pi, value):
+    def _store_sample(self, state, legal_actions, pi, value, value_pred: Optional[float] = None):
         # value 未確定は None のまま保持 (学習時にスキップ)
         sample = {
             "state": state,
             "legal_actions": legal_actions,
             "pi": pi,
-            "value": value,  # None or float
+            "value": value,      # None or float (ラベル)
+            "value_pred": value_pred,  # 直近ルート推論確率 (フェーズ精度計測用)
         }
         if len(self.replay_buffer) >= self.max_buffer_size:
             self.replay_buffer.pop(0)
@@ -349,12 +362,37 @@ class AlphaZeroAgent:
             self._phase_indices = []
             return
         val = 1.0 if self.player_id == winner_player_id else 0.0
+        # フェーズ精度: フェーズ内最後のサンプルの value_pred を代表として用いる
+        try:
+            last_idx = self._phase_indices[-1]
+            pred = self.replay_buffer[last_idx].get("value_pred")
+            if pred is not None:
+                self.phase_total += 1
+                self.episode_phase_total += 1
+                hit = (pred > 0.5) == (val > 0.5)
+                if hit:
+                    self.phase_correct += 1
+                    self.episode_phase_correct += 1
+        except Exception:
+            pass
         self.assign_values(self._phase_indices, val)
         self._phase_indices = []
 
     def flush_unfinished_phase(self):
         # ゲーム終了時などに未確定フェーズが残った場合は「次に上がれなかった」として 0 を付与
         if self._phase_indices:
+            # unfinished フェーズも評価対象とみなす (pred vs 0)
+            try:
+                last_idx = self._phase_indices[-1]
+                pred = self.replay_buffer[last_idx].get("value_pred")
+                if pred is not None:
+                    self.phase_total += 1
+                    self.episode_phase_total += 1
+                    if (pred <= 0.5):  # 正解は 0 ラベル
+                        self.phase_correct += 1
+                        self.episode_phase_correct += 1
+            except Exception:
+                pass
             self.assign_values(self._phase_indices, 0.0)
             self._phase_indices = []
 
@@ -554,6 +592,8 @@ class AlphaZeroAgent:
 
     def reset_episode(self):
         self.move_count = 0
+        self.episode_phase_total = 0
+        self.episode_phase_correct = 0
 
 
 DRLAgent = AlphaZeroAgent

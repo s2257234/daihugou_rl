@@ -12,7 +12,7 @@
   - モデル: PolicyValueNet (agents.models.PolicyValueNet)
 
 制約:
-  - 現在 train_step はダミー。後続で損失計算 / 逆伝播を実装する。
+  - 現在 後続で損失計算 / 逆伝播を実装する。
   - 複数エージェント(4人)分のデータ管理は簡易。各 AlphaZeroAgent が自分のバッファを内部保持する。
 
 使い方(例):
@@ -242,11 +242,15 @@ class Trainer:
             cum_phase_rate = learner_agent.total_positive / learner_agent.total_value_samples
 
         phase_win_rate = (phase_wins / phase_attempts) if phase_attempts > 0 else None
+        # フェーズ予測精度 (学習プレイヤーでのみ定義)
+        phase_acc = None
+        if isinstance(learner_agent, AlphaZeroAgent) and learner_agent.episode_phase_total > 0:
+            phase_acc = learner_agent.episode_phase_correct / learner_agent.episode_phase_total
         ep_metrics = {
             "avg_rank": avg_rank,
             "first_rate": first_rate,
             "episode_len": episode_len,
-            "phase_acc": None,  # (未実装) モデルのフェーズ予測的中率を別途追加予定
+            "phase_acc": phase_acc,
             "phase_win_rate": phase_win_rate,
             "phase_wins": phase_wins,
             "phase_attempts": phase_attempts,
