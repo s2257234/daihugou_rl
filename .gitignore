@@ -7,3 +7,5 @@ venv/
 memo.txt
 pytorch_practice.py
 logs/
+*.joblib
+*.pt
