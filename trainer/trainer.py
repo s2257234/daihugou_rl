@@ -37,6 +37,7 @@ from __future__ import annotations
 import os
 import random
 from typing import Dict, Any, List
+import argparse
 
 import sys
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -46,6 +47,7 @@ if PROJECT_ROOT not in sys.path:
 from agents.drl_agent import AlphaZeroAgent
 from agents.models import PolicyValueNet
 from agents.config import ALPHA_ZERO_CONFIG
+from utils.logger import TrainingLogger
 
 try:
     from game.environment import DaifugoSimpleEnv
@@ -69,6 +71,8 @@ class Trainer:
         self.warmup_mix = self.config.get("warmup_mix", ["random", "rule", "random"])  # 学習エージェント以外の順番
         # 学習対象プレイヤーID (単純化: 0固定) 今後拡張可
         self.learning_player_id = self.config.get("learning_player_id", 0)
+    # ロガー (setup で初期化)
+        self.logger = None  # type: ignore  # TrainingLogger インスタンスは setup で設定
 
     # -----------------------------------------------------
     # 準備
@@ -79,6 +83,12 @@ class Trainer:
             max_policy_size=self.config["max_policy_size"],
             hidden_size=self.config["hidden_size"],
             num_players=self.config["num_players"],
+        )
+        # ロガー生成
+        self.logger = TrainingLogger(
+            log_dir=self.config.get("log_dir", "logs"),
+            use_tensorboard=self.config.get("enable_tensorboard", True),
+            clear_existing=self.config.get("clear_logs_on_start", False)
         )
         # 初期は全員学習エージェント (ウォームアップで差し替える)
         self.agents = []
@@ -93,6 +103,9 @@ class Trainer:
         for ag in self.agents:
             if hasattr(ag, 'set_env_ref'):
                 ag.set_env_ref(self.env)
+            # 後方互換: エージェントが logger を受け取れるなら設定
+            if hasattr(ag, 'logger'):
+                ag.logger = self.logger
 
     # ウォームアップ用: 他プレイヤーを簡易エージェントに差し替え
     def _apply_warmup_opponents(self):
@@ -151,6 +164,9 @@ class Trainer:
         # 環境を初期化 (DaifugoSimpleEnv が reset を持つ想定)
         if hasattr(self.env, "reset"):
             self.env.reset()
+        # エピソード内フェーズ勝利カウント (学習プレイヤー視点)
+        phase_wins = 0
+        phase_attempts = 0
         # 各学習エージェントの move カウンタをリセット
         for ag in self.agents:
             if isinstance(ag, AlphaZeroAgent) and hasattr(ag, 'reset_episode'):
@@ -193,6 +209,11 @@ class Trainer:
                     for ag in self.agents:
                         if isinstance(ag, AlphaZeroAgent):
                             was_active = ag.player_id not in prev_rankings  # 以前まだ上がっていなかったか
+                            # 学習プレイヤー視点のフェーズ統計更新
+                            if ag.player_id == self.learning_player_id and was_active:
+                                phase_attempts += 1
+                                if winner_id == self.learning_player_id:
+                                    phase_wins += 1
                             ag.finalize_phase(winner_player_id=winner_id, was_active=was_active)
                 prev_rankings = current_rankings
         # 念のため未確定フェーズを 0 でクリア
@@ -204,6 +225,35 @@ class Trainer:
         for ag in self.agents:
             if isinstance(ag, AlphaZeroAgent):
                 ag.finalize_game()
+        # Episode メトリクス集計
+        rankings = list(getattr(self.env.game, 'rankings', []))
+        episode_len = step_count
+        avg_rank = None
+        first_rate = 0.0
+        if rankings:
+            # 学習プレイヤー順位 (1-based)
+            if self.learning_player_id in rankings:
+                avg_rank = rankings.index(self.learning_player_id) + 1
+            first_rate = 1.0 if rankings and rankings[0] == self.learning_player_id else 0.0
+        # 学習プレイヤーの累積フェーズ勝率 (Agent内のカウンタ) 取得
+        learner_agent = self.agents[self.learning_player_id]
+        cum_phase_rate = None
+        if isinstance(learner_agent, AlphaZeroAgent) and learner_agent.total_value_samples > 0:
+            cum_phase_rate = learner_agent.total_positive / learner_agent.total_value_samples
+
+        phase_win_rate = (phase_wins / phase_attempts) if phase_attempts > 0 else None
+        ep_metrics = {
+            "avg_rank": avg_rank,
+            "first_rate": first_rate,
+            "episode_len": episode_len,
+            "phase_acc": None,  # (未実装) モデルのフェーズ予測的中率を別途追加予定
+            "phase_win_rate": phase_win_rate,
+            "phase_wins": phase_wins,
+            "phase_attempts": phase_attempts,
+            "cum_phase_win_rate": cum_phase_rate,
+        }
+        if self.logger:
+            self.logger.log_episode(ep_metrics)
 
     # 旧最終順位一括報酬方式は廃止 (フェーズごとの finalize_phase を利用)
     def _finalize_episode_rewards(self):  # 互換: 何もしない
@@ -217,6 +267,9 @@ class Trainer:
             loss_info = self.agents[0].train_step(batch_size=self.config.get("batch_size", 256))
             if (i + 1) % self.config.get("log_interval", 50) == 0:
                 print(f"[TRAIN] update={i+1} loss={loss_info}")
+            # ロガーへ (train_step 内で既に push されている場合は二重記録を避ける)
+            if self.logger and loss_info.get("loss") is not None and not getattr(self.agents[0], '_logged_inside', False):
+                self.logger.log_train(loss_info)
         self._save_checkpoint()
 
     # -----------------------------------------------------
@@ -235,10 +288,33 @@ __all__ = ["Trainer"]
 
 
 if __name__ == "__main__":
-    # 簡易動作テスト: 1エピソード自己対局 + ダミー学習1回
-    trainer = Trainer()
+    parser = argparse.ArgumentParser(description="AlphaZero 大富豪 小規模学習")
+    parser.add_argument("--episodes", type=int, default=3, help="自己対局エピソード数 (default: 3)")
+    parser.add_argument("--updates", type=int, default=5, help="train_step 呼び出し回数 (default: 5)")
+    parser.add_argument("--num-sim", type=int, default=None, help="MCTS シミュレーション数を一時的に上書き")
+    parser.add_argument("--batch-size", type=int, default=None, help="train_step のバッチサイズ一時上書き")
+    parser.add_argument("--log-dir", type=str, default=None, help="ログディレクトリ上書き")
+    parser.add_argument("--no-tb", action="store_true", help="TensorBoard を無効化")
+    parser.add_argument("--seed", type=int, default=None, help="乱数シード上書き")
+    args = parser.parse_args()
+
+    cfg = dict(ALPHA_ZERO_CONFIG)
+    if args.num_sim is not None:
+        cfg["num_simulations"] = args.num_sim
+    if args.batch_size is not None:
+        cfg["batch_size"] = args.batch_size
+    if args.log_dir is not None:
+        cfg["log_dir"] = args.log_dir
+    if args.no_tb:
+        cfg["enable_tensorboard"] = False
+    if args.seed is not None:
+        cfg["seed"] = args.seed
+
+    print("[CLI] Config overrides:", {k: cfg[k] for k in ["num_simulations","batch_size","log_dir","enable_tensorboard"] if k in cfg})
+    trainer = Trainer(config=cfg)
     trainer.setup()
-    trainer.self_play(num_episodes=1)
-    trainer.train_updates(num_updates=1)
-    print("[INFO] quick run finished")
-    print("[INFO] save checkpoints/policy_value_latest.pt and replay_buffer.joblib")
+    trainer.self_play(num_episodes=args.episodes)
+    trainer.train_updates(num_updates=args.updates)
+    print(f"[INFO] run finished episodes={args.episodes} updates={args.updates}")
+    print("[INFO] checkpoints ->", cfg.get("checkpoint_path"))
+    print("[INFO] replay ->", cfg.get("replay_path"))

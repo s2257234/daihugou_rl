@@ -60,6 +60,13 @@ ALPHA_ZERO_CONFIG = {
     # 実行安全性 / 時間制御
     # ---------------------------
     "max_episode_steps": 800,        # 1エピソードのステップ上限 (無限長防止 / 強制打ち切り)
+    # ---------------------------
+    # ログ / 可視化
+    # ---------------------------
+    "log_dir": "logs",              # ログ出力ディレクトリ (CSV / TensorBoard)
+    "enable_tensorboard": True,      # TensorBoard 出力を有効化
+    "mcts_log_sample_rate": 0.15,    # MCTS ルート統計のサンプリング率
+    "clear_logs_on_start": True,     # 起動時に既存ログを消去 (Falseで残す)
 }
 
 __all__ = ["ALPHA_ZERO_CONFIG"]

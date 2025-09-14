@@ -86,6 +86,13 @@ class AlphaZeroAgent:
         # For assigning values later
         self._phase_indices: List[int] = []
         self.env_ref = None
+        # ログ用: Trainer から直接セット
+        self.logger = None
+        # train_step 内で log_train を呼んだかどうか (trainer での二重記録防止)
+        self._logged_inside = False
+        # 累積フェーズ勝利統計 (報酬可視化用)
+        self.total_value_samples = 0  # value(=フェーズラベル)が確定したサンプル総数
+        self.total_positive = 0       # そのうち勝者(=1)ラベル数
 
     # ---------------- Public API ----------------
     def set_model(self, model):
@@ -113,6 +120,36 @@ class AlphaZeroAgent:
         else:
             cur_temp = 1e-6
         pi = softmax_temperature_policy(visits, cur_temp)
+
+        # MCTS ルート統計をサンプリングログ
+        if actions:
+            try:
+                import math
+                priors = [root.children[a].prior for a in actions]
+                s_p = sum(priors)
+                priors_n = [p / s_p for p in priors] if s_p > 0 else [1/len(priors)]*len(priors)
+                s_v = sum(visits)
+                visit_probs = [v / s_v for v in visits] if s_v > 0 else [1/len(visits)]*len(visits)
+                def _entropy(vec):
+                    return -sum(p*math.log(max(p,1e-12)) for p in vec)
+                prior_ent = _entropy(priors_n)
+                visit_ent = _entropy(visit_probs)
+                kl = sum(p*(math.log(max(p,1e-12)) - math.log(max(q,1e-12))) for p,q in zip(priors_n, visit_probs))
+                top1_same = 1 if priors_n.index(max(priors_n)) == visit_probs.index(max(visit_probs)) else 0
+                rate = self.config.get("mcts_log_sample_rate", 0.15)
+                if self.logger and random.random() < rate:
+                    self.logger.log_mcts_sample({
+                        "player": self.player_id,
+                        "move_index": self.move_count,
+                        "legal_count": len(actions),
+                        "prior_entropy": prior_ent,
+                        "visit_entropy": visit_ent,
+                        "kl_prior_visit": kl,
+                        "top1_same": top1_same,
+                        "temperature": cur_temp,
+                    })
+            except Exception:
+                pass
 
         chosen = random.choices(actions, weights=pi, k=1)[0] if actions else "pass"
         action_env = None if chosen == "pass" else chosen
@@ -299,6 +336,12 @@ class AlphaZeroAgent:
     def assign_values(self, indices: List[int], value: float):
         for i in indices:
             if 0 <= i < len(self.replay_buffer):
+                # 既に未確定(None) -> 確定するタイミングで統計反映
+                prev = self.replay_buffer[i]["value"]
+                if prev is None:
+                    self.total_value_samples += 1
+                    if value > 0.5:
+                        self.total_positive += 1
                 self.replay_buffer[i]["value"] = value
 
     def finalize_phase(self, winner_player_id: int, was_active: bool):
@@ -322,7 +365,10 @@ class AlphaZeroAgent:
     # ---------------- Persistence ----------------
     def save_replay(self, path: Optional[str] = None):
         path = path or self.config.get("replay_path", "replay_buffer.joblib")
-        joblib.dump(self.replay_buffer, path)
+        try:
+            joblib.dump(self.replay_buffer, path, compress=3)
+        except Exception:
+            joblib.dump(self.replay_buffer, path)
 
     def load_replay(self, path: Optional[str] = None):
         path = path or self.config.get("replay_path", "replay_buffer.joblib")
@@ -333,6 +379,8 @@ class AlphaZeroAgent:
 
     # ---------------- Training ----------------
     def train_step(self, batch_size: int = 64):
+        # ログ二重記録制御フラグ初期化
+        self._logged_inside = False
         try:
             import torch
         except ImportError:
@@ -350,6 +398,11 @@ class AlphaZeroAgent:
         value_losses = []
         entropies = []
         valid = 0
+        # 統計収集
+        collected_pi = []  # target pi
+        collected_model = []  # model probs
+        collected_v_pred = []
+        collected_v_t = []
         variable = getattr(self.model, 'supports_variable_actions', False) and hasattr(self.model, 'evaluate')
 
         for sample in batch:
@@ -415,6 +468,12 @@ class AlphaZeroAgent:
             entropies.append(entropy)
             valid += 1
 
+            # 追加統計
+            collected_pi.append(pi_t.detach())
+            collected_model.append(probs.detach())
+            collected_v_pred.append(v_clamped.detach())
+            collected_v_t.append(v_t.detach())
+
         if valid == 0:
             return {"loss": None, "reason": "no_valid_samples"}
 
@@ -430,13 +489,68 @@ class AlphaZeroAgent:
             import torch as _t
             _t.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
         self._optimizer.step()
-        return {
+
+        # 追加メトリクス
+        policy_kl = None
+        policy_top1 = None
+        value_acc = None
+        value_brier = None
+        pos_rate = None
+        if collected_pi:
+            try:
+                import torch as _t
+                # サンプル単位で KL / top1 を計算し Python list に蓄積し平均
+                kl_list = []
+                top1_list = []
+                v_hit_list = []
+                brier_list = []
+                v_label_list = []
+                for pi_t, model_p, v_pred_c, v_lab in zip(collected_pi, collected_model, collected_v_pred, collected_v_t):
+                    # KL(pi || p_model)
+                    kl = (pi_t * (pi_t.add(1e-12).log() - model_p.add(1e-12).log())).sum().item()
+                    kl_list.append(kl)
+                    # top1 match
+                    if pi_t.numel() > 0 and model_p.numel() > 0:
+                        top1_list.append(1.0 if int(pi_t.argmax()) == int(model_p.argmax()) else 0.0)
+                    # value accuracy (0.5閾値)
+                    v_hit_list.append(1.0 if (float(v_pred_c) > 0.5) == (float(v_lab) > 0.5) else 0.0)
+                    # brier
+                    brier_list.append(float((v_pred_c - v_lab).pow(2).item()))
+                    v_label_list.append(float(v_lab.item()))
+                import math as _m
+                if kl_list:
+                    policy_kl = float(sum(kl_list) / len(kl_list))
+                if top1_list:
+                    policy_top1 = float(sum(top1_list) / len(top1_list))
+                if v_hit_list:
+                    value_acc = float(sum(v_hit_list) / len(v_hit_list))
+                if brier_list:
+                    value_brier = float(sum(brier_list) / len(brier_list))
+                if v_label_list:
+                    pos_rate = float(sum(1.0 if v>0.5 else 0.0 for v in v_label_list) / len(v_label_list))
+            except Exception as e:  # 1回だけ標準出力へ
+                if not hasattr(self, '_metric_warned'):
+                    print(f"[WARN] metric calc failed: {e}")
+                    self._metric_warned = True
+
+        metrics = {
             "loss": float(total_loss.item()),
             "policy_loss": float(policy_loss_mean.item()),
             "value_loss": float(value_loss_mean.item()),
             "entropy": float(entropy_mean.item()),
             "samples": valid,
+            "policy_kl": policy_kl,
+            "policy_top1_match": policy_top1,
+            "value_acc": value_acc,
+            "value_brier": value_brier,
+            "pos_rate": pos_rate,
+            # 累積 (学習開始以降) のフェーズ勝率
+            "cum_pos_rate": (self.total_positive / self.total_value_samples) if self.total_value_samples > 0 else None,
         }
+        if self.logger:
+            self.logger.log_train(metrics)
+            self._logged_inside = True
+        return metrics
 
     def reset_episode(self):
         self.move_count = 0
