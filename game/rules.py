@@ -1,6 +1,12 @@
 class RuleChecker:
     def __init__(self):
         self.revolution = False  # 革命フラグ
+        # 追加ルール: 既存の階段より強い階段を出す際、
+        #   1) ランク集合が一切重ならない (完全に上位の新しいブロック)
+        #   2) その最小ランク(※Aは14として扱う) が 前の最大ランク より大きい
+        # を要求する。これにより 9-10-J の後に J-Q-K や 10-J-Q は不可、最初に出せるのは Q-K-A。
+        # デフォルト有効。従来挙動に戻したい場合 False に設定。
+        self.strict_straight_progression = True
 
     # === 役分類 / 比較ユーティリティ =====================================
     def classify_combo(self, cards):
@@ -84,7 +90,25 @@ class RuleChecker:
             return False
         if challenger['size'] != field_combo['size']:
             return False
-        # 階段 or 同ランク系 は strength 比較
+        # 階段の特別ルール (strict progression)
+        if challenger['type'] == 'straight' and self.strict_straight_progression:
+            old_ranks = field_combo.get('ranks', [])
+            new_ranks = challenger.get('ranks', [])
+            if not old_ranks or not new_ranks:
+                return False
+            # 1(A) は比較のため 14 に持ち上げ (循環を切って一方向比較)
+            def norm(r):
+                return 14 if r == 1 else r
+            # 1) ランク集合が重なったら不可
+            if set(old_ranks) & set(new_ranks):
+                return False
+            # 2) 新階段の“全ての”ランクが旧階段最大ランクより上になることを要求
+            old_max = max(norm(r) for r in old_ranks)
+            new_min = min(norm(r) for r in new_ranks)
+            if new_min <= old_max:
+                return False
+            return True
+        # それ以外 (従来通り) : strength 比較
         return self._compare_strength_value(challenger['strength'], field_combo['strength'])
 
     def _compare_strength_value(self, a, b):
