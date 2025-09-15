@@ -45,6 +45,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from agents.drl_agent import AlphaZeroAgent
+from agents.replay_buffer import ReplayBuffer
 from agents.models import PolicyValueNet
 from agents.config import ALPHA_ZERO_CONFIG
 from utils.logger import TrainingLogger
@@ -90,10 +91,20 @@ class Trainer:
             use_tensorboard=self.config.get("enable_tensorboard", True),
             clear_existing=self.config.get("clear_logs_on_start", False)
         )
+        # 共有リプレイバッファ (use_shared_replay=true の場合)
+        self.shared_replay = None
+        if self.config.get("use_shared_replay", False):
+            self.shared_replay = ReplayBuffer(
+                maxlen=self.config.get("buffer_size", 50000),
+                path=self.config.get("replay_path", "replay_buffer.joblib")
+            )
         # 初期は全員学習エージェント (ウォームアップで差し替える)
         self.agents = []
         for i in range(self.config["num_players"]):
             ag = AlphaZeroAgent(player_id=i, model=self.model, config=self.config)
+            # 共有モードならリプレイ参照注入
+            if self.shared_replay is not None:
+                ag.replay_buffer = self.shared_replay
             self.agents.append(ag)
         # 環境生成 (内部の env.agents も後で差し替える可能性があるため agent_classes=None)
         self.env = DaifugoSimpleEnv(num_players=self.config["num_players"], agent_classes=None)
@@ -106,6 +117,26 @@ class Trainer:
             # 後方互換: エージェントが logger を受け取れるなら設定
             if hasattr(ag, 'logger'):
                 ag.logger = self.logger
+            # 念のため共有リプレイ再注入 (ウォームアップ戻し時等)
+            if self.shared_replay is not None:
+                ag.replay_buffer = self.shared_replay
+        # 既存リプレイのロード (継続学習対応)
+        if self.shared_replay is not None:
+            replay_path = self.config.get("replay_path", "replay_buffer.joblib")
+            if os.path.exists(replay_path):
+                try:
+                    loaded = ReplayBuffer.load(replay_path)
+                    # load は新インスタンスを返すので差し替え
+                    self.shared_replay = loaded
+                    for ag in self.agents:
+                        if isinstance(ag, AlphaZeroAgent):
+                            ag.replay_buffer = self.shared_replay
+                    if self.logger:
+                        self.logger.log_text(f"[replay] loaded existing shared buffer size={len(self.shared_replay)}")
+                    else:
+                        print(f"[INFO] loaded replay size={len(self.shared_replay)}")
+                except Exception as e:
+                    print(f"[WARN] replay load failed: {e}")
 
     # ウォームアップ用: 他プレイヤーを簡易エージェントに差し替え
     def _apply_warmup_opponents(self):
@@ -131,6 +162,8 @@ class Trainer:
         for ag in self.agents:
             if isinstance(ag, AlphaZeroAgent) and hasattr(ag, 'set_env_ref'):
                 ag.set_env_ref(self.env)
+                if self.shared_replay is not None:
+                    ag.replay_buffer = self.shared_replay
 
     def _restore_learning_agents(self):
         # すべて AlphaZeroAgent に戻す (学習対象以外を新規インスタンスにしてもよいが、簡単のため再生成)
@@ -146,6 +179,8 @@ class Trainer:
         for ag in self.agents:
             if isinstance(ag, AlphaZeroAgent) and hasattr(ag, 'set_env_ref'):
                 ag.set_env_ref(self.env)
+                if self.shared_replay is not None:
+                    ag.replay_buffer = self.shared_replay
 
     # -----------------------------------------------------
     # 自己対局 (データ収集)
@@ -269,6 +304,18 @@ class Trainer:
     def train_updates(self, num_updates: int = 1):
         for i in range(num_updates):
             loss_info = self.agents[0].train_step(batch_size=self.config.get("batch_size", 256))
+            # サンプル不足/偏り警告
+            if loss_info.get("reason") == "no_data":
+                print("[WARN] train_step skipped: no_data (consider increasing episodes or buffer)")
+            else:
+                # 共有バッファ存在時に学習プレイヤーサンプルの割合を軽くチェック
+                if self.config.get("use_shared_replay", False) and self.shared_replay is not None:
+                    total = len(self.shared_replay)
+                    if total > 0:
+                        own = sum(1 for _ in self.shared_replay.iter_all(owner_pid=self.learning_player_id))
+                        ratio = own / total
+                        if ratio < 0.15:  # しきい値は暫定
+                            print(f"[WARN] low data share for learner: {own}/{total} ({ratio:.2%})")
             if (i + 1) % self.config.get("log_interval", 50) == 0:
                 print(f"[TRAIN] update={i+1} loss={loss_info}")
             # ロガーへ (train_step 内で既に push されている場合は二重記録を避ける)
@@ -284,8 +331,15 @@ class Trainer:
         path = self.config["checkpoint_path"]
         if self.model is not None:
             self.model.save(path)
-        # 代表エージェントのリプレイを保存 (本来は統合 / マージも検討)
-        self.agents[0].save_replay(self.config.get("replay_path", "replay_buffer.joblib"))
+        # リプレイ保存: 共有モードなら共有バッファを保存、そうでなければ従来通り代表エージェント
+        replay_path = self.config.get("replay_path", "replay_buffer.joblib")
+        if self.shared_replay is not None:
+            try:
+                self.shared_replay.save(replay_path)
+            except Exception as e:
+                print(f"[WARN] shared replay save failed: {e}")
+        else:
+            self.agents[0].save_replay(replay_path)
 
 
 __all__ = ["Trainer"]

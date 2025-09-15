@@ -57,10 +57,10 @@ class AlphaZeroAgent:
         self.player_id = player_id
         self.config = config or ALPHA_ZERO_CONFIG
         self.model = model
-
-        # Replay buffer
-        self.replay_buffer: List[Dict[str, Any]] = []
+        # Replay buffer (shared or local placeholder)
+        self.replay_buffer: Any = []  # shared ReplayBuffer が Trainer から注入される想定
         self.max_buffer_size = self.config.get("buffer_size", 50000)
+        self._use_shared = self.config.get("use_shared_replay", False)
 
         # MCTS params
         self.num_simulations = self.config.get("num_simulations", 64)
@@ -83,8 +83,8 @@ class AlphaZeroAgent:
         self.grad_clip = self.config.get("grad_clip", 1.0)
         self._optimizer = None
 
-        # For assigning values later
-        self._phase_indices: List[int] = []
+        # フェーズ中のサンプル参照 (shared モードでは dict 参照)
+        self._phase_samples: List[Any] = []
         self.env_ref = None
         # ログ用: Trainer から直接セット
         self.logger = None
@@ -98,6 +98,8 @@ class AlphaZeroAgent:
         self.phase_correct = 0        # そのうち value 予測(0.5閾値)が的中した数
         self.episode_phase_total = 0  # エピソード内フェーズ数
         self.episode_phase_correct = 0
+        # 追い出し検知カウンタ
+        self.lost_phase_samples = 0
 
     # ---------------- Public API ----------------
     def set_model(self, model):
@@ -172,8 +174,8 @@ class AlphaZeroAgent:
             _, value_scalar_for_store = self._policy_value(env)
         except Exception:
             value_scalar_for_store = 0.5
-        idx = self._store_sample(state_repr, serialized_legal, pi, None, value_pred=value_scalar_for_store)
-        self._phase_indices.append(idx)
+        stored = self._store_sample(state_repr, serialized_legal, pi, None, value_pred=value_scalar_for_store)
+        self._phase_samples.append(stored)
         self.move_count += 1
         return action_env
 
@@ -333,39 +335,53 @@ class AlphaZeroAgent:
 
     # ---------------- Replay buffer ----------------
     def _store_sample(self, state, legal_actions, pi, value, value_pred: Optional[float] = None):
-        # value 未確定は None のまま保持 (学習時にスキップ)
         sample = {
+            "player_id": self.player_id,
             "state": state,
             "legal_actions": legal_actions,
             "pi": pi,
-            "value": value,      # None or float (ラベル)
-            "value_pred": value_pred,  # 直近ルート推論確率 (フェーズ精度計測用)
+            "value": value,      # None or float
+            "value_pred": value_pred,
         }
+        if self._use_shared and hasattr(self.replay_buffer, 'append'):
+            self.replay_buffer.append(sample)  # shared ReplayBuffer -> returns uid (unused)
+            return sample  # 参照返却
+        # ローカル (後方互換)
         if len(self.replay_buffer) >= self.max_buffer_size:
             self.replay_buffer.pop(0)
         self.replay_buffer.append(sample)
-        return len(self.replay_buffer) - 1
+        return sample
 
-    def assign_values(self, indices: List[int], value: float):
-        for i in indices:
-            if 0 <= i < len(self.replay_buffer):
-                # 既に未確定(None) -> 確定するタイミングで統計反映
-                prev = self.replay_buffer[i]["value"]
-                if prev is None:
-                    self.total_value_samples += 1
-                    if value > 0.5:
-                        self.total_positive += 1
-                self.replay_buffer[i]["value"] = value
+    def assign_values(self, samples: List[Any], value: float):
+        for s in samples:
+            if not isinstance(s, dict):
+                # 後方互換: index の可能性
+                if 0 <= s < len(self.replay_buffer):
+                    rec = self.replay_buffer[s]
+                else:
+                    continue
+            else:
+                rec = s
+            prev = rec.get("value")
+            if prev is None:
+                self.total_value_samples += 1
+                if value > 0.5:
+                    self.total_positive += 1
+            rec["value"] = value
 
     def finalize_phase(self, winner_player_id: int, was_active: bool):
-        if not was_active or not self._phase_indices:
-            self._phase_indices = []
+        if not was_active or not self._phase_samples:
+            self._phase_samples = []
             return
         val = 1.0 if self.player_id == winner_player_id else 0.0
+        # 追い出されて学習対象外になったサンプル数カウント
+        lost = sum(1 for s in self._phase_samples if isinstance(s, dict) and s.get("in_buffer") is False)
+        if lost:
+            self.lost_phase_samples += lost
         # フェーズ精度: フェーズ内最後のサンプルの value_pred を代表として用いる
         try:
-            last_idx = self._phase_indices[-1]
-            pred = self.replay_buffer[last_idx].get("value_pred")
+            last_rec = self._phase_samples[-1]
+            pred = last_rec.get("value_pred") if isinstance(last_rec, dict) else None
             if pred is not None:
                 self.phase_total += 1
                 self.episode_phase_total += 1
@@ -375,30 +391,31 @@ class AlphaZeroAgent:
                     self.episode_phase_correct += 1
         except Exception:
             pass
-        self.assign_values(self._phase_indices, val)
-        self._phase_indices = []
+        self.assign_values(self._phase_samples, val)
+        self._phase_samples = []
 
     def flush_unfinished_phase(self):
-        # ゲーム終了時などに未確定フェーズが残った場合は「次に上がれなかった」として 0 を付与
-        if self._phase_indices:
-            # unfinished フェーズも評価対象とみなす (pred vs 0)
+        if self._phase_samples:
+            lost = sum(1 for s in self._phase_samples if isinstance(s, dict) and s.get("in_buffer") is False)
+            if lost:
+                self.lost_phase_samples += lost
             try:
-                last_idx = self._phase_indices[-1]
-                pred = self.replay_buffer[last_idx].get("value_pred")
+                last_rec = self._phase_samples[-1]
+                pred = last_rec.get("value_pred") if isinstance(last_rec, dict) else None
                 if pred is not None:
                     self.phase_total += 1
                     self.episode_phase_total += 1
-                    if (pred <= 0.5):  # 正解は 0 ラベル
+                    if pred <= 0.5:
                         self.phase_correct += 1
                         self.episode_phase_correct += 1
             except Exception:
                 pass
-            self.assign_values(self._phase_indices, 0.0)
-            self._phase_indices = []
+            self.assign_values(self._phase_samples, 0.0)
+            self._phase_samples = []
 
     def finalize_game(self, *_args, **_kwargs):  # 互換維持用 no-op
         # 最終順位報酬は使用しない方針のため何もしない
-        self._phase_indices = []
+        self._phase_samples = []
 
     # ---------------- Persistence ----------------
     def save_replay(self, path: Optional[str] = None):
@@ -423,14 +440,26 @@ class AlphaZeroAgent:
             import torch
         except ImportError:
             return {"loss": None, "reason": "torch_not_installed"}
-        if self.model is None or not self.replay_buffer:
-            return {"loss": None, "reason": "no_data_or_model"}
+        # 共有モード: 自分のサンプルが一件も無ければスキップ
+        if self.model is None:
+            return {"loss": None, "reason": "no_model"}
+        # 可用サンプル収集
+        if self._use_shared and hasattr(self.replay_buffer, 'iter_all'):
+            # value が確定しているサンプルのみ抽出
+            my_samples = [s for s in self.replay_buffer.iter_all(owner_pid=self.player_id) if s.get("value") is not None]
+            if not my_samples:
+                return {"loss": None, "reason": "no_data"}
+            batch_pool = my_samples
+        else:
+            if not self.replay_buffer:
+                return {"loss": None, "reason": "no_data"}
+            batch_pool = self.replay_buffer
 
         if self._optimizer is None:
             params = [p for p in self.model.parameters() if p.requires_grad]
             self._optimizer = torch.optim.Adam(params, lr=self.lr, weight_decay=self.weight_decay)
 
-        batch = self.replay_buffer if len(self.replay_buffer) <= batch_size else random.sample(self.replay_buffer, batch_size)
+        batch = batch_pool if len(batch_pool) <= batch_size else random.sample(batch_pool, batch_size)
 
         policy_losses = []
         value_losses = []

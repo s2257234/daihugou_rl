@@ -67,6 +67,11 @@ ALPHA_ZERO_CONFIG = {
     "enable_tensorboard": True,      # TensorBoard 出力を有効化
     "mcts_log_sample_rate": 0.15,    # MCTS ルート統計のサンプリング率
     "clear_logs_on_start": True,     # 起動時に既存ログを消去 (Falseで残す)
+    # ---------------------------
+    # リプレイ共有 / 構造
+    # ---------------------------
+    "use_shared_replay": True,       # 全エージェントで単一の共有リプレイバッファを使用
+    "replay_recent_sample_ratio": 0.0,  # >0 なら直近一定割合を優先サンプリング (未実装placeholder)
 }
 
 __all__ = ["ALPHA_ZERO_CONFIG"]
