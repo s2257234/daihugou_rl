@@ -21,6 +21,12 @@ class Game:
         self.last_player = None # 最後にカードを出したプレイヤー
         self.rankings = []  # 上がった順に記録するリスト
         self._deal_cards()  # カードを配る
+        # 革命デバッグ用フラグ: True の場合 REV_EVENT 行を出力
+        self.debug_revolution_trace = True
+        # ゲーム終了時に革命イベントを自動出力するフラグ
+        self.auto_dump_revolution_events = True
+        # 見出しを一度だけ出すための内部フラグ
+        self._rev_events_header_printed = True
 
     def _all_others_passed(self):
         """
@@ -49,6 +55,7 @@ class Game:
         self.rankings = []
         self._deal_cards()  # 新しい手札を配る
         self.rule_checker.reset_revolution()  # 革命状態もリセット
+        self.rule_checker.clear_revolution_events()  # イベント履歴をクリア
         # 新しい手札が配られた後にカード交換を実施
         if prev_rankings and len(prev_rankings) == self.num_players:
             self.rule_checker.exchange_cards_by_rankings(self.players, prev_rankings)
@@ -157,16 +164,61 @@ class Game:
                 pass
             # ゲーム中の出力を「Player X played: ...」形式に（解決済みの card_objs を使用）
             played_str = ', '.join(str(c) for c in card_objs) if card_objs else ''
-            self.log(f"Player {self.turn} played: {played_str}")
+            # 1) 場に反映
             self._play_cards(player, card_objs)
             self.last_player = self.turn
-            # 特殊ルール処理
-            reset_happened, ret = self._handle_special_rules(card_objs)
-            if reset_happened:
-                return ret
+            # 2) 革命判定のみ先に実行 (出力順制御のため分離)
+            prev_rev = self.rule_checker.revolution
+            rev_triggered = False
+            try:
+                # 四枚同ランク or 5枚以上階段で革命トグル (イベント記録付き)
+                rev_triggered = self.rule_checker.check_revolution(
+                    card_objs,
+                    player_id=self.turn,
+                    turn_count=self.turn_count
+                )
+            except Exception:
+                pass
+            new_rev = self.rule_checker.revolution
+            rev_changed = (prev_rev != new_rev)
+            rev_flag = ' (REV)' if new_rev else ''
+            trig = ' [+REV]' if rev_changed and new_rev else (' [-REV]' if rev_changed and not new_rev else '')
+            # 3) プレイログ (リセット系より先に必ず出す)
+            self.log(f"Player {self.turn} played: {played_str}{rev_flag}{trig}")
+            # 革命発生メッセージ (オプション) - 従来互換
+            if rev_triggered:
+                self.log(f"革命発生! 現在の革命状態: {self.rule_checker.revolution}")
+                if self.debug_revolution_trace:
+                    # 直近イベントのみ取り出し
+                    ev = self.rule_checker.revolution_events[-1] if self.rule_checker.revolution_events else None
+                    if ev:
+                        self.log(
+                            "REV_EVENT "
+                            f"turn={ev['turn']} player={ev['player']} reason={ev['reason']} "
+                            f"old={ev['old_state']} new={ev['new_state']} cards={ev['cards']} meta={ev['meta']}"
+                        )
+            # 4) その他特殊ルール: 階段表示 / 8切り / ジョーカー流し
+            try:
+                # 階段 (表示のみ)
+                if self.rule_checker.is_straight(card_objs):
+                    self.log(f"Player {self.turn} が階段を出しました: {[str(c) for c in card_objs]}")
+            except Exception:
+                pass
+            # 8切り
+            if self.rule_checker.is_8cut(card_objs):
+                self.log(f"8切り発動 by Player {self.turn}!")
+                self.last_player = self.turn
+                self._reset_field()
+                return self.get_state(self.turn), False, True, "eight_cut"
+            # ジョーカー流し
+            if len(card_objs) == 1 and card_objs[0].is_joker:
+                self.last_player = self.turn
+                self._reset_field()
+                return self.get_state(self.turn), False, True, "joker_cut"
         else:
             # ゲーム中の出力を「Player X passed.」形式に
-            self.log(f"Player {self.turn} passed.")
+            rev_flag = ' (REV)' if self.rule_checker.revolution else ''
+            self.log(f"Player {self.turn} passed.{rev_flag}")
             action_cards = None
             self.passed[self.turn] = True
             # 最後に出したプレイヤー以外が全員パス → 場リセット
@@ -245,8 +297,30 @@ class Game:
             last_player = [i for i in range(self.num_players) if i not in self.rankings][0]
             self.rankings.append(last_player)
             self.done = True
+            if self.auto_dump_revolution_events:
+                self.dump_revolution_events()
             return True
         return False
+
+    # --- 革命イベントログ出力ユーティリティ -----------------------
+    def dump_revolution_events(self):
+        """現在のゲームに記録された革命イベントログを整形して出力する。"""
+        events = self.rule_checker.get_revolution_events()
+        if not events:
+            self.log("[REV_EVENTS] (none)")
+            return
+        if not self._rev_events_header_printed:
+            self.log("[REV_EVENTS] turn player reason old->new size cards meta")
+            self._rev_events_header_printed = True
+        for ev in events:
+            self.log(
+                f"[REV_EVENTS] {ev['turn']} P{ev['player']} {ev['reason']} "
+                f"{ev['old_state']}->{ev['new_state']} {ev['size']} {ev['cards']} {ev['meta']}"
+            )
+
+    def print_revolution_events(self):
+        """エイリアスメソッド (dump_revolution_events と同じ)。"""
+        self.dump_revolution_events()
 
     # --- 補助メソッド ---
     def _find_hand_cards(self, player, action_cards):
