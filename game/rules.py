@@ -291,73 +291,69 @@ class RuleChecker:
 
     def check_revolution(self, cards, player_id=None, turn_count=None):
         """
-        革命発生条件を判定し、該当すればself.revolutionをTrueにする。
-        例: 同じランク4枚以上（ジョーカー含む場合は調整可）、または5枚以上の階段
+        革命トグル判定 (現在の仕様):
+          - 条件: (1) 四枚同ランク(ジョーカー補完可, ちょうど4枚) または (2) 5枚以上の階段(ジョーカー可)
+          - 条件成立ごとに revolution フラグを反転 (OFF→ON / ON→OFF)
+          - 同一手番・同一カード集合での多重トグル防止 (idempotent)
+        戻り値: トグルが発生した場合 True, それ以外 False
         """
-        # 同一手番・同一カード集合に対する重複判定（安全側: 情報が無ければスキップ）
+        if not cards:
+            return False
+        # 重複発火保護キー
         action_key = None
         try:
-            if turn_count is not None and player_id is not None and cards is not None:
+            if turn_count is not None and player_id is not None:
                 canonical_cards = tuple(sorted(str(c) for c in cards))
                 action_key = (int(turn_count), int(player_id), canonical_cards)
                 if action_key in self._rev_seen_actions:
                     return False
         except Exception:
-            # 何らかの理由でキー生成失敗時は保護を無効化して継続
             action_key = None
+
         non_jokers = [c for c in cards if not c.is_joker]
         jokers = [c for c in cards if c.is_joker]
-        old_state = self.revolution
-        toggled = False
-        reason = None
-        meta = {
-            'straight_len': None,
-            'rank': None,
-            'jokers': len(jokers),
-        }
-        # 4枚(以上)同ランク条件
-        if self.rev_enable_four_kind and len(non_jokers) > 0:
-            rank = non_jokers[0].rank
-            same_rank_with_jokers = all(c.rank == rank or c.is_joker for c in cards)
-            size_ok = (
-                (len(cards) == 4 if self.rev_four_kind_exact else len(cards) >= 4)
-            )
-            jokers_used = len(jokers) > 0
-            pure = same_rank_with_jokers and not jokers_used
-            cond_joker = self.rev_four_kind_allow_joker or not jokers_used
-            if not toggled and size_ok and same_rank_with_jokers and cond_joker:
-                self.revolution = not self.revolution
-                toggled = True
-                reason = 'four_kind'
-                meta['rank'] = rank
-                meta['pure'] = pure
-        # 階段条件
-        if (self.rev_enable_straight and not toggled and len(cards) >= self.rev_straight_min_len):
+
+        # 条件1: 四枚同ランク (ジョーカーで補完してよい) - ちょうど4枚
+        four_kind_ok = False
+        if len(cards) == 4:
+            if len(non_jokers) > 0:
+                base_rank = non_jokers[0].rank
+                if all(c.rank == base_rank or c.is_joker for c in cards):
+                    four_kind_ok = True
+
+        # 条件2: 5枚以上の階段 (ジョーカー使用可) - is_straight 判定利用
+        straight_ok = False
+        if len(cards) >= 5:
             if self.is_straight(cards):
-                jokers_used = len(jokers) > 0
-                if self.rev_straight_allow_joker or not jokers_used:
-                    self.revolution = not self.revolution
-                    toggled = True
-                    reason = 'long_straight'
-                    meta['straight_len'] = len(cards)
-                    meta['used_joker'] = jokers_used
-        if toggled:
-            event = {
-                'turn': turn_count,
-                'player': player_id,
-                'reason': reason,
-                'cards': [str(c) for c in cards],
-                'old_state': old_state,
-                'new_state': self.revolution,
-                'size': len(cards),
-                'meta': meta,
-            }
-            self.revolution_events.append(event)
-            # このアクションに対するトグルは記録済みとしてマーク（再トグル抑止）
-            if action_key is not None:
-                self._rev_seen_actions.add(action_key)
-            return True
-        return False
+                straight_ok = True
+
+        if not (four_kind_ok or straight_ok):
+            return False
+
+        # トグル
+        old_state = self.revolution
+        self.revolution = not self.revolution
+        pure = (len(jokers) == 0)
+        event = {
+            'turn': turn_count,
+            'player': player_id,
+            'reason': 'four_kind' if four_kind_ok else 'long_straight',
+            'cards': [str(c) for c in cards],
+            'old_state': old_state,
+            'new_state': self.revolution,
+            'size': len(cards),
+            'meta': {
+                'straight_len': len(cards) if straight_ok else None,
+                'rank': non_jokers[0].rank if four_kind_ok else None,
+                'jokers': len(jokers),
+                'pure': pure,
+                'toggled': True,
+            },
+        }
+        self.revolution_events.append(event)
+        if action_key is not None:
+            self._rev_seen_actions.add(action_key)
+        return True
 
     def reset_revolution(self):
         """
