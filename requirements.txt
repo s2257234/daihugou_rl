@@ -11,3 +11,6 @@ tensorboard==2.16.2
 
 # TensorBoard compatibility (avoid MessageToJson keyword error)
 protobuf==4.25.3
+
+# Plotting (evaluation visualization)
+matplotlib==3.9.0
