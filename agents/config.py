@@ -72,6 +72,12 @@ ALPHA_ZERO_CONFIG = {
     # ---------------------------
     "use_shared_replay": True,       # 全エージェントで単一の共有リプレイバッファを使用
     "replay_recent_sample_ratio": 0.0,  # >0 なら直近一定割合を優先サンプリング (未実装placeholder)
+    # ---------------------------
+    # ハードウェア / デバイス
+    # ---------------------------
+    # 'auto' -> torch.cuda.is_available() なら 'cuda'、それ以外は 'cpu'
+    # 明示的に 'cpu' / 'cuda' / 'cuda:0' などを指定することも可能
+    "device": "auto",
 }
 
 __all__ = ["ALPHA_ZERO_CONFIG"]

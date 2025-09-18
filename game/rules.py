@@ -7,7 +7,23 @@ class RuleChecker:
         # を要求する。これにより 9-10-J の後に J-Q-K や 10-J-Q は不可、最初に出せるのは Q-K-A。
         # デフォルト有効。従来挙動に戻したい場合 False に設定。
         self.strict_straight_progression = True
-
+        # 革命イベントログ: トグル発生時のみ追加
+        # 例: {'turn': 5, 'player': 2, 'reason': 'four_kind', 'cards': [...], 'old_state': False,
+        #       'new_state': True, 'size': 4, 'meta': {'straight_len': None, 'rank': 7, 'jokers':1}}
+        self.revolution_events = []
+        # 革命発生条件の閾値設定（デフォルトは従来寄りの緩め）
+        # - 4枚同ランク（ジョーカー混在可、4枚ちょうどでなく4枚以上）
+        # - 階段は5枚以上（ジョーカー混在可）
+        self.rev_enable_four_kind = True
+        self.rev_four_kind_allow_joker = True
+        self.rev_four_kind_exact = False
+        self.rev_enable_straight = True
+        self.rev_straight_min_len = 5
+        self.rev_straight_allow_joker = True
+        # 同一手番・同一カード集合での重複トグル防止用（idempotent 保護）
+        # キー: (turn_count, player_id, tuple(sorted(str(c) for c in cards)))
+        self._rev_seen_actions = set()
+    
     # === 役分類 / 比較ユーティリティ =====================================
     def classify_combo(self, cards):
         """カード集合を役情報へ分類。無効なら None。
@@ -30,6 +46,10 @@ class RuleChecker:
 
         # Joker単体
         if n == 1 and jokers:
+            # 単体ジョーカーは代用情報を強制リセットして素の表示に統一
+            jk = jokers[0]
+            jk.joker_as_rank = None
+            jk.joker_as_suit = None
             return {
                 'type': 'joker_single',
                 'size': 1,
@@ -269,22 +289,73 @@ class RuleChecker:
             joker.joker_as_suit = None
         return []
 
-    def check_revolution(self, cards):
+    def check_revolution(self, cards, player_id=None, turn_count=None):
         """
         革命発生条件を判定し、該当すればself.revolutionをTrueにする。
         例: 同じランク4枚以上（ジョーカー含む場合は調整可）、または5枚以上の階段
         """
+        # 同一手番・同一カード集合に対する重複判定（安全側: 情報が無ければスキップ）
+        action_key = None
+        try:
+            if turn_count is not None and player_id is not None and cards is not None:
+                canonical_cards = tuple(sorted(str(c) for c in cards))
+                action_key = (int(turn_count), int(player_id), canonical_cards)
+                if action_key in self._rev_seen_actions:
+                    return False
+        except Exception:
+            # 何らかの理由でキー生成失敗時は保護を無効化して継続
+            action_key = None
         non_jokers = [c for c in cards if not c.is_joker]
-        # 4枚以上、かつ全て同じランク（ジョーカーは無視）
-        if len(cards) >= 4:
-            if len(non_jokers) > 0:
-                rank = non_jokers[0].rank
-                if all(c.rank == rank or c.is_joker for c in cards):
-                    self.revolution = not self.revolution  # 革命状態をトグル
-                    return True
-        # 5枚以上の階段
-        if len(cards) >= 5 and self.is_straight(cards):
-            self.revolution = not self.revolution
+        jokers = [c for c in cards if c.is_joker]
+        old_state = self.revolution
+        toggled = False
+        reason = None
+        meta = {
+            'straight_len': None,
+            'rank': None,
+            'jokers': len(jokers),
+        }
+        # 4枚(以上)同ランク条件
+        if self.rev_enable_four_kind and len(non_jokers) > 0:
+            rank = non_jokers[0].rank
+            same_rank_with_jokers = all(c.rank == rank or c.is_joker for c in cards)
+            size_ok = (
+                (len(cards) == 4 if self.rev_four_kind_exact else len(cards) >= 4)
+            )
+            jokers_used = len(jokers) > 0
+            pure = same_rank_with_jokers and not jokers_used
+            cond_joker = self.rev_four_kind_allow_joker or not jokers_used
+            if not toggled and size_ok and same_rank_with_jokers and cond_joker:
+                self.revolution = not self.revolution
+                toggled = True
+                reason = 'four_kind'
+                meta['rank'] = rank
+                meta['pure'] = pure
+        # 階段条件
+        if (self.rev_enable_straight and not toggled and len(cards) >= self.rev_straight_min_len):
+            if self.is_straight(cards):
+                jokers_used = len(jokers) > 0
+                if self.rev_straight_allow_joker or not jokers_used:
+                    self.revolution = not self.revolution
+                    toggled = True
+                    reason = 'long_straight'
+                    meta['straight_len'] = len(cards)
+                    meta['used_joker'] = jokers_used
+        if toggled:
+            event = {
+                'turn': turn_count,
+                'player': player_id,
+                'reason': reason,
+                'cards': [str(c) for c in cards],
+                'old_state': old_state,
+                'new_state': self.revolution,
+                'size': len(cards),
+                'meta': meta,
+            }
+            self.revolution_events.append(event)
+            # このアクションに対するトグルは記録済みとしてマーク（再トグル抑止）
+            if action_key is not None:
+                self._rev_seen_actions.add(action_key)
             return True
         return False
 
@@ -293,7 +364,19 @@ class RuleChecker:
         革命状態をリセット（場流し時など）
         """
         self.revolution = False
+        # 場流しなどで状態をリセットするが、イベント履歴は残す（完全リセットしたいときは clear_revolution_events を呼ぶ）
 
+    def clear_revolution_events(self):
+        """革命イベント履歴をクリア（新ゲーム開始時など）。"""
+        self.revolution_events.clear()
+        # 重複トグル保護のキーもクリア
+        self._rev_seen_actions.clear()
+
+    def get_revolution_events(self):
+        """革命イベント履歴を返す（参照用）。"""
+        return list(self.revolution_events)
+
+   
     def exchange_cards_by_rankings(self, players, rankings):
         """
         大富豪ルールの順位に応じたカード交換を行う。
@@ -316,7 +399,7 @@ class RuleChecker:
         for card in dai_hinmin_give:
             players[dai_hinmin].hand.remove(card)
         players[daifugo].hand.extend(dai_hinmin_give)
-        print(f"大貧民(Player {dai_hinmin})→大富豪(Player {daifugo}): {[str(c) for c in dai_hinmin_give]}")
+        #print(f"大貧民(Player {dai_hinmin})→大富豪(Player {daifugo}): {[str(c) for c in dai_hinmin_give]}")
 
         # --- 大富豪→大貧民（2枚） ---　自分の最も弱いカードを2枚渡す。
         daifugo_hand = sorted(players[daifugo].hand, key=lambda c: c.strength())
@@ -324,18 +407,18 @@ class RuleChecker:
         for card in daifugo_give:
             players[daifugo].hand.remove(card)
         players[dai_hinmin].hand.extend(daifugo_give)
-        print(f"大富豪(Player {daifugo})→大貧民(Player {dai_hinmin}): {[str(c) for c in daifugo_give]}")
+        #print(f"大富豪(Player {daifugo})→大貧民(Player {dai_hinmin}): {[str(c) for c in daifugo_give]}")
 
         # --- 貧民→富豪（1枚） ---　自分の最も強いカードを1枚渡す。
         hinmin_hand = sorted(players[hinmin].hand, key=lambda c: c.strength(), reverse=True)
         hinmin_give = hinmin_hand[0]
         players[hinmin].hand.remove(hinmin_give)
         players[fugo].hand.append(hinmin_give)
-        print(f"貧民(Player {hinmin})→富豪(Player {fugo}): {hinmin_give}")
+        #print(f"貧民(Player {hinmin})→富豪(Player {fugo}): {hinmin_give}")
 
         # --- 富豪→貧民（1枚） ---　自分の最も弱いカードを1枚渡す。
         fugo_hand = sorted(players[fugo].hand, key=lambda c: c.strength())
         fugo_give = fugo_hand[0]
         players[fugo].hand.remove(fugo_give)
         players[hinmin].hand.append(fugo_give)
-        print(f"富豪(Player {fugo})→貧民(Player {hinmin}): {fugo_give}")
+        #print(f"富豪(Player {fugo})→貧民(Player {hinmin}): {fugo_give}")
