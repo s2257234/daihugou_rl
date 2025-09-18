@@ -1,94 +1,103 @@
 # daihugou_rl
 
-大富豪（大貧民）AI対戦・強化学習用シミュレーション環境
+大富豪（大貧民）AI 対戦 / AlphaZero 風強化学習 + Elo 評価環境。
 
-## 開発支援ツール
+学習 (self-play + MCTS) → チェックポイント保存 → Elo 対戦評価 → 自動グラフ生成 までを一通り回せる最小構成です。
 
-本リポジトリでは、AIコードレビュー・自動ドキュメント生成支援のために CodeRabbit（フリー） を導入しています。
-CodeRabbitはVS Code拡張として利用でき、PRレビューやコード説明、リファクタ提案などをAIがサポートします。
-（詳細: https://coderabbit.ai/ja ）
+## 主要機能
 
-## 開発の進め方
+- 大富豪ルール: 革命 / 階段 / 8切り / ジョーカー流し / 順位に応じた次ゲームのカード交換
+- 強化学習エージェント: AlphaZero 風 MCTS + Policy/Value ネット (MLP)
+- リプレイバッファ（共有モード対応）
+- ロギング: CSV / (任意) TensorBoard
+- Elo レーティング: 対戦結果を多人数ペアワイズに分解して更新
+- 評価自動可視化: 評価完了ごとに勝率・平均順位・レーティング推移 PNG を再生成
 
-本リポジトリでは、機能追加やバグ修正ごとに新しいブランチを作成し、
-「feature/○○」「bugfix/○○」など用途ごとにブランチを切り分けて開発を進めています。
-開発が完了したら、プルリクエスト（PR）を作成し、マージする運用をしています
-
-
-## 概要
-
-このリポジトリは、トランプゲーム「大富豪（大貧民）」のルールに基づいたAI対戦・強化学習用のPython環境です。  
-複数のエージェント（AI）が自動で対戦し、順位やカード交換、階段出し・革命などのルールも実装されています。
-
-## ディレクトリ構成
+## ディレクトリ (抜粋)
 
 ```
-daihugou_rl/
-├── main.py                # メイン実行スクリプト
-├── re_main.py             # 別バージョンのメイン（リファクタ用等）
-├── agents/                # 標準エージェント（AI）群
-│   ├── straight_agent.py
-│   ├── random_agent.py
-│   ├── rule_based_agent.py
-│   └── ＿init＿.py
-├── game/                  # ゲーム本体・ルール・環境
-│   ├── card.py
-│   ├── environment.py
-│   ├── game.py
-│   ├── player.py
-│   ├── rules.py
-│   └── ＿init＿.py
-├── re_agents/             # 別バージョンのエージェント
-│   ├── random_agent.py
-│   └── ＿init＿.py
-├── re_game/               # 別バージョンのゲーム本体
-│   ├── card.py
-│   ├── environment.py
-│   ├── game.py
-│   ├── player.py
-│   ├── rules.py
-│   └── ＿init＿.py
-└── venv/                  # 仮想環境（無視してOK）
+agents/         # 学習/ベースラインエージェント (AlphaZero, Random, RuleBased, etc.)
+game/           # ゲーム進行・環境・ルール
+trainer/        # 学習ループ (self-play + train updates)
+evaluation/     # Elo 評価, 自動プロット (evaluator / run_eval / plot_eval / rating)
+checkpoints/    # 最新モデル保存 (policy_value_latest.pt)
+logs/           # 学習 & 評価ログ
+  └─ elo/      # Elo 関連ファイル (ratings.json, ratings.csv, eval_metrics.csv, figs/*.png)
+requirements.txt
 ```
 
-## 主なファイル・モジュール
+## 学習 (Self-Play + 更新)
 
+少数エピソードで動作確認:
 
-- `main.py`  
-  シミュレーションのエントリーポイント。複数エージェントで自動対戦し、順位集計も行う。
-
-- `game/environment.py`  
-  強化学習・AI対戦用の環境クラス（`DaifugoSimpleEnv`）。エージェントの行動選択や合法手生成、リセット処理など。
-
-- `game/game.py`  
-  ゲーム進行の本体クラス。カード配布、ターン管理、カード交換、順位決定など。
-
-- `game/player.py`  
-  プレイヤー（人間・AI問わず）の状態や手札、行動を管理するクラス。
-
-- `game/rules.py`  
-  ルール判定、階段判定、革命、カード交換ロジック（順位に応じて強い/弱いカードを交換）など。
-
-- `agents/`  
-  さまざまなAIエージェント（例：ランダム、ルールベース、階段優先など）。
-
-## 特徴的なルール実装
-
-- 階段出し、ペア出し、ジョーカー、革命、8切りなど大富豪の主要ルールをサポート
-- ゲーム終了後、前回の順位に応じて新しい手札からカード交換を自動実施
-- エージェントは差し替え可能で、強化学習やAI対戦の実験が容易
-
-## 実行方法
-
-1. 必要なパッケージをインストール（例: numpy）
-2. `main.py` を実行
-
-```bash
-python main.py
+```powershell
+python -m trainer.trainer --episodes 5 --updates 5 --device auto
 ```
 
-## カスタマイズ
+出力:
+- `checkpoints/policy_value_latest.pt` モデル
+- `replay_buffer.joblib` リプレイバッファ
+- `logs/episodes.csv`, `logs/train_updates.csv` など
 
-- エージェントの追加・差し替えは `agents/` フォルダにクラスを追加し、`main.py` の `agent_classes` を編集してください。
-- ルールやカード交換ロジックの調整は `game/rules.py` を参照。
+## Elo 評価（自動グラフ付き）
+
+学習済み (または初期) モデルをランダム/ルールベースと対戦評価:
+
+```powershell
+python -m evaluation.run_eval --episodes 20 --checkpoint checkpoints/policy_value_latest.pt
+```
+
+生成/更新される主ファイル:
+
+| ファイル | 内容 |
+|----------|------|
+| `logs/elo/ratings.json` | 最新 Elo 状態 (player -> rating) |
+| `logs/elo/ratings.csv`  | ゲームごとの全プレイヤー Elo 履歴 |
+| `logs/elo/eval_metrics.csv` | episode 単位の `win_rate, avg_rank, rating_p0` |
+| `logs/elo/figs/eval_progress.png` | WinRate & AvgRank 推移 |
+| `logs/elo/figs/p0_rating.png` | P0 (学習エージェント) Elo 推移 |
+| `logs/elo/figs/elo_history.png` | 全プレイヤー Elo 推移 |
+
+オプション:
+
+```text
+--mix rule,random,random   # ベースライン3枠指定 (rule/random)
+--no-tb                    # TensorBoard 無効
+--no-auto-plot             # 評価終了後の自動PNG生成を無効化
+--num-sim 32               # 評価時 MCTS シミュレーション数上書き
+```
+
+## 手動でプロット再生成のみ行いたい場合
+
+```powershell
+python -m evaluation.plot_eval --elo-dir logs/elo
+```
+
+## 方針 / 実装メモ
+
+- Elo: 4人最終順位を全ペア勝敗に変換し K=32 で Δ を均等適用。
+- 勝率は「1位獲得率」、平均順位は 1(最良)～4(最悪)。
+- 評価メトリクスは逐次 CSV 追記し、再実行で継続。リセットしたい場合は `logs/elo` フォルダを削除。
+
+## 代表クラス / スクリプト
+
+| パス | 役割 |
+|------|------|
+| `agents/drl_agent.py` | AlphaZero 風 MCTS エージェント |
+| `agents/models.py` | PolicyValueNet (方策+価値) |
+| `trainer/trainer.py` | Self-play & train スケジューラ |
+| `evaluation/evaluator.py` | 単発評価ロジック (1ゲーム生成) |
+| `evaluation/rating.py` | Elo 計算 & 永続化 |
+| `evaluation/run_eval.py` | CLI, 自動プロット呼び出し |
+| `evaluation/plot_eval.py` | CSV / Elo 履歴のPNG化 |
+| `game/rules.py` | 革命 / 8切り / 階段 判定など |
+
+## 今後の拡張候補
+
+- K係数スケジューリング (初期高速収束 → 安定化)
+- チェックポイント複数世代の総当たり評価
+- 勝率の信頼区間 (Wilson) 表示
+- 評価時にステップ数や革命頻度の併記
+
+
 

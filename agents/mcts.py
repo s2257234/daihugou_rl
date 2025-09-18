@@ -217,6 +217,19 @@ def run_puct_mcts(root_env_copy,
         g_new.current_field = list(g.current_field)
         g_new.passed = list(g.passed)
         g_new.rankings = list(getattr(g, 'rankings', []))
+        # 重要: rule_checker, deck は共有すると副作用が本番へ伝播するので deepcopy
+        try:
+            g_new.rule_checker = copy.deepcopy(g.rule_checker)
+        except Exception:
+            # 最低限、新しいインスタンスへイベントはコピーしない形でフォールバック
+            from game.rules import RuleChecker
+            rc = RuleChecker()
+            rc.revolution = getattr(g.rule_checker, 'revolution', False)
+            g_new.rule_checker = rc
+        try:
+            g_new.deck = copy.deepcopy(g.deck)
+        except Exception:
+            pass
         env_new = copy.copy(env)
         env_new.game = g_new
         return env_new

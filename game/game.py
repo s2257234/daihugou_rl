@@ -181,8 +181,11 @@ class Game:
                 pass
             new_rev = self.rule_checker.revolution
             rev_changed = (prev_rev != new_rev)
+            # トグル仕様: 変化したら [+REV] / [-REV]
             rev_flag = ' (REV)' if new_rev else ''
-            trig = ' [+REV]' if rev_changed and new_rev else (' [-REV]' if rev_changed and not new_rev else '')
+            trig = ''
+            if rev_changed:
+                trig = ' [+REV]' if new_rev else ' [-REV]'
             # 3) プレイログ (リセット系より先に必ず出す)
             self.log(f"Player {self.turn} played: {played_str}{rev_flag}{trig}")
             # 革命発生メッセージ (オプション) - 従来互換
