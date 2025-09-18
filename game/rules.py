@@ -20,6 +20,9 @@ class RuleChecker:
         self.rev_enable_straight = True
         self.rev_straight_min_len = 5
         self.rev_straight_allow_joker = True
+        # 同一手番・同一カード集合での重複トグル防止用（idempotent 保護）
+        # キー: (turn_count, player_id, tuple(sorted(str(c) for c in cards)))
+        self._rev_seen_actions = set()
     
     # === 役分類 / 比較ユーティリティ =====================================
     def classify_combo(self, cards):
@@ -291,6 +294,17 @@ class RuleChecker:
         革命発生条件を判定し、該当すればself.revolutionをTrueにする。
         例: 同じランク4枚以上（ジョーカー含む場合は調整可）、または5枚以上の階段
         """
+        # 同一手番・同一カード集合に対する重複判定（安全側: 情報が無ければスキップ）
+        action_key = None
+        try:
+            if turn_count is not None and player_id is not None and cards is not None:
+                canonical_cards = tuple(sorted(str(c) for c in cards))
+                action_key = (int(turn_count), int(player_id), canonical_cards)
+                if action_key in self._rev_seen_actions:
+                    return False
+        except Exception:
+            # 何らかの理由でキー生成失敗時は保護を無効化して継続
+            action_key = None
         non_jokers = [c for c in cards if not c.is_joker]
         jokers = [c for c in cards if c.is_joker]
         old_state = self.revolution
@@ -339,6 +353,9 @@ class RuleChecker:
                 'meta': meta,
             }
             self.revolution_events.append(event)
+            # このアクションに対するトグルは記録済みとしてマーク（再トグル抑止）
+            if action_key is not None:
+                self._rev_seen_actions.add(action_key)
             return True
         return False
 
@@ -352,6 +369,8 @@ class RuleChecker:
     def clear_revolution_events(self):
         """革命イベント履歴をクリア（新ゲーム開始時など）。"""
         self.revolution_events.clear()
+        # 重複トグル保護のキーもクリア
+        self._rev_seen_actions.clear()
 
     def get_revolution_events(self):
         """革命イベント履歴を返す（参照用）。"""
@@ -380,7 +399,7 @@ class RuleChecker:
         for card in dai_hinmin_give:
             players[dai_hinmin].hand.remove(card)
         players[daifugo].hand.extend(dai_hinmin_give)
-        print(f"大貧民(Player {dai_hinmin})→大富豪(Player {daifugo}): {[str(c) for c in dai_hinmin_give]}")
+        #print(f"大貧民(Player {dai_hinmin})→大富豪(Player {daifugo}): {[str(c) for c in dai_hinmin_give]}")
 
         # --- 大富豪→大貧民（2枚） ---　自分の最も弱いカードを2枚渡す。
         daifugo_hand = sorted(players[daifugo].hand, key=lambda c: c.strength())
@@ -388,18 +407,18 @@ class RuleChecker:
         for card in daifugo_give:
             players[daifugo].hand.remove(card)
         players[dai_hinmin].hand.extend(daifugo_give)
-        print(f"大富豪(Player {daifugo})→大貧民(Player {dai_hinmin}): {[str(c) for c in daifugo_give]}")
+        #print(f"大富豪(Player {daifugo})→大貧民(Player {dai_hinmin}): {[str(c) for c in daifugo_give]}")
 
         # --- 貧民→富豪（1枚） ---　自分の最も強いカードを1枚渡す。
         hinmin_hand = sorted(players[hinmin].hand, key=lambda c: c.strength(), reverse=True)
         hinmin_give = hinmin_hand[0]
         players[hinmin].hand.remove(hinmin_give)
         players[fugo].hand.append(hinmin_give)
-        print(f"貧民(Player {hinmin})→富豪(Player {fugo}): {hinmin_give}")
+        #print(f"貧民(Player {hinmin})→富豪(Player {fugo}): {hinmin_give}")
 
         # --- 富豪→貧民（1枚） ---　自分の最も弱いカードを1枚渡す。
         fugo_hand = sorted(players[fugo].hand, key=lambda c: c.strength())
         fugo_give = fugo_hand[0]
         players[fugo].hand.remove(fugo_give)
         players[hinmin].hand.append(fugo_give)
-        print(f"富豪(Player {fugo})→貧民(Player {hinmin}): {fugo_give}")
+        #print(f"富豪(Player {fugo})→貧民(Player {hinmin}): {fugo_give}")

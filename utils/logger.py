@@ -211,4 +211,39 @@ class TrainingLogger:
             if self._tb_disabled_reason is None:
                 print(f"[TrainingLogger] MCTSサンプル書き込み失敗 (disk?) : {e}")
 
+    # ---------------- Free-form text logging ----------------
+    def log_text(self, text: str, filename: str = "events.log", also_print: bool = False):
+        """任意のテキストをログに追記し、可能ならTensorBoardにも出力する。
+
+        - logs/events.log にタイムスタンプ付きで追記
+        - TensorBoard が有効な場合は add_text で記録（step は update_step または episode_idx）
+        - also_print=True の場合は標準出力にも表示
+        """
+        try:
+            ts = time.strftime('%Y-%m-%d %H:%M:%S')
+            line = f"[{ts}] {text}\n"
+            path = os.path.join(self.log_dir, filename)
+            os.makedirs(self.log_dir, exist_ok=True)
+            with open(path, 'a', encoding='utf-8') as f:
+                f.write(line)
+            if also_print:
+                print(line.strip())
+        except Exception:
+            # 例外は握りつぶして学習を止めない
+            pass
+
+        if self.tb:
+            try:
+                step = self.update_step or self.episode_idx or 0
+                self.tb.add_text('misc/text', text, step)
+                try:
+                    self.tb.flush()
+                except Exception:
+                    pass
+            except OSError as e:
+                self._disable_tensorboard(f"OSError:{e}")
+            except Exception:
+                # TensorBoard へのテキスト出力失敗は無視
+                pass
+
 __all__ = ["TrainingLogger"]

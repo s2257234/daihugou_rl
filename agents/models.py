@@ -17,19 +17,16 @@
   logits, value = model.forward(state_dict)
   -> logits: Tensor(shape=[max_policy_size])
      value : Tensor(shape=[1])  (tanh で -1~1)
-
-PyTorch 依存: torch が未インストールの場合は ImportError を送出する。
 """
 from __future__ import annotations
 
 from typing import Dict, Any, Optional, List
 
-try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-except ImportError as e:  # pragma: no cover
-    raise ImportError("PyTorch がインストールされていません。pip install torch で導入してください.") from e
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 
 
 class PolicyValueNet(nn.Module):
@@ -42,6 +39,7 @@ class PolicyValueNet(nn.Module):
         self.max_policy_size = max_policy_size
         self.num_players = num_players
         self.device = torch.device(device) if device else torch.device("cpu")
+        
 
         # 入力特徴量: hand_size(1) + field_size(1) + turn_onehot(num_players)
         input_dim = 2 + num_players

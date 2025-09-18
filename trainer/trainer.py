@@ -79,11 +79,21 @@ class Trainer:
     # 準備
     # -----------------------------------------------------
     def setup(self):
-        # モデル生成
+        # デバイス決定とモデル生成
+        device_cfg = self.config.get("device", "auto")
+        if device_cfg == "auto":
+            try:
+                import torch  # lazy import to check availability
+                resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:
+                resolved_device = "cpu"
+        else:
+            resolved_device = device_cfg
         self.model = PolicyValueNet(
             max_policy_size=self.config["max_policy_size"],
             hidden_size=self.config["hidden_size"],
             num_players=self.config["num_players"],
+            device=resolved_device,
         )
         # ロガー生成
         self.logger = TrainingLogger(
@@ -187,6 +197,8 @@ class Trainer:
     # -----------------------------------------------------
     def self_play(self, num_episodes: int = 1):
         for ep in range(num_episodes):
+            # ゲーム開始時にエポック（エピソード）進行を表示
+            print(f"[EPOCH] {ep+1}/{num_episodes}")
             # ウォームアップ期間中は対戦相手をランダム/ルールベースに
             if ep < self.warmup_episodes:
                 self._apply_warmup_opponents()
@@ -304,6 +316,9 @@ class Trainer:
     def train_updates(self, num_updates: int = 1):
         for i in range(num_updates):
             loss_info = self.agents[0].train_step(batch_size=self.config.get("batch_size", 256))
+            # ログ用にエポック情報を付与（存在する辞書に無害に追加）
+            if isinstance(loss_info, dict):
+                loss_info.setdefault("total_epochs", num_updates)
             # サンプル不足/偏り警告
             if loss_info.get("reason") == "no_data":
                 print("[WARN] train_step skipped: no_data (consider increasing episodes or buffer)")
@@ -317,7 +332,7 @@ class Trainer:
                         if ratio < 0.15:  # しきい値は暫定
                             print(f"[WARN] low data share for learner: {own}/{total} ({ratio:.2%})")
             if (i + 1) % self.config.get("log_interval", 50) == 0:
-                print(f"[TRAIN] update={i+1} loss={loss_info}")
+                print(f"[TRAIN] epoch={i+1}/{num_updates} loss={loss_info}")
             # ロガーへ (train_step 内で既に push されている場合は二重記録を避ける)
             if self.logger and loss_info.get("loss") is not None and not getattr(self.agents[0], '_logged_inside', False):
                 self.logger.log_train(loss_info)
@@ -354,6 +369,7 @@ if __name__ == "__main__":
     parser.add_argument("--log-dir", type=str, default=None, help="ログディレクトリ上書き")
     parser.add_argument("--no-tb", action="store_true", help="TensorBoard を無効化")
     parser.add_argument("--seed", type=int, default=None, help="乱数シード上書き")
+    parser.add_argument("--device", type=str, default=None, help="使用デバイスを指定 (cpu/cuda/cuda:0)。未指定はauto")
     args = parser.parse_args()
 
     cfg = dict(ALPHA_ZERO_CONFIG)
@@ -367,8 +383,10 @@ if __name__ == "__main__":
         cfg["enable_tensorboard"] = False
     if args.seed is not None:
         cfg["seed"] = args.seed
+    if args.device is not None:
+        cfg["device"] = args.device
 
-    print("[CLI] Config overrides:", {k: cfg[k] for k in ["num_simulations","batch_size","log_dir","enable_tensorboard"] if k in cfg})
+    #print("[CLI] Config overrides:", {k: cfg[k] for k in ["num_simulations","batch_size","log_dir","enable_tensorboard","device"] if k in cfg})
     trainer = Trainer(config=cfg)
     trainer.setup()
     trainer.self_play(num_episodes=args.episodes)

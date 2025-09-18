@@ -26,7 +26,7 @@ class Game:
         # ゲーム終了時に革命イベントを自動出力するフラグ
         self.auto_dump_revolution_events = True
         # 見出しを一度だけ出すための内部フラグ
-        self._rev_events_header_printed = True
+        self._rev_events_header_printed = False
 
     def _all_others_passed(self):
         """
