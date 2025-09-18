@@ -39,6 +39,8 @@ def main():
         use_tensorboard=not args.no_tb,
     )
     evaluator.run(num_episodes=args.episodes)
+    for i, p in enumerate(evaluator.players):
+        print(f"P{i} -> {type(p).__name__}")
     if not args.no_auto_plot:
         # 自動プロット更新 (figs ディレクトリを明示)
         out_dir = os.path.join(args.elo_dir, "figs")

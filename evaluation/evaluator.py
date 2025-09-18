@@ -88,6 +88,8 @@ class Evaluator:
             print(f"[WARN] checkpoint not found: {self.checkpoint_path}. Using random initialized model.")
         # 評価用 AlphaZeroAgent (player_id=0 固定)
         self.eval_agent = AlphaZeroAgent(player_id=0, model=self.model, config=self.config)
+        # ここでプレイヤー順序を確定 (P0=評価対象)
+        self.players = self._build_agents()
 
     def _auto_device(self) -> str:
         try:
@@ -113,12 +115,9 @@ class Evaluator:
 
     def play_one_game(self) -> List[int]:
         env = DaifugoSimpleEnv(num_players=4, agent_classes=None)
-        # 環境の agents を上書き
-        env.agents = self._build_agents()
-        # 学習エージェントに環境参照 (MCTS 内で利用する可能性)
+        env.agents = self.players  # あらかじめ構築した順序 (P0=評価対象)
         if hasattr(self.eval_agent, 'set_env_ref'):
             self.eval_agent.set_env_ref(env)
-        # リセット
         env.reset()
         # 進行
         step_limit = 1000
@@ -189,5 +188,10 @@ class Evaluator:
         if self.tb_writer is not None:
             self.tb_writer.flush()
             self.tb_writer.close()
+
+    def print_player_types(self):
+        """現在のプレイヤー順序と型を表示 (デバッグ用)。"""
+        for i, p in enumerate(getattr(self, 'players', [])):
+            print(f"P{i}: {type(p).__name__}")
 
 __all__ = ["Evaluator"]
