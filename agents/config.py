@@ -49,6 +49,13 @@ ALPHA_ZERO_CONFIG = {
     # ---------------------------
     "checkpoint_dir": "checkpoints",           # モデル保存ディレクトリ
     "checkpoint_path": "checkpoints/policy_value_latest.pt",  # 直近モデル
+    # 周期保存: 大量エピソード実行時にエピソード間隔で世代チェックポイントを残す
+    # 例) 100000 エピソードで 2000 間隔 -> 50 個保存
+    "checkpoint_interval_episodes": 2000,       # 0 / None なら無効
+    "keep_previous_model_opponent": True,       # 直前世代モデルを一部プレイヤーに割当てて多様性確保
+    "previous_model_mix_players": 2,            # 学習プレイヤー以外から2人を過去モデル化
+    "past_model_pool_size": 6,             # 過去6世代保持
+    "opponent_mix_interval_episodes": 500, # 500エピソードごとに再割当
     "replay_path": "replay_buffer.joblib",     # リプレイバッファ保存先
 
     # ---------------------------
