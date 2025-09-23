@@ -18,7 +18,7 @@ ALPHA_ZERO_CONFIG = {
     # MCTS / 探索
     # ---------------------------
     # MCTS シミュレーション回数 (初期は重いので軽量値。性能向上後に再調整) 
-    "num_simulations": 32,           # 1手あたりのシミュレーション回数 (以前:128)
+    "num_simulations": 96,           # 1手あたりのシミュレーション回数 (以前:128)
     "puct_c": 1.4,                   # PUCT 探索定数
     "dirichlet_alpha": 0.3,          # Dirichlet ノイズ α (ルート)
     "dirichlet_epsilon": 0.25,       # ノイズ混合率 ε
@@ -35,7 +35,7 @@ ALPHA_ZERO_CONFIG = {
     # ---------------------------
     # 学習 / 最適化
     # ---------------------------
-    "buffer_size": 50_000,           # リプレイバッファ最大サイズ
+    "buffer_size": 200_000,           # リプレイバッファ最大サイズ
     "batch_size": 256,               # 学習バッチサイズ (train_step 実装時に利用)
     "lr": 1e-4,                      # 学習率
     "weight_decay": 1e-4,            # L2 正則化
@@ -66,7 +66,11 @@ ALPHA_ZERO_CONFIG = {
     "log_dir": "logs",              # ログ出力ディレクトリ (CSV / TensorBoard)
     "enable_tensorboard": True,      # TensorBoard 出力を有効化
     "mcts_log_sample_rate": 0.15,    # MCTS ルート統計のサンプリング率
+    "disable_mcts_log": True,        # True で mcts_samples.jsonl へ出力しない
     "clear_logs_on_start": True,     # 起動時に既存ログを消去 (Falseで残す)
+    # ETA 表示調整
+    "eta_smoothing_alpha": 0.25,     # エピソード時間 EMA 係数 (0=平均,1=最新のみ)
+    "monotonic_eta": True,           # 残り時間推定を単調減少にクランプ
     # ---------------------------
     # リプレイ共有 / 構造
     # ---------------------------

@@ -187,29 +187,30 @@ class Game:
             if rev_changed:
                 trig = ' [+REV]' if new_rev else ' [-REV]'
             # 3) プレイログ (リセット系より先に必ず出す)
-            self.log(f"Player {self.turn} played: {played_str}{rev_flag}{trig}")
+            #self.log(f"Player {self.turn} played: {played_str}{rev_flag}{trig}")
             # 革命発生メッセージ (オプション) - 従来互換
             if rev_triggered:
-                self.log(f"革命発生! 現在の革命状態: {self.rule_checker.revolution}")
+                #self.log(f"革命発生! 現在の革命状態: {self.rule_checker.revolution}")
                 if self.debug_revolution_trace:
                     # 直近イベントのみ取り出し
                     ev = self.rule_checker.revolution_events[-1] if self.rule_checker.revolution_events else None
                     if ev:
-                        self.log(
+                        """self.log(
                             "REV_EVENT "
                             f"turn={ev['turn']} player={ev['player']} reason={ev['reason']} "
                             f"old={ev['old_state']} new={ev['new_state']} cards={ev['cards']} meta={ev['meta']}"
-                        )
+                        )"""
             # 4) その他特殊ルール: 階段表示 / 8切り / ジョーカー流し
             try:
                 # 階段 (表示のみ)
                 if self.rule_checker.is_straight(card_objs):
-                    self.log(f"Player {self.turn} が階段を出しました: {[str(c) for c in card_objs]}")
+                    #self.log(f"Player {self.turn} が階段を出しました: {[str(c) for c in card_objs]}")
+                    pass
             except Exception:
                 pass
             # 8切り
             if self.rule_checker.is_8cut(card_objs):
-                self.log(f"8切り発動 by Player {self.turn}!")
+                #self.log(f"8切り発動 by Player {self.turn}!")
                 self.last_player = self.turn
                 self._reset_field()
                 return self.get_state(self.turn), False, True, "eight_cut"
@@ -221,7 +222,7 @@ class Game:
         else:
             # ゲーム中の出力を「Player X passed.」形式に
             rev_flag = ' (REV)' if self.rule_checker.revolution else ''
-            self.log(f"Player {self.turn} passed.{rev_flag}")
+            #self.log(f"Player {self.turn} passed.{rev_flag}")
             action_cards = None
             self.passed[self.turn] = True
             # 最後に出したプレイヤー以外が全員パス → 場リセット
@@ -272,13 +273,10 @@ class Game:
         """
         # 革命
         if self.rule_checker.check_revolution(card_objs):
-            self.log(f"革命発生! 現在の革命状態: {self.rule_checker.revolution}")
-        # 階段
-        if self.rule_checker.is_straight(card_objs):
-            self.log(f"Player {self.turn} が階段を出しました: {[str(c) for c in card_objs]}")
+            #self.log(f"革命発生! 現在の革命状態: {self.rule_checker.revolution}")
+            pass  # コメントのみだと構文エラーになるため明示 no-op
         # 8切り
         if self.rule_checker.is_8cut(card_objs):
-            self.log(f"8切り発動 by Player {self.turn}!")
             self.last_player = self.turn
             self._reset_field()
             return True, (self.get_state(self.turn), False, True, "eight_cut")
@@ -310,15 +308,15 @@ class Game:
         """現在のゲームに記録された革命イベントログを整形して出力する。"""
         events = self.rule_checker.get_revolution_events()
         if not events:
-            self.log("[REV_EVENTS] (none)")
+            #self.log("[REV_EVENTS] (none)")
             return
         if not self._rev_events_header_printed:
-            self.log("[REV_EVENTS] turn player reason old->new size cards meta")
+            #self.log("[REV_EVENTS] turn player reason old->new size cards meta")
             self._rev_events_header_printed = True
         for ev in events:
             self.log(
-                f"[REV_EVENTS] {ev['turn']} P{ev['player']} {ev['reason']} "
-                f"{ev['old_state']}->{ev['new_state']} {ev['size']} {ev['cards']} {ev['meta']}"
+                #f"[REV_EVENTS] {ev['turn']} P{ev['player']} {ev['reason']} "
+                #f"{ev['old_state']}->{ev['new_state']} {ev['size']} {ev['cards']} {ev['meta']}"
             )
 
     def print_revolution_events(self):
@@ -415,4 +413,4 @@ class Game:
         # 場リセット時は必ず最後に出したプレイヤーから再開
         if self.last_player is not None:
             self.turn = self.last_player
-        self.log("--- 場がリセットされました ---")
+        #self.log("--- 場がリセットされました ---")

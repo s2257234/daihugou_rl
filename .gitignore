@@ -9,3 +9,4 @@ pytorch_practice.py
 logs/
 *.joblib
 *.pt
+tests/
