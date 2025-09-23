@@ -96,6 +96,8 @@ class AlphaZeroAgent:
         self.entropy_coef = self.config.get("entropy_coef", 1e-3)
         self.grad_clip = self.config.get("grad_clip", 1.0)
         self._optimizer = None  # 遅延初期化
+        # モデル世代 (Trainer 側で更新される想定)。データ多様性確保用にサンプルへ埋め込む。
+        self.model_version = config.get("current_model_version", 0) if isinstance(config, dict) else 0
 
         # フェーズ中サンプル保持 (フェーズ確定時にラベル付与)
         self._phase_samples: List[Any] = []
@@ -356,6 +358,7 @@ class AlphaZeroAgent:
             "pi": pi,
             "value": value,
             "value_pred": value_pred,
+            "model_version": getattr(self, 'model_version', 0),
         }
         if self._use_shared and hasattr(self.replay_buffer, 'append'):
             self.replay_buffer.append(sample)

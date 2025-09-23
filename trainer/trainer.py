@@ -88,6 +88,21 @@ class Trainer:
         self.learning_player_id = self.config.get("learning_player_id", 0)
         # ロガー (setup で初期化)
         self.logger = None  # type: ignore
+        # 追加: 周期チェックポイント & 直前モデルミックス用
+        self.ckpt_interval = self.config.get("checkpoint_interval_episodes", 0) or 0
+        self.keep_prev_model = self.config.get("keep_previous_model_opponent", False)
+        self.prev_model_mix_players = int(self.config.get("previous_model_mix_players", 0) or 0)
+        self._previous_model = None  # type: ignore
+        self._episodes_total_run = 0  # 累積自己対局回数 (複数 self_play 呼び出し対応)
+        # モデル世代管理 (リプレイに過去モデル由来サンプルを混在保持)
+        self.model_version = 0
+        # --- 追加: 複数過去モデルプール ---
+        # 過去モデルを複数保持し、対戦相手へランダム割当して探索多様性を向上させる。
+        # keep_previous_model_opponent / previous_model_mix_players が有効な場合にのみ使用。
+        self.past_models = []  # List[PolicyValueNet]
+        self.past_model_pool_size = int(self.config.get("past_model_pool_size", 5))  # 保存上限 (古い順に削除)
+        # 何エピソードごとに opponent へ再割当するか (0/未指定なら checkpoint タイミングでのみ)
+        self.opponent_mix_interval = int(self.config.get("opponent_mix_interval_episodes", 0) or 0)
 
     # -----------------------------------------------------
     # 準備
@@ -127,6 +142,9 @@ class Trainer:
         self.agents = []
         for i in range(self.config["num_players"]):
             ag = AlphaZeroAgent(player_id=i, model=self.model, config=self.config)
+            # 初期世代を注入
+            if hasattr(ag, 'model_version'):
+                ag.model_version = self.model_version
             # 共有モードならリプレイ参照注入
             if self.shared_replay is not None:
                 ag.replay_buffer = self.shared_replay
@@ -223,35 +241,116 @@ class Trainer:
                 # ウォームアップ直後に全員学習エージェントへ戻す
                 self._restore_learning_agents()
             self._play_one_episode(ep)
+            self._episodes_total_run += 1
+            # 周期チェックポイント保存 (2000 エピソードごと等)
+            if self.ckpt_interval > 0 and (self._episodes_total_run % self.ckpt_interval == 0):
+                self._save_checkpoint(version_tag=f"ep{self._episodes_total_run}")
+                # --- 過去モデルプールへ追加 (多世代保持) ---
+                if self.keep_prev_model:
+                    self._snapshot_current_model()
+                # --- 対戦相手へ過去モデル再割当 (プールが空なら従来方式にフォールバック) ---
+                if self.keep_prev_model and self.prev_model_mix_players > 0:
+                    if self.past_models:
+                        self._assign_past_models_to_opponents()
+                    elif self._previous_model is not None:  # 後方互換: 旧単一方式
+                        self._mix_previous_model_opponents()
+                # チェックポイント間隔で世代を進め、エージェントへ新世代番号を反映
+                self.model_version += 1
+                for ag in self.agents:
+                    if isinstance(ag, AlphaZeroAgent) and hasattr(ag, 'model_version'):
+                        ag.model_version = self.model_version
+            # 任意のエピソード間隔で opponent 再割当 (checkpoint タイミング以外でも多様性確保)
+            if self.opponent_mix_interval > 0 and self.keep_prev_model and self.prev_model_mix_players > 0:
+                if (self._episodes_total_run % self.opponent_mix_interval == 0) and self.past_models:
+                    self._assign_past_models_to_opponents()
+
             # 進捗表示 (エピソード終了後に確定時間で ETA 推定)
             if self.minimal_progress and self.use_progress_bar:
                 done = ep + 1
-                # このエピソード所要時間
                 ep_dur = time.time() - ep_start
-                # EMA 更新
+                # エピソード時間 EMA
                 if self._eta_smooth is None:
                     self._eta_smooth = ep_dur
                 else:
                     a = max(0.0, min(1.0, self.eta_alpha))
                     self._eta_smooth = a * ep_dur + (1 - a) * self._eta_smooth
                 elapsed = time.time() - start_time
-                # 総所要時間見積り = 平滑化1エピソード時間 * 総エピソード数
                 estimated_total = (self._eta_smooth or 0.0) * num_episodes
                 remaining = max(0.0, estimated_total - elapsed)
-                if self.monotonic_eta and self._eta_prev_remaining is not None:
-                    # 単調減少: 新推定が前回より増えたら前回値を使用
-                    if remaining > self._eta_prev_remaining:
-                        remaining = self._eta_prev_remaining
+                if self.monotonic_eta and self._eta_prev_remaining is not None and remaining > self._eta_prev_remaining:
+                    remaining = self._eta_prev_remaining
                 self._eta_prev_remaining = remaining
                 def _fmt(t: float):
                     m, s = divmod(int(t), 60)
                     h, m = divmod(m, 60)
                     return f"{h:d}:{m:02d}:{s:02d}"
-                bar, pct_str = self._make_progress_bar(done, num_episodes)
+                bar, _pct = self._make_progress_bar(done, num_episodes)
                 line = f"[SELFPLAY] {bar} {done}/{num_episodes} eta={_fmt(remaining)}"
                 pad = max(0, self._last_progress_len - len(line))
                 print(line + ' ' * pad, end='\r' if done < num_episodes else '\n', flush=True)
                 self._last_progress_len = len(line)
+        # ループ終了後、バー表示時は改行が確定するので追加処理不要
+
+    # -----------------------------------------------------
+    # 過去モデルスナップショット
+    # -----------------------------------------------------
+    def _snapshot_current_model(self):
+        """現在モデルを CPU 上に複製し past_models に追加。容量上限を超えたら FIFO で削除。
+
+        注意: self._previous_model (旧互換) も最新スナップショットとして更新し、
+              プール未使用設定時のフォールバックを維持する。
+        """
+        if self.model is None:
+            return
+        try:
+            # live モデル state_dict を CPU 上にコピー
+            snap = PolicyValueNet(
+                max_policy_size=self.config["max_policy_size"],
+                hidden_size=self.config["hidden_size"],
+                num_players=self.config["num_players"],
+                device="cpu",
+            )
+            snap.load_state_dict(self.model.state_dict())  # type: ignore[arg-type]
+            self.past_models.append(snap)
+            self._previous_model = snap  # 互換
+            # 上限超過なら古いものから削除
+            if self.past_model_pool_size > 0 and len(self.past_models) > self.past_model_pool_size:
+                overflow = len(self.past_models) - self.past_model_pool_size
+                if overflow > 0:
+                    del self.past_models[0:overflow]
+            if self.logger:
+                self.logger.log_text(f"[snapshot] pool_size={len(self.past_models)}")
+        except Exception as e:
+            if self.logger:
+                self.logger.log_text(f"[WARN] snapshot failed: {e}")
+            else:
+                print(f"[WARN] snapshot failed: {e}")
+
+    # -----------------------------------------------------
+    # 過去モデルを対戦相手へランダム割当
+    # -----------------------------------------------------
+    def _assign_past_models_to_opponents(self):
+        if not self.past_models:
+            return
+        candidate_indices = [i for i in range(self.config["num_players"]) if i != self.learning_player_id]
+        if not candidate_indices:
+            return
+        random.shuffle(candidate_indices)
+        selected = candidate_indices[: self.prev_model_mix_players]
+        # 割当: 選択プレイヤーにランダムな過去モデルを割り当てる
+        for idx in selected:
+            ag = self.agents[idx]
+            if isinstance(ag, AlphaZeroAgent):
+                model_choice = random.choice(self.past_models)
+                ag.set_model(model_choice)
+        # 学習プレイヤーは常に最新モデル
+        learner = self.agents[self.learning_player_id]
+        if isinstance(learner, AlphaZeroAgent):
+            learner.set_model(self.model)
+        if self.logger:
+            self.logger.log_text(f"[mix-multi] assigned past models to players={selected} (pool={len(self.past_models)})")
+        else:
+            print(f"[INFO] past models mixed into players={selected} (pool={len(self.past_models)})")
         if self.minimal_progress:
             # ループ終了で改行確定
             if not self.use_progress_bar:
@@ -410,6 +509,9 @@ class Trainer:
             if self.logger and loss_info.get("loss") is not None and not getattr(self.agents[0], '_logged_inside', False):
                 self.logger.log_train(loss_info)
         self._save_checkpoint()
+        # 学習直後の最新モデルもスナップショット (自己対局前に世代差が明確になる)
+        if self.keep_prev_model:
+            self._snapshot_current_model()
 
     # -----------------------------------------------------
     # 進捗バー生成ヘルパー
@@ -425,11 +527,20 @@ class Trainer:
     # -----------------------------------------------------
     # チェックポイント
     # -----------------------------------------------------
-    def _save_checkpoint(self):
+    def _save_checkpoint(self):  # backward compatibility name
+        self._save_checkpoint(version_tag=None)
+
+    def _save_checkpoint(self, version_tag: str | None = None):
         os.makedirs(self.config["checkpoint_dir"], exist_ok=True)
-        path = self.config["checkpoint_path"]
+        # 最新モデル保存
+        latest_path = self.config["checkpoint_path"]
         if self.model is not None:
-            self.model.save(path)
+            self.model.save(latest_path)
+        # バージョン付き保存
+        if version_tag:
+            ver_path = os.path.join(self.config["checkpoint_dir"], f"policy_value_{version_tag}.pt")
+            if self.model is not None:
+                self.model.save(ver_path)
         # リプレイ保存: 共有モードなら共有バッファを保存、そうでなければ従来通り代表エージェント
         replay_path = self.config.get("replay_path", "replay_buffer.joblib")
         if self.shared_replay is not None:
@@ -439,6 +550,31 @@ class Trainer:
                 print(f"[WARN] shared replay save failed: {e}")
         else:
             self.agents[0].save_replay(replay_path)
+
+    # -----------------------------------------------------
+    # 直前モデルを対戦相手に混在させる
+    # -----------------------------------------------------
+    def _mix_previous_model_opponents(self):
+        if self._previous_model is None:
+            return
+        # 学習プレイヤー以外から N 人を選び、そのエージェントの model を previous_model に差し替える
+        candidate_indices = [i for i in range(self.config["num_players"]) if i != self.learning_player_id]
+        if not candidate_indices:
+            return
+        random.shuffle(candidate_indices)
+        selected = candidate_indices[: self.prev_model_mix_players]
+        for idx in selected:
+            ag = self.agents[idx]
+            if isinstance(ag, AlphaZeroAgent):
+                ag.set_model(self._previous_model)
+        # 学習プレイヤーのモデルは必ず最新 (self.model) に戻しておく
+        learner = self.agents[self.learning_player_id]
+        if isinstance(learner, AlphaZeroAgent):
+            learner.set_model(self.model)
+        if self.logger:
+            self.logger.log_text(f"[mix] applied previous model to players={selected}")
+        else:
+            print(f"[INFO] previous model mixed into players={selected}")
 
 
 __all__ = ["Trainer"]
