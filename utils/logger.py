@@ -10,7 +10,7 @@ class TrainingLogger:
       logs/mcts_samples.jsonl  : sampled MCTS root statistics per move
       TensorBoard (logs/tb)    : scalar summaries (optional)
     """
-    def __init__(self, log_dir: str = "logs", use_tensorboard: bool = True, clear_existing: bool = False):
+    def __init__(self, log_dir: str = "logs", use_tensorboard: bool = True, clear_existing: bool = False, log_mcts_samples: bool = True):
         self.log_dir = log_dir
         if clear_existing and os.path.exists(log_dir):
             try:
@@ -41,7 +41,7 @@ class TrainingLogger:
                     self.tb.add_text("meta/info", f"logger_initialized_at={time.strftime('%Y-%m-%d %H:%M:%S')}" , 0)
                     self.tb.add_scalar("meta/initialized", 1, 0)
                     self.tb.flush()
-                    print(f"[TrainingLogger] TensorBoard 有効: イベント出力先 = {tb_dir}")
+                    #print(f"[TrainingLogger] TensorBoard 有効: イベント出力先 = {tb_dir}")
                 except Exception:
                     pass
             except Exception:
@@ -53,6 +53,8 @@ class TrainingLogger:
                     print("[TrainingLogger] TensorBoard 初期化失敗。'logs/tensorboard_disabled.txt' を確認してください。")
                 except Exception:
                     pass
+        # MCTS サンプル記録可否
+        self.log_mcts_samples = log_mcts_samples
         # files
         self.train_csv = os.path.join(log_dir, "train_updates.csv")
         self.episode_csv = os.path.join(log_dir, "episodes.csv")
@@ -77,6 +79,9 @@ class TrainingLogger:
         self._config_written = False
         self.update_step = 0
         self.episode_idx = 0
+        # ディスクフル検知フラグ
+        self._disk_full = False
+        self._disk_full_reason = None
 
     # ---------------- Internal helpers ----------------
     def _disable_tensorboard(self, reason: str):
@@ -95,8 +100,29 @@ class TrainingLogger:
             pass
         print(f"[TrainingLogger] TensorBoard無効化: {reason}")
 
+    def _mark_disk_full(self, exc: Exception, context: str):
+        """ディスクフル(OSError:28)検知時にロギングを停止し以降静かにスキップ。
+
+        context: 'train_csv','episode_csv','mcts','text','tensorboard' など呼び出し元識別
+        """
+        if not self._disk_full:
+            self._disk_full = True
+            self._disk_full_reason = f"{type(exc).__name__}:{exc}"
+            marker = os.path.join(self.log_dir, "disk_full_disabled.txt")
+            try:
+                with open(marker, 'a', encoding='utf-8') as f:
+                    f.write(f"DISABLED {time.strftime('%Y-%m-%d %H:%M:%S')} ctx={context} reason={self._disk_full_reason}\n")
+            except Exception:
+                pass
+            print(f"[TrainingLogger] ディスク容量不足検知 (ctx={context}) -> 以降のログ出力を停止: {self._disk_full_reason}")
+        # TensorBoard も停止
+        if self.tb is not None:
+            self._disable_tensorboard(f"disk_full({context})")
+
     # ---------------- Train metrics ----------------
     def log_train(self, metrics: Dict[str, Any]):
+        if self._disk_full:
+            return
         self.update_step += 1
         # 旧バージョンの train_updates.csv に追記しようとして列不足になるケースを検出し再生成 (一度だけ)
         try:
@@ -124,23 +150,27 @@ class TrainingLogger:
                 self._config_written = True
             except Exception:
                 pass
-        with open(self.train_csv, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                self.update_step,
-                metrics.get("policy_loss"),
-                metrics.get("value_loss"),
-                metrics.get("entropy"),
-                metrics.get("loss"),
-                metrics.get("value_acc"),
-                metrics.get("value_brier"),
-                metrics.get("policy_kl"),
-                metrics.get("policy_top1_match"),
-                metrics.get("pos_rate"),
-                metrics.get("cum_pos_rate"),
-                metrics.get("samples"),
-            ])
-        if self.tb:
+        try:
+            with open(self.train_csv, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    self.update_step,
+                    metrics.get("policy_loss"),
+                    metrics.get("value_loss"),
+                    metrics.get("entropy"),
+                    metrics.get("loss"),
+                    metrics.get("value_acc"),
+                    metrics.get("value_brier"),
+                    metrics.get("policy_kl"),
+                    metrics.get("policy_top1_match"),
+                    metrics.get("pos_rate"),
+                    metrics.get("cum_pos_rate"),
+                    metrics.get("samples"),
+                ])
+        except OSError as e:
+            self._mark_disk_full(e, 'train_csv')
+            return
+        if self.tb and not self._disk_full:
             try:
                 for k,v in metrics.items():
                     if isinstance(v,(int,float)):
@@ -156,6 +186,8 @@ class TrainingLogger:
 
     # ---------------- Episode metrics ----------------
     def log_episode(self, metrics: Dict[str, Any]):
+        if self._disk_full:
+            return
         self.episode_idx += 1
         # 旧ヘッダ互換処理 (一度だけ再生成)
         try:
@@ -174,20 +206,24 @@ class TrainingLogger:
                             ])
         except Exception:
             pass
-        with open(self.episode_csv, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                self.episode_idx,
-                metrics.get("avg_rank"),
-                metrics.get("first_rate"),
-                metrics.get("episode_len"),
-                metrics.get("phase_acc"),
-                metrics.get("phase_win_rate"),
-                metrics.get("phase_wins"),
-                metrics.get("phase_attempts"),
-                metrics.get("cum_phase_win_rate"),
-            ])
-        if self.tb:
+        try:
+            with open(self.episode_csv, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    self.episode_idx,
+                    metrics.get("avg_rank"),
+                    metrics.get("first_rate"),
+                    metrics.get("episode_len"),
+                    metrics.get("phase_acc"),
+                    metrics.get("phase_win_rate"),
+                    metrics.get("phase_wins"),
+                    metrics.get("phase_attempts"),
+                    metrics.get("cum_phase_win_rate"),
+                ])
+        except OSError as e:
+            self._mark_disk_full(e, 'episode_csv')
+            return
+        if self.tb and not self._disk_full:
             try:
                 for k,v in metrics.items():
                     if isinstance(v,(int,float)):
@@ -203,13 +239,13 @@ class TrainingLogger:
 
     # ---------------- MCTS root sample ----------------
     def log_mcts_sample(self, data: Dict[str, Any]):
+        if self._disk_full or not self.log_mcts_samples:
+            return
         try:
             with open(self.mcts_jsonl, "a", encoding="utf-8") as f:
                 f.write(json.dumps(data, ensure_ascii=False) + "\n")
         except OSError as e:
-            # ディスク満杯なら静かに無視 (学習継続優先)
-            if self._tb_disabled_reason is None:
-                print(f"[TrainingLogger] MCTSサンプル書き込み失敗 (disk?) : {e}")
+            self._mark_disk_full(e, 'mcts')
 
     # ---------------- Free-form text logging ----------------
     def log_text(self, text: str, filename: str = "events.log", also_print: bool = False):
@@ -219,20 +255,23 @@ class TrainingLogger:
         - TensorBoard が有効な場合は add_text で記録（step は update_step または episode_idx）
         - also_print=True の場合は標準出力にも表示
         """
-        try:
-            ts = time.strftime('%Y-%m-%d %H:%M:%S')
-            line = f"[{ts}] {text}\n"
-            path = os.path.join(self.log_dir, filename)
-            os.makedirs(self.log_dir, exist_ok=True)
-            with open(path, 'a', encoding='utf-8') as f:
-                f.write(line)
-            if also_print:
-                print(line.strip())
-        except Exception:
-            # 例外は握りつぶして学習を止めない
-            pass
+        if not self._disk_full:
+            try:
+                ts = time.strftime('%Y-%m-%d %H:%M:%S')
+                line = f"[{ts}] {text}\n"
+                path = os.path.join(self.log_dir, filename)
+                os.makedirs(self.log_dir, exist_ok=True)
+                with open(path, 'a', encoding='utf-8') as f:
+                    f.write(line)
+                if also_print:
+                    print(line.strip())
+            except OSError as e:
+                self._mark_disk_full(e, 'text')
+            except Exception:
+                # その他エラーは無視
+                pass
 
-        if self.tb:
+        if self.tb and not self._disk_full:
             try:
                 step = self.update_step or self.episode_idx or 0
                 self.tb.add_text('misc/text', text, step)

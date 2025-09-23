@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import os
 import random
+import time
 from typing import Dict, Any, List
 import argparse
 
@@ -62,18 +63,31 @@ class Trainer:
         self.config = dict(ALPHA_ZERO_CONFIG)
         if config:
             self.config.update(config)
+        # 進捗表示オプション (大量エピソード時の簡潔出力)
+        self.minimal_progress = self.config.get("minimal_progress", True)
+        self.progress_update_interval = self.config.get("progress_update_interval", 100)
+        # 進捗バー設定
+        self.use_progress_bar = self.config.get("progress_bar", True)
+        self.progress_bar_width = self.config.get("progress_bar_width", 40)
+        # 動的バー用内部ステート
+        self._last_progress_len = 0
+        # ETA 改善用パラメータ (エピソード時間の指数移動平均)
+        self.eta_alpha = self.config.get("eta_smoothing_alpha", 0.25)  # 0.0(なし)〜1.0(最新のみ)
+        self.monotonic_eta = self.config.get("monotonic_eta", True)    # True なら残り時間を単調減少にクランプ
+        self._eta_smooth = None  # 型: float|None (EMAされた 1 エピソード所要時間秒)
+        self._eta_prev_remaining = None  # 前回表示した残り秒 (単調減少用)
         # メンバ初期化
-        self.agents: List[AlphaZeroAgent] = []
+        self.agents = []  # type: ignore[list]
         self.env = None
         self.model = None
         random.seed(self.config.get("seed", 42))
-        # ウォームアップ設定: 最初の n エピソードは他プレイヤーをランダム/ルールベースにして多様な盤面を収集
+        # ウォームアップ設定
         self.warmup_episodes = self.config.get("warmup_episodes", 0)
         self.warmup_mix = self.config.get("warmup_mix", ["random", "rule", "random"])  # 学習エージェント以外の順番
-        # 学習対象プレイヤーID (単純化: 0固定) 今後拡張可
+        # 学習対象プレイヤーID
         self.learning_player_id = self.config.get("learning_player_id", 0)
-    # ロガー (setup で初期化)
-        self.logger = None  # type: ignore  # TrainingLogger インスタンスは setup で設定
+        # ロガー (setup で初期化)
+        self.logger = None  # type: ignore
 
     # -----------------------------------------------------
     # 準備
@@ -99,7 +113,8 @@ class Trainer:
         self.logger = TrainingLogger(
             log_dir=self.config.get("log_dir", "logs"),
             use_tensorboard=self.config.get("enable_tensorboard", True),
-            clear_existing=self.config.get("clear_logs_on_start", False)
+            clear_existing=self.config.get("clear_logs_on_start", False),
+            log_mcts_samples=not self.config.get("disable_mcts_log", False)
         )
         # 共有リプレイバッファ (use_shared_replay=true の場合)
         self.shared_replay = None
@@ -196,9 +211,11 @@ class Trainer:
     # 自己対局 (データ収集)
     # -----------------------------------------------------
     def self_play(self, num_episodes: int = 1):
+        start_time = time.time()
         for ep in range(num_episodes):
-            # ゲーム開始時にエポック（エピソード）進行を表示
-            print(f"[EPOCH] {ep+1}/{num_episodes}")
+            ep_start = time.time()
+            if not self.minimal_progress and not self.use_progress_bar:
+                print(f"[EPOCH] {ep+1}/{num_episodes}")
             # ウォームアップ期間中は対戦相手をランダム/ルールベースに
             if ep < self.warmup_episodes:
                 self._apply_warmup_opponents()
@@ -206,6 +223,39 @@ class Trainer:
                 # ウォームアップ直後に全員学習エージェントへ戻す
                 self._restore_learning_agents()
             self._play_one_episode(ep)
+            # 進捗表示 (エピソード終了後に確定時間で ETA 推定)
+            if self.minimal_progress and self.use_progress_bar:
+                done = ep + 1
+                # このエピソード所要時間
+                ep_dur = time.time() - ep_start
+                # EMA 更新
+                if self._eta_smooth is None:
+                    self._eta_smooth = ep_dur
+                else:
+                    a = max(0.0, min(1.0, self.eta_alpha))
+                    self._eta_smooth = a * ep_dur + (1 - a) * self._eta_smooth
+                elapsed = time.time() - start_time
+                # 総所要時間見積り = 平滑化1エピソード時間 * 総エピソード数
+                estimated_total = (self._eta_smooth or 0.0) * num_episodes
+                remaining = max(0.0, estimated_total - elapsed)
+                if self.monotonic_eta and self._eta_prev_remaining is not None:
+                    # 単調減少: 新推定が前回より増えたら前回値を使用
+                    if remaining > self._eta_prev_remaining:
+                        remaining = self._eta_prev_remaining
+                self._eta_prev_remaining = remaining
+                def _fmt(t: float):
+                    m, s = divmod(int(t), 60)
+                    h, m = divmod(m, 60)
+                    return f"{h:d}:{m:02d}:{s:02d}"
+                bar, pct_str = self._make_progress_bar(done, num_episodes)
+                line = f"[SELFPLAY] {bar} {done}/{num_episodes} eta={_fmt(remaining)}"
+                pad = max(0, self._last_progress_len - len(line))
+                print(line + ' ' * pad, end='\r' if done < num_episodes else '\n', flush=True)
+                self._last_progress_len = len(line)
+        if self.minimal_progress:
+            # ループ終了で改行確定
+            if not self.use_progress_bar:
+                print()
 
     def _play_one_episode(self, episode_index: int):
         # 環境を初期化 (DaifugoSimpleEnv が reset を持つ想定)
@@ -314,6 +364,8 @@ class Trainer:
     # モデル学習 (ダミー)
     # -----------------------------------------------------
     def train_updates(self, num_updates: int = 1):
+        start_time = time.time()
+        last_print = 0
         for i in range(num_updates):
             loss_info = self.agents[0].train_step(batch_size=self.config.get("batch_size", 256))
             # ログ用にエポック情報を付与（存在する辞書に無害に追加）
@@ -331,12 +383,44 @@ class Trainer:
                         ratio = own / total
                         if ratio < 0.15:  # しきい値は暫定
                             print(f"[WARN] low data share for learner: {own}/{total} ({ratio:.2%})")
-            if (i + 1) % self.config.get("log_interval", 50) == 0:
-                print(f"[TRAIN] epoch={i+1}/{num_updates} loss={loss_info}")
+            # 進捗出力 (動的バー)
+            if self.minimal_progress and self.use_progress_bar:
+                done = i + 1
+                # シンプル表示: バー無し / ETA無し / 一行上書き
+                if isinstance(loss_info, dict) and loss_info.get("loss") is not None:
+                    loss_part = f"loss={loss_info['loss']:.4f}"
+                else:
+                    loss_part = "loss=----"
+                lr_val = None
+                try:
+                    opt = getattr(self.agents[0], '_optimizer', None)
+                    if opt and hasattr(opt, 'param_groups') and opt.param_groups:
+                        lr_val = opt.param_groups[0].get('lr', None)
+                except Exception:
+                    lr_val = None
+                lr_part = f"lr={lr_val:.2e}" if lr_val is not None else "lr=----"
+                line = f"[TRAIN] {done}/{num_updates} {loss_part} {lr_part}"
+                pad = max(0, self._last_progress_len - len(line))
+                print(line + ' ' * pad, end='\r' if done < num_updates else '\n', flush=True)
+                self._last_progress_len = len(line)
+            else:
+                if (i + 1) % self.config.get("log_interval", 50) == 0:
+                    print(f"[TRAIN] epoch={i+1}/{num_updates} loss={loss_info}")
             # ロガーへ (train_step 内で既に push されている場合は二重記録を避ける)
             if self.logger and loss_info.get("loss") is not None and not getattr(self.agents[0], '_logged_inside', False):
                 self.logger.log_train(loss_info)
         self._save_checkpoint()
+
+    # -----------------------------------------------------
+    # 進捗バー生成ヘルパー
+    # -----------------------------------------------------
+    def _make_progress_bar(self, done: int, total: int, pct: float | None = None):
+        width = max(10, int(self.progress_bar_width))
+        ratio = 0.0 if total <= 0 else min(1.0, max(0.0, done / total))
+        fill = int(ratio * width)
+        bar = "#" * fill + "-" * (width - fill)
+        pct_val = ratio * 100.0
+        return f"[{bar}] {pct_val:6.2f}%", f"{pct_val:6.2f}%"
 
     # -----------------------------------------------------
     # チェックポイント
@@ -392,5 +476,5 @@ if __name__ == "__main__":
     trainer.self_play(num_episodes=args.episodes)
     trainer.train_updates(num_updates=args.updates)
     print(f"[INFO] run finished episodes={args.episodes} updates={args.updates}")
-    print("[INFO] checkpoints ->", cfg.get("checkpoint_path"))
-    print("[INFO] replay ->", cfg.get("replay_path"))
+    #print("[INFO] checkpoints ->", cfg.get("checkpoint_path"))
+    #print("[INFO] replay ->", cfg.get("replay_path"))
