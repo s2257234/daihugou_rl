@@ -300,14 +300,24 @@ def run_puct_mcts(root_env_copy,
         eval_envs = []
         cached_results = {}
         for i, (k, leg) in enumerate(zip(leaf_keys, leaf_legal)):
-            if not leg:
-                cached_results[i] = ({}, 0.0)
-                continue
+            # TT ヒット時は保存済みの合法手を使えるよう (policy, value, legal) の形式を許容
             if k is not None and k in TT:
-                cached_results[i] = TT[k]
-            else:
-                eval_indices.append(i)
-                eval_envs.append(leaf_envs[i])
+                cached = TT[k]
+                if isinstance(cached, tuple) and len(cached) == 3:
+                    cached_results[i] = cached  # (policy, value, legal)
+                    # 法生成をスキップできる
+                    leaf_legal[i] = cached[2]
+                    continue
+                elif isinstance(cached, tuple) and len(cached) == 2:
+                    # 後方互換: (policy, value)
+                    cached_results[i] = (cached[0], cached[1], leg)
+                    continue
+            # ここに来たら評価が必要
+            if not leg:
+                cached_results[i] = ({}, 0.0, [])
+                continue
+            eval_indices.append(i)
+            eval_envs.append(leaf_envs[i])
         # 必要分だけ NN 評価
         evaluated = {}
         if eval_envs:
@@ -331,12 +341,17 @@ def run_puct_mcts(root_env_copy,
             leg = leaf_legal[i] or []
             # キャッシュ or 評価結果取得
             if i in cached_results:
-                policy_leaf, leaf_value = cached_results[i]
+                cached = cached_results[i]
+                if isinstance(cached, tuple) and len(cached) == 3:
+                    policy_leaf, leaf_value, leg = cached
+                else:
+                    policy_leaf, leaf_value = cached  # 後方互換
             elif i in evaluated:
                 policy_leaf, leaf_value = evaluated[i]
                 k = leaf_keys[i]
                 if k is not None:
-                    TT[k] = (policy_leaf, leaf_value)
+                    # 合法手も併せて保存し、次回ヒット時の法生成を省略
+                    TT[k] = (policy_leaf, leaf_value, leg)
             else:
                 # 安全側: 一様分布 + 0.0
                 policy_leaf, leaf_value = ({a: 1.0 / len(leg) for a in leg} if leg else {}), 0.0

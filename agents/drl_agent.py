@@ -260,7 +260,16 @@ class AlphaZeroAgent:
                 # forward_batch があれば使う
                 if hasattr(self.model, 'forward_batch'):
                     states = [self._extract_state(e) for e in env_list]
-                    logits_b, value_vec_b = self.model.forward_batch(states)
+                    # 推論は勾配不要 + CUDA では AMP を利用
+                    try:
+                        import torch as _t
+                        _dev = getattr(self.model, 'device', None)
+                        _use_amp = bool(getattr(_dev, 'type', None) == 'cuda')
+                        with _t.no_grad():
+                            with _t.amp.autocast('cuda', enabled=_use_amp):
+                                logits_b, value_vec_b = self.model.forward_batch(states)
+                    except Exception:
+                        logits_b, value_vec_b = self.model.forward_batch(states)
                     outs = []
                     for i, e in enumerate(env_list):
                         legal = self._get_legal_actions(e)
@@ -335,21 +344,45 @@ class AlphaZeroAgent:
             return {a: p for a in legal}, 0.0
 
         # 可変長アクション対応モデル
-        if getattr(self.model, 'supports_variable_actions', False) and hasattr(self.model, 'evaluate'):
-            logits, value_scalar = self.model.evaluate(state, legal)
-        else:
-            logits_t, value_vec_t = self.model.forward(state)  # tensors
-            if logits_t.shape[0] < n:  # 念のためパディング
-                import torch as _t
-                pad = _t.zeros(n - logits_t.shape[0])
-                logits_t = _t.cat([logits_t, pad], dim=0)
-            logits_t = logits_t[:n]
-            pid = getattr(self, 'player_id', 0)
-            if 0 <= pid < value_vec_t.shape[0]:
-                value_scalar = float(value_vec_t[pid].item())
+        try:
+            import torch as _t
+            _dev = getattr(self.model, 'device', None)
+            _use_amp = bool(getattr(_dev, 'type', None) == 'cuda')
+            with _t.no_grad():
+                if getattr(self.model, 'supports_variable_actions', False) and hasattr(self.model, 'evaluate'):
+                    # 可変長アクションモデルの逐次評価
+                    logits, value_scalar = self.model.evaluate(state, legal)
+                else:
+                    # 固定ヘッドはAMPでバッチ/単発推論
+                    with _t.amp.autocast('cuda', enabled=_use_amp):
+                        logits_t, value_vec_t = self.model.forward(state)  # tensors
+                    if hasattr(logits_t, 'shape') and logits_t.shape[0] < n:  # 念のためパディング
+                        pad = _t.zeros(n - logits_t.shape[0], device=getattr(logits_t, 'device', None))
+                        logits_t = _t.cat([logits_t, pad], dim=0)
+                    logits_t = logits_t[:n]
+                    pid = getattr(self, 'player_id', 0)
+                    if hasattr(value_vec_t, 'shape') and 0 <= pid < value_vec_t.shape[0]:
+                        value_scalar = float(value_vec_t[pid].item())
+                    else:
+                        value_scalar = float(value_vec_t[0].item())
+                    logits = logits_t.tolist() if hasattr(logits_t, 'tolist') else list(logits_t)
+        except Exception:
+            # フォールバック（従来通り）
+            if getattr(self.model, 'supports_variable_actions', False) and hasattr(self.model, 'evaluate'):
+                logits, value_scalar = self.model.evaluate(state, legal)
             else:
-                value_scalar = float(value_vec_t[0].item())
-            logits = logits_t.tolist()
+                logits_t, value_vec_t = self.model.forward(state)
+                if hasattr(logits_t, 'shape') and logits_t.shape[0] < n:
+                    import torch as _t
+                    pad = _t.zeros(n - logits_t.shape[0])
+                    logits_t = _t.cat([logits_t, pad], dim=0)
+                logits_t = logits_t[:n]
+                pid = getattr(self, 'player_id', 0)
+                try:
+                    value_scalar = float(value_vec_t[pid].item())
+                except Exception:
+                    value_scalar = float(value_vec_t[0].item())
+                logits = logits_t.tolist() if hasattr(logits_t, 'tolist') else list(logits_t)
 
         # softmax 正規化
         import math as _m
