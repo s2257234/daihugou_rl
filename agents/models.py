@@ -94,6 +94,33 @@ class PolicyValueNet(nn.Module):
         return policy_logits, value_vec
 
     # -----------------------------------------------------
+    # バッチ推論（挙動互換のためオプション利用）
+    # -----------------------------------------------------
+    def forward_batch(self, states: List[Dict[str, Any]]):
+        """複数 state をまとめて (policy_logits, value_vec) を返す。
+
+        戻り値:
+          policy_logits: Tensor (B, max_policy_size)
+          value_vec    : Tensor (B, num_players)
+
+        既存 forward と同じ計算をまとめて行うだけで、出力の意味は同一です。
+        """
+        if not states:
+            # 空バッチ対策: ダミー1件で実行し、空を返す
+            x = self._encode_state({})
+            h = self.backbone(x)
+            _ = self.policy_head(h)
+            _ = self.value_head(h)
+            import torch
+            return torch.empty(0, self.max_policy_size, device=self.device), torch.empty(0, self.num_players, device=self.device)
+        import torch
+        xs = torch.stack([self._encode_state(s) for s in states], dim=0)
+        h = self.backbone(xs)
+        policy_logits = self.policy_head(h)
+        value_vec = self.value_head(h)
+        return policy_logits, value_vec
+
+    # -----------------------------------------------------
     # 保存 / 読込ユーティリティ
     # -----------------------------------------------------
     def save(self, path: str):

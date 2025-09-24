@@ -137,13 +137,18 @@ class PUCTNode:
             node = node.parent
 
 
-def _puct_select(node: PUCTNode, c_puct: float) -> PUCTNode:
+def _puct_select(node: PUCTNode, c_puct: float, virtual_counts=None) -> PUCTNode:
     """子ノードの中から PUCT スコア最大のものを返す"""
-    total_visits = max(1, sum(child.visit_count for child in node.children.values()))
+    if virtual_counts is None:
+        virtual_counts = {}
+    def vc(ch):
+        return virtual_counts.get(id(ch), 0)
+    total_visits = max(1, sum(child.visit_count + vc(child) for child in node.children.values()))
     best, best_score = None, -1e18
     sqrt_total = math.sqrt(total_visits)
     for child in node.children.values():
-        u = c_puct * child.prior * sqrt_total / (1 + child.visit_count)
+        visit_eff = child.visit_count + vc(child)
+        u = c_puct * child.prior * sqrt_total / (1 + visit_eff)
         score = child.value + u
         if score > best_score:
             best_score = score
@@ -159,7 +164,12 @@ def run_puct_mcts(root_env_copy,
                   add_dirichlet: bool = True,
                   dirichlet_alpha: float = 0.3,
                   dirichlet_epsilon: float = 0.25,
-                  root_player_id: int = 0):
+                  root_player_id: int = 0,
+                  *,
+                  policy_value_batch_fn=None,
+                  batch_eval_size: int = 1,
+                  transposition_table: dict | None = None,
+                  state_key_fn = None):
     """AlphaZero 風 PUCT MCTS 実行 (正規化 & 欠損補完対応版)。"""
     # ルート合法手
     legal_root = get_legal_actions_fn(root_env_copy)
@@ -234,44 +244,130 @@ def run_puct_mcts(root_env_copy,
         env_new.game = g_new
         return env_new
 
-    for _ in range(num_simulations):
-        # env_copy = copy.deepcopy(root_env_copy)
-        env_copy = _fast_clone(root_env_copy)
-        node = root
-        # 選択フェーズ
-        while node.children:
-            node = _puct_select(node, c_puct)
+    # --------------------------------------
+    # 事前: キャッシュ用キー関数
+    # --------------------------------------
+    if state_key_fn is None:
+        def state_key_fn_default(e):
             try:
-                env_copy.step(external_action=node.action, simulate=True)
-            except TypeError:
-                env_copy.step(node.action)
-        # 葉ノード評価
-        policy_leaf, leaf_value = policy_value_fn(env_copy)
-        legal_leaf = get_legal_actions_fn(env_copy)
-        if not legal_leaf:
-            node.backup(leaf_value)
-            continue
-        if not policy_leaf:
-            policy_leaf = {a: 1.0 / len(legal_leaf) for a in legal_leaf}
-        else:
-            missing_l = [a for a in legal_leaf if a not in policy_leaf]
-            tot_l = sum(policy_leaf.values())
-            if tot_l <= 0:
-                policy_leaf = {a: 1.0 / len(legal_leaf) for a in legal_leaf}
+                g = e.game
+                # 安全なキー（手番 / 場 / 各手札のカードID / パス状況 / ランキング / 革命）
+                turn = getattr(g, 'turn', 0)
+                field = tuple(str(c) for c in getattr(g, 'current_field', []))
+                hands = tuple(tuple(sorted(str(c) for c in p.hand)) for p in getattr(g, 'players', []))
+                passed = tuple(bool(x) for x in getattr(g, 'passed', []))
+                rankings = tuple(getattr(g, 'rankings', []))
+                revo = bool(getattr(getattr(g, 'rule_checker', None), 'revolution', False))
+                return (turn, field, hands, passed, rankings, revo)
+            except Exception:
+                return None
+        state_key_fn = state_key_fn_default
+
+    TT = transposition_table if transposition_table is not None else {}
+
+    # --------------------------------------
+    # 反復: バッチ評価付き MCTS
+    # --------------------------------------
+    sims_done = 0
+    batch_eval_size = max(1, int(batch_eval_size or 1))
+    while sims_done < num_simulations:
+        # 1バッチ分の葉を収集
+        leaf_nodes = []
+        leaf_envs = []
+        leaf_keys = []
+        leaf_legal = []
+        virtual_counts = {}
+        for _ in range(min(batch_eval_size, num_simulations - sims_done)):
+            env_copy = _fast_clone(root_env_copy)
+            node = root
+            # 選択
+            while node.children:
+                node = _puct_select(node, c_puct, virtual_counts)
+                # 同一バッチ中に同じ経路が過剰に選ばれないよう仮想訪問を加算
+                virtual_counts[id(node)] = virtual_counts.get(id(node), 0) + 1
+                try:
+                    env_copy.step(external_action=node.action, simulate=True)
+                except TypeError:
+                    env_copy.step(node.action)
+            leaf_nodes.append(node)
+            leaf_envs.append(env_copy)
+            k = state_key_fn(env_copy)
+            leaf_keys.append(k)
+            leg = get_legal_actions_fn(env_copy)
+            leaf_legal.append(leg)
+        # まずキャッシュヒットを適用
+        eval_indices = []
+        eval_envs = []
+        cached_results = {}
+        for i, (k, leg) in enumerate(zip(leaf_keys, leaf_legal)):
+            if not leg:
+                cached_results[i] = ({}, 0.0)
+                continue
+            if k is not None and k in TT:
+                cached_results[i] = TT[k]
             else:
-                for k in list(policy_leaf.keys()):
-                    policy_leaf[k] /= tot_l
-                if missing_l:
-                    rem_l = max(0.0, 1.0 - sum(policy_leaf.values()))
-                    add_l = rem_l / len(missing_l) if missing_l else 0.0
-                    for m in missing_l:
-                        policy_leaf[m] = add_l
-                s3 = sum(policy_leaf.values())
-                if s3 > 0:
-                    for k in list(policy_leaf.keys()):
-                        policy_leaf[k] /= s3
-        node.expand(getattr(env_copy.game, 'turn', 0), {a: policy_leaf[a] for a in legal_leaf if a in policy_leaf})
-        node.backup(leaf_value)
+                eval_indices.append(i)
+                eval_envs.append(leaf_envs[i])
+        # 必要分だけ NN 評価
+        evaluated = {}
+        if eval_envs:
+            # バッチ API が提供され、かつバッチサイズ>1 のとき可能なら利用
+            used_batch = False
+            if policy_value_batch_fn is not None and len(eval_envs) > 1:
+                try:
+                    outs = policy_value_batch_fn(eval_envs)
+                    if isinstance(outs, list) and len(outs) == len(eval_envs):
+                        for j, idx in enumerate(eval_indices):
+                            evaluated[idx] = outs[j]
+                        used_batch = True
+                except Exception:
+                    used_batch = False
+            if not used_batch:
+                for idx, e in zip(eval_indices, eval_envs):
+                    evaluated[idx] = policy_value_fn(e)
+        # マージして backup / expand
+        for i in range(len(leaf_nodes)):
+            node = leaf_nodes[i]
+            leg = leaf_legal[i] or []
+            # キャッシュ or 評価結果取得
+            if i in cached_results:
+                policy_leaf, leaf_value = cached_results[i]
+            elif i in evaluated:
+                policy_leaf, leaf_value = evaluated[i]
+                k = leaf_keys[i]
+                if k is not None:
+                    TT[k] = (policy_leaf, leaf_value)
+            else:
+                # 安全側: 一様分布 + 0.0
+                policy_leaf, leaf_value = ({a: 1.0 / len(leg) for a in leg} if leg else {}), 0.0
+
+            if not leg:
+                node.backup(leaf_value)
+                continue
+
+            if not policy_leaf:
+                policy_leaf = {a: 1.0 / len(leg) for a in leg}
+            else:
+                missing_l = [a for a in leg if a not in policy_leaf]
+                tot_l = sum(policy_leaf.values())
+                if tot_l <= 0:
+                    policy_leaf = {a: 1.0 / len(leg) for a in leg}
+                else:
+                    for k2 in list(policy_leaf.keys()):
+                        policy_leaf[k2] /= tot_l
+                    if missing_l:
+                        rem_l = max(0.0, 1.0 - sum(policy_leaf.values()))
+                        add_l = rem_l / len(missing_l) if missing_l else 0.0
+                        for m in missing_l:
+                            policy_leaf[m] = add_l
+                    s3 = sum(policy_leaf.values())
+                    if s3 > 0:
+                        for k2 in list(policy_leaf.keys()):
+                            policy_leaf[k2] /= s3
+            node.expand(getattr(leaf_envs[i].game, 'turn', 0), {a: policy_leaf[a] for a in leg if a in policy_leaf})
+            node.backup(leaf_value)
+
+        sims_done += len(leaf_nodes)
     return root
 
 

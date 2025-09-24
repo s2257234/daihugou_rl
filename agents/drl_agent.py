@@ -81,6 +81,11 @@ class AlphaZeroAgent:
         self.puct_c = self.config.get("puct_c", 1.4)
         self.dirichlet_alpha = self.config.get("dirichlet_alpha", 0.3)
         self.dirichlet_epsilon = self.config.get("dirichlet_epsilon", 0.25)
+        # バッチ推論/TT 設定（デフォルトは挙動不変: バッチ=1, キャッシュoff）
+        self.mcts_batch_eval_size = int(self.config.get("mcts_batch_eval_size", 1))
+        self.enable_mcts_tt = bool(self.config.get("enable_mcts_tt", False))
+        self.mcts_tt_capacity = int(self.config.get("mcts_tt_capacity", 10000))
+        self._mcts_tt = None  # lazy init LRU 風辞書
 
         # 温度スケジュール (序盤探索重視 → 後半確定的)
         self.temperature = self.config.get("temperature", 1.0)
@@ -120,6 +125,20 @@ class AlphaZeroAgent:
     def set_model(self, model):
         """後から学習済みモデルを差し替える."""
         self.model = model
+        # モデル更新時は TT を無効化（古い出力を使わないように）
+        try:
+            if self._mcts_tt is not None:
+                self._mcts_tt.clear()
+                self._mcts_tt_tick = 0
+        except Exception:
+            pass
+
+    def set_model_version(self, version: int):
+        """Trainer 側からモデル世代を更新するフック（TTは世代で分離）."""
+        try:
+            self.model_version = int(version)
+        except Exception:
+            self.model_version = version
 
     def set_env_ref(self, env):
         """環境参照をセット (select_action が obs だけ来た場合に使用)。"""
@@ -213,16 +232,90 @@ class AlphaZeroAgent:
         def legal_fn(e):  # 合法手生成
             return self._get_legal_actions(e)
 
+        # トランスポジションテーブル準備（必要時のみ）
+        TT = None
+        if self.enable_mcts_tt:
+            if self._mcts_tt is None:
+                # 使用回数で簡易LRU: {key: (value, last_tick)}
+                self._mcts_tt = {}
+                self._mcts_tt_tick = 0
+            TT = _AlphaZeroTTView(self)
+
+        # バッチ版 policy_value 関数（固定アクションヘッド時のみ活用、未対応なら None）
+        def policy_value_batch_fn(env_list):
+            try:
+                if self.model is None:
+                    outs = []
+                    for e in env_list:
+                        legal = self._get_legal_actions(e)
+                        if not legal:
+                            outs.append(({}, 0.0))
+                        else:
+                            p = 1.0 / len(legal)
+                            outs.append(({a: p for a in legal}, 0.0))
+                    return outs
+                # 可変長アクションモデルはバッチ困難 → 個別に処理
+                if getattr(self.model, 'supports_variable_actions', False) and hasattr(self.model, 'evaluate'):
+                    return [self._policy_value(e) for e in env_list]
+                # forward_batch があれば使う
+                if hasattr(self.model, 'forward_batch'):
+                    states = [self._extract_state(e) for e in env_list]
+                    logits_b, value_vec_b = self.model.forward_batch(states)
+                    outs = []
+                    for i, e in enumerate(env_list):
+                        legal = self._get_legal_actions(e)
+                        if not legal:
+                            outs.append(({}, 0.0))
+                            continue
+                        n = len(legal)
+                        logits_t = logits_b[i]
+                        if hasattr(logits_t, 'shape'):
+                            import torch as _t
+                            if logits_t.shape[0] < n:
+                                pad = _t.zeros(n - logits_t.shape[0], device=logits_t.device)
+                                logits_t = _t.cat([logits_t, pad], dim=0)
+                            logits_t = logits_t[:n]
+                            logits = logits_t.tolist()
+                        else:
+                            logits = list(logits_t)[:n]
+                            if len(logits) < n:
+                                logits += [0.0] * (n - len(logits))
+                        # value
+                        v_vec = value_vec_b[i]
+                        pid = getattr(self, 'player_id', 0)
+                        if hasattr(v_vec, 'shape') and 0 <= pid < v_vec.shape[0]:
+                            v_scalar = float(v_vec[pid].item())
+                        else:
+                            try:
+                                v_scalar = float(v_vec[pid])
+                            except Exception:
+                                v_scalar = float(v_vec[0]) if hasattr(v_vec, '__getitem__') else float(v_vec)
+                        # softmax
+                        import math as _m
+                        mx = max(logits) if logits else 0.0
+                        exps = [_m.exp(x - mx) for x in logits]
+                        s = sum(exps)
+                        probs = [e_ / s for e_ in exps] if s > 0 else [1.0 / n] * n
+                        outs.append(({legal[j]: probs[j] for j in range(n)}, v_scalar))
+                    return outs
+            except Exception:
+                pass
+            # 失敗時は逐次版へフォールバック
+            return [self._policy_value(e) for e in env_list]
+
         return run_puct_mcts(
             root_env_copy=env_copy,
             num_simulations=self.num_simulations,
             policy_value_fn=policy_value_fn,
+            policy_value_batch_fn=policy_value_batch_fn,
             get_legal_actions_fn=legal_fn,
             c_puct=self.puct_c,
             add_dirichlet=True,
             dirichlet_alpha=self.dirichlet_alpha,
             dirichlet_epsilon=self.dirichlet_epsilon,
             root_player_id=getattr(env.game, "turn", 0),
+            batch_eval_size=self.mcts_batch_eval_size,
+            transposition_table=TT,
         )
 
     def _policy_value(self, env):
@@ -638,3 +731,40 @@ class AlphaZeroAgent:
 
 
 DRLAgent = AlphaZeroAgent
+
+
+class _AlphaZeroTTView(dict):
+    """エージェント内簡易 LRU TT の薄いビュー。
+
+    内部表現: agent._mcts_tt: {key: (result, tick)}
+    ここでは dict 互換の最小操作のみを提供し、参照される度に tick を更新。
+    容量超過時には最古 tick を削除。
+    """
+    def __init__(self, agent: AlphaZeroAgent):
+        self._agent = agent
+    def _mk(self, k):
+        return (getattr(self._agent, 'model_version', 0), k)
+
+    def __contains__(self, k):
+        store = self._agent._mcts_tt
+        return self._mk(k) in store
+
+    def __getitem__(self, k):
+        store = self._agent._mcts_tt
+        key = self._mk(k)
+        res, _tick = store[key]
+        self._agent._mcts_tt_tick += 1
+        store[key] = (res, self._agent._mcts_tt_tick)
+        return res
+
+    def __setitem__(self, k, v):
+        agent = self._agent
+        store = agent._mcts_tt
+        agent._mcts_tt_tick += 1
+        store[self._mk(k)] = (v, agent._mcts_tt_tick)
+        # 簡易エビクション
+        cap = max(1, int(agent.mcts_tt_capacity or 1))
+        if len(store) > cap:
+            # 最小 tick を 1 件落とす
+            oldest_k = min(store.items(), key=lambda kv: kv[1][1])[0]
+            store.pop(oldest_k, None)

@@ -24,6 +24,10 @@ ALPHA_ZERO_CONFIG = {
     "dirichlet_epsilon": 0.25,       # ノイズ混合率 ε
     "temperature": 1.0,              # 方策サンプリング温度 (序盤高く終盤低くする調整可)
     "temperature_decay_moves": 20,   # この手数以降は温度を 0 (argmax) にする等のスケジューリング用目安
+    # 追加: MCTS 高速化オプション（デフォルト有効化）
+    "mcts_batch_eval_size": 64,      # 葉ノードのバッチ評価サイズ（1で無効同等）
+    "enable_mcts_tt": True,          # トランスポジションテーブル（NN結果キャッシュ）
+    "mcts_tt_capacity": 10000,       # キャッシュ上限（簡易LRUでエビクション）
 
     # ---------------------------
     # モデル
