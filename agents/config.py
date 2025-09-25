@@ -62,7 +62,7 @@ ALPHA_ZERO_CONFIG = {
     "checkpoint_path": "checkpoints/policy_value_latest.pt",  # 直近モデル
     # 周期保存: 大量エピソード実行時にエピソード間隔で世代チェックポイントを残す
     # 例) 100000 エピソードで 2000 間隔 -> 50 個保存
-    "checkpoint_interval_episodes": 2000,       # 0 / None なら無効
+    "checkpoint_interval_episodes": 200,       # 0 / None なら無効
     "keep_previous_model_opponent": True,       # 直前世代モデルを一部プレイヤーに割当てて多様性確保
     "previous_model_mix_players": 2,            # 学習プレイヤー以外から2人を過去モデル化
     "past_model_pool_size": 6,             # 過去6世代保持
@@ -74,10 +74,12 @@ ALPHA_ZERO_CONFIG = {
     # ---------------------------
     "log_interval": 50,              # 何手 or 何エピソードごとにログ出力するか (trainer 実装で使用想定)
     "seed": 42,                      # 乱数シード (再現性確保)
+
     # ---------------------------
     # 実行安全性 / 時間制御
     # ---------------------------
     "max_episode_steps": 800,        # 1エピソードのステップ上限 (無限長防止 / 強制打ち切り)
+
     # ---------------------------
     # ログ / 可視化
     # ---------------------------
@@ -89,24 +91,35 @@ ALPHA_ZERO_CONFIG = {
     # ETA 表示調整
     "eta_smoothing_alpha": 0.25,     # エピソード時間 EMA 係数 (0=平均,1=最新のみ)
     "monotonic_eta": True,           # 残り時間推定を単調減少にクランプ
+
     # ---------------------------
     # リプレイ共有 / 構造
     # ---------------------------
     "use_shared_replay": True,       # 全エージェントで単一の共有リプレイバッファを使用
     "replay_recent_sample_ratio": 0.0,  # >0 なら直近一定割合を優先サンプリング (未実装placeholder)
+
     # ---------------------------
     # 自己対局 並列実行
     # ---------------------------
     # 並列ワーカー数 (0/1 で無効 = 単一プロセス)。Windows の spawn に対応。
     "selfplay_workers": 16,
     # ワーカープロセスでの推論デバイス。通常は CPU を推奨 (GPU 共有は非推奨)。
+
     "selfplay_worker_device": "cpu",
+    # 並行学習トリガ: 新規サンプルがこの数だけ取り込まれたら学習を1バースト起動
+    # 小さすぎると学習バーストが細切れになり効率低下。大きすぎると応答が遅れる
+    "concurrent_min_new_samples_before_train": 2000,
+    # 学習後の最新チェックポイント保存の最短間隔(秒)。0以下で毎回保存（高I/O）
+    "concurrent_latest_save_every_sec": 300.0,
+    # ワーカー配布用モデル(pt)保存の最短間隔(秒)。0以下で毎回保存
+    "concurrent_blob_save_every_sec": 30.0,
     # ---------------------------
     # ハードウェア / デバイス
     # ---------------------------
     # 'auto' -> torch.cuda.is_available() なら 'cuda'、それ以外は 'cpu'
     # 明示的に 'cpu' / 'cuda' / 'cuda:0' などを指定することも可能
     "device": "auto",
+
     # ---------------------------
     # ログ最適化 (大量学習向け)
     # ---------------------------
@@ -120,6 +133,7 @@ ALPHA_ZERO_CONFIG = {
     "csv_episode_log_every": 1,
     # MCTS ルート統計 JSONL を更に抑制したい場合 (disable_mcts_log と組み合わせ)
     "mcts_jsonl_max_bytes": 50_000_000,     # 上限超過で以降追記停止 (約50MB)。0/None で無効
+
     # ---------------------------
     # CSV ログ制御
     # ---------------------------
