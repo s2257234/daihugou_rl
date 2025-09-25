@@ -38,6 +38,8 @@ import os
 import random
 import time
 from typing import Dict, Any, List
+from dataclasses import dataclass
+import multiprocessing as mp
 import argparse
 
 import sys
@@ -55,6 +57,106 @@ try:
     from game.environment import DaifugoSimpleEnv
 except ImportError as e:  # pragma: no cover
     raise ImportError("DaifugoSimpleEnv が見つかりません。game.environment を確認してください") from e
+
+
+# ======================================================
+# 並列自己対局: ワーカープロセス用エントリ関数 (Windows spawn 対応)
+# ======================================================
+def _selfplay_worker_entry(worker_id: int, episodes: int, config: Dict[str, Any], model_path: str):
+    """ワーカープロセスで自己対局を複数回実行し、確定サンプルを返す。
+
+    戻り値: {"samples": List[Dict], "episodes": int, "worker": int}
+    """
+    # 乱数初期化（プロセス毎にズラす）
+    try:
+        seed = int(config.get("seed", 42)) + 10000 * int(worker_id)
+    except Exception:
+        seed = 42 + 10000 * int(worker_id)
+    random.seed(seed)
+    try:
+        import numpy as _np
+        _np.random.seed(seed % (2**32 - 1))
+    except Exception:
+        pass
+
+    # モデル読込（CPU 推奨）
+    from agents.models import PolicyValueNet as _PVN
+    try:
+        model = _PVN.load(model_path, map_location=config.get("selfplay_worker_device", "cpu"))
+    except Exception:
+        model = _PVN(
+            max_policy_size=config.get("max_policy_size", 128),
+            hidden_size=config.get("hidden_size", 128),
+            num_players=config.get("num_players", 4),
+            device=config.get("selfplay_worker_device", "cpu"),
+        )
+
+    # エージェントと環境を構築（共有リプレイは使わずローカルに蓄積）
+    num_players = int(config.get("num_players", 4))
+    agents: List[AlphaZeroAgent] = []
+    for pid in range(num_players):
+        ag = AlphaZeroAgent(player_id=pid, model=model, config=dict(config))
+        # ワーカー内では共有リプレイを無効化し、ローカル list に保存させる
+        try:
+            ag._use_shared = False
+            ag.replay_buffer = []
+        except Exception:
+            pass
+        agents.append(ag)
+    env = DaifugoSimpleEnv(num_players=num_players, agent_classes=None)
+    env.agents = agents
+    for ag in agents:
+        if hasattr(ag, 'set_env_ref'):
+            ag.set_env_ref(env)
+        if hasattr(ag, 'logger'):
+            ag.logger = None
+
+    # エピソード実行ループ（Trainer._play_one_episode とほぼ同等の縮約版）
+    total_episodes = int(episodes)
+    for ep in range(total_episodes):
+        if hasattr(env, 'reset'):
+            env.reset()
+        for ag in agents:
+            if hasattr(ag, 'reset_episode'):
+                ag.reset_episode()
+        step_count = 0
+        prev_rankings: List[int] = list(getattr(env.game, "rankings", []))
+        max_steps = int(config.get("max_episode_steps", 1000))
+        while not getattr(env.game, "done", False):
+            if step_count >= max_steps:
+                break
+            cur_pid = env.game.turn
+            ag = agents[cur_pid]
+            action = ag.select_action(env, training=True)
+            try:
+                env.step(external_action=action)
+            except TypeError:
+                env.step(action)
+            step_count += 1
+            # フェーズ確定時処理
+            current_rankings: List[int] = list(getattr(env.game, "rankings", []))
+            if len(current_rankings) > len(prev_rankings):
+                new_winners = current_rankings[len(prev_rankings):]
+                for winner_id in new_winners:
+                    for az in agents:
+                        was_active = az.player_id not in prev_rankings
+                        az.finalize_phase(winner_player_id=winner_id, was_active=was_active)
+                prev_rankings = current_rankings
+        # 未確定フェーズを 0 で確定し、ゲーム終端フック
+        for az in agents:
+            az.flush_unfinished_phase()
+            az.finalize_game()
+
+    # 確定サンプルを収集して返す
+    out_samples: List[Dict[str, Any]] = []
+    for az in agents:
+        try:
+            for s in az.replay_buffer:
+                if isinstance(s, dict) and s.get("value") is not None:
+                    out_samples.append(dict(s))
+        except Exception:
+            pass
+    return {"samples": out_samples, "episodes": total_episodes, "worker": worker_id}
 
 
 class Trainer:
@@ -129,7 +231,8 @@ class Trainer:
             log_dir=self.config.get("log_dir", "logs"),
             use_tensorboard=self.config.get("enable_tensorboard", True),
             clear_existing=self.config.get("clear_logs_on_start", False),
-            log_mcts_samples=not self.config.get("disable_mcts_log", False)
+            log_mcts_samples=not self.config.get("disable_mcts_log", False),
+            config=self.config
         )
         # 共有リプレイバッファ (use_shared_replay=true の場合)
         self.shared_replay = None
@@ -229,6 +332,11 @@ class Trainer:
     # 自己対局 (データ収集)
     # -----------------------------------------------------
     def self_play(self, num_episodes: int = 1):
+        # 並列数で分岐
+        workers = int(self.config.get("selfplay_workers", 0) or 0)
+        if workers and workers > 1:
+            return self._self_play_parallel(num_episodes=num_episodes, workers=workers)
+
         start_time = time.time()
         for ep in range(num_episodes):
             ep_start = time.time()
@@ -290,6 +398,107 @@ class Trainer:
                 print(line + ' ' * pad, end='\r' if done < num_episodes else '\n', flush=True)
                 self._last_progress_len = len(line)
         # ループ終了後、バー表示時は改行が確定するので追加処理不要
+        return
+
+    # ---------------- 並列自己対局 ----------------
+    def _self_play_parallel(self, num_episodes: int, workers: int):
+        """マルチプロセスで自己対局を並行実行し、共有リプレイへ集約する。
+
+        注意:
+          - Windows は spawn 方式のため、ワーカー関数はトップレベルに定義。
+          - モデルは CPU コピーをミニチェックポイント経由で各ワーカーへ配布。
+          - ワーカーはローカルバッファに確定サンプルのみを溜め、終了時に親へ返す。
+        """
+        start_time = time.time()
+        # 進捗用
+        total_done = 0
+        last_progress_len = 0
+
+        # モデル配布: 最新を一時パスへ保存（各チャンクで共通利用）
+        os.makedirs(self.config["checkpoint_dir"], exist_ok=True)
+        model_blob_path = os.path.join(self.config["checkpoint_dir"], "_selfplay_worker_model.pt")
+        if self.model is not None:
+            self.model.save(model_blob_path)
+
+        remaining = int(num_episodes)
+        ckpt_interval = int(self.ckpt_interval or 0)
+
+        while remaining > 0:
+            # 次のチェックポイント境界までの残り (0=無効なら全量)
+            if ckpt_interval > 0:
+                to_next = ckpt_interval - (self._episodes_total_run % ckpt_interval)
+                if to_next <= 0:
+                    to_next = ckpt_interval
+                chunk = min(remaining, to_next)
+            else:
+                chunk = remaining
+
+            # このチャンクを workers にほぼ均等割当
+            base = chunk // workers
+            rem = chunk % workers
+            ep_splits = [base + (1 if i < rem else 0) for i in range(workers)]
+            tasks = []
+            for wid, n_ep in enumerate(ep_splits):
+                if n_ep <= 0:
+                    continue
+                tasks.append((wid, n_ep, self.config, model_blob_path))
+
+            # 実行（spawn プールをチャンク毎に生成して安全に実行）
+            results = []
+            if tasks:
+                with mp.get_context("spawn").Pool(processes=len(tasks)) as pool:
+                    for wid, n_ep, cfg, model_path in tasks:
+                        results.append(pool.apply_async(_selfplay_worker_entry, (wid, n_ep, cfg, model_path)))
+                    # 逐次回収しリプレイへ反映
+                    for res in results:
+                        worker_out = res.get()
+                        samples = worker_out.get("samples", [])
+                        if self.shared_replay is None:
+                            learner = self.agents[self.learning_player_id]
+                            if isinstance(learner, AlphaZeroAgent):
+                                for s in samples:
+                                    learner.replay_buffer.append(s)
+                        else:
+                            for s in samples:
+                                self.shared_replay.append(s)
+                        total_done += worker_out.get("episodes", 0)
+                        if self.minimal_progress and self.use_progress_bar:
+                            bar, _pct = self._make_progress_bar(total_done, num_episodes)
+                            line = f"[SELFPLAY*] {bar} {total_done}/{num_episodes} (workers={workers})"
+                            pad = max(0, last_progress_len - len(line))
+                            print(line + ' ' * pad, end='\r' if total_done < num_episodes else '\n', flush=True)
+                            last_progress_len = len(line)
+
+            # エピソードカウンタを 1 ずつ進めて単一実行時と同じタイミングのフックを発火
+            for _ in range(chunk):
+                self._episodes_total_run += 1
+                # 周期チェックポイント保存（単一実行時と同一判定）
+                if self.ckpt_interval > 0 and (self._episodes_total_run % self.ckpt_interval == 0):
+                    self._save_checkpoint(version_tag=f"ep{self._episodes_total_run}")
+                    if self.keep_prev_model:
+                        self._snapshot_current_model()
+                    if self.keep_prev_model and self.prev_model_mix_players > 0:
+                        if self.past_models:
+                            self._assign_past_models_to_opponents()
+                        elif self._previous_model is not None:
+                            self._mix_previous_model_opponents()
+                    # モデル世代を進め、エージェントへ反映
+                    self.model_version += 1
+                    for ag in self.agents:
+                        if isinstance(ag, AlphaZeroAgent) and hasattr(ag, 'model_version'):
+                            ag.model_version = self.model_version
+                # 任意のエピソード間隔で opponent 再割当
+                if self.opponent_mix_interval > 0 and self.keep_prev_model and self.prev_model_mix_players > 0:
+                    if (self._episodes_total_run % self.opponent_mix_interval == 0) and self.past_models:
+                        self._assign_past_models_to_opponents()
+
+            remaining -= chunk
+
+        # 終了ログ
+        elapsed = time.time() - start_time
+        if not self.minimal_progress:
+            print(f"[SELFPLAY*] finished {num_episodes} episodes in {elapsed:.1f}s using {workers} workers")
+        return
 
     # -----------------------------------------------------
     # 過去モデルスナップショット
@@ -512,6 +721,12 @@ class Trainer:
         # 学習直後の最新モデルもスナップショット (自己対局前に世代差が明確になる)
         if self.keep_prev_model:
             self._snapshot_current_model()
+        # CSV サマリーモードならここで 1 行のみ書き出し
+        if self.logger and getattr(self.logger, 'csv_summary_only', False):
+            try:
+                self.logger.write_csv_summaries()
+            except Exception as e:
+                print(f"[WARN] write_csv_summaries failed: {e}")
 
     # -----------------------------------------------------
     # 進捗バー生成ヘルパー
@@ -590,6 +805,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-tb", action="store_true", help="TensorBoard を無効化")
     parser.add_argument("--seed", type=int, default=None, help="乱数シード上書き")
     parser.add_argument("--device", type=str, default=None, help="使用デバイスを指定 (cpu/cuda/cuda:0)。未指定はauto")
+    parser.add_argument("--workers", type=int, default=None, help="自己対局の並列ワーカー数。未指定は設定値を使用")
     args = parser.parse_args()
 
     cfg = dict(ALPHA_ZERO_CONFIG)
@@ -605,6 +821,8 @@ if __name__ == "__main__":
         cfg["seed"] = args.seed
     if args.device is not None:
         cfg["device"] = args.device
+    if args.workers is not None:
+        cfg["selfplay_workers"] = max(0, int(args.workers))
 
     #print("[CLI] Config overrides:", {k: cfg[k] for k in ["num_simulations","batch_size","log_dir","enable_tensorboard","device"] if k in cfg})
     trainer = Trainer(config=cfg)

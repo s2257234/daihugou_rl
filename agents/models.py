@@ -134,13 +134,33 @@ class PolicyValueNet(nn.Module):
 
     @staticmethod
     def load(path: str, map_location: Optional[str] = None) -> "PolicyValueNet":
-        ckpt = torch.load(path, map_location=map_location or "cpu")
+        # weights_only=True を優先し、非対応や旧形式はフォールバック
+        try:
+            ckpt = torch.load(path, map_location=map_location or "cpu", weights_only=True)
+        except TypeError:
+            # 古いPyTorchで weights_only 未対応
+            ckpt = torch.load(path, map_location=map_location or "cpu")
+        except Exception:
+            ckpt = torch.load(path, map_location=map_location or "cpu")
+
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            state_dict = ckpt["state_dict"]
+            max_policy_size = ckpt.get("max_policy_size", 128)
+            hidden_size = ckpt.get("hidden_size", 128)
+            num_players = ckpt.get("num_players", 4)
+        else:
+            # 純粋な state_dict のみが保存されていた場合
+            state_dict = ckpt
+            max_policy_size = 128
+            hidden_size = 128
+            num_players = 4
+
         model = PolicyValueNet(
-            max_policy_size=ckpt.get("max_policy_size", 128),
-            hidden_size=ckpt.get("hidden_size", 128),
-            num_players=ckpt.get("num_players", 4),
+            max_policy_size=max_policy_size,
+            hidden_size=hidden_size,
+            num_players=num_players,
         )
-        model.load_state_dict(ckpt["state_dict"])
+        model.load_state_dict(state_dict)
         return model
 
 
@@ -316,9 +336,22 @@ class ActionPolicyValueNet(nn.Module):
 
     @staticmethod
     def load(path: str, map_location: Optional[str] = None):
-        ckpt = torch.load(path, map_location=map_location or "cpu")
-        model = ActionPolicyValueNet(num_players=ckpt.get("num_players",4))
-        model.load_state_dict(ckpt["state_dict"])
+        try:
+            ckpt = torch.load(path, map_location=map_location or "cpu", weights_only=True)
+        except TypeError:
+            ckpt = torch.load(path, map_location=map_location or "cpu")
+        except Exception:
+            ckpt = torch.load(path, map_location=map_location or "cpu")
+
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            state_dict = ckpt["state_dict"]
+            num_players = ckpt.get("num_players", 4)
+        else:
+            state_dict = ckpt
+            num_players = 4
+
+        model = ActionPolicyValueNet(num_players=num_players)
+        model.load_state_dict(state_dict)
         return model
 
 

@@ -27,7 +27,7 @@ ALPHA_ZERO_CONFIG = {
     # 追加: MCTS 高速化オプション（デフォルト有効化）
     "mcts_batch_eval_size": 64,      # 葉ノードのバッチ評価サイズ（1で無効同等）
     "enable_mcts_tt": True,          # トランスポジションテーブル（NN結果キャッシュ）
-    "mcts_tt_capacity": 10000,       # キャッシュ上限（簡易LRUでエビクション）
+    "mcts_tt_capacity": 100000,       # キャッシュ上限（簡易LRUでエビクション）
 
     # ---------------------------
     # モデル
@@ -88,11 +88,39 @@ ALPHA_ZERO_CONFIG = {
     "use_shared_replay": True,       # 全エージェントで単一の共有リプレイバッファを使用
     "replay_recent_sample_ratio": 0.0,  # >0 なら直近一定割合を優先サンプリング (未実装placeholder)
     # ---------------------------
+    # 自己対局 並列実行
+    # ---------------------------
+    # 並列ワーカー数 (0/1 で無効 = 単一プロセス)。Windows の spawn に対応。
+    "selfplay_workers": 16,
+    # ワーカープロセスでの推論デバイス。通常は CPU を推奨 (GPU 共有は非推奨)。
+    "selfplay_worker_device": "cpu",
+    # ---------------------------
     # ハードウェア / デバイス
     # ---------------------------
     # 'auto' -> torch.cuda.is_available() なら 'cuda'、それ以外は 'cpu'
     # 明示的に 'cpu' / 'cuda' / 'cuda:0' などを指定することも可能
     "device": "auto",
+    # ---------------------------
+    # ログ最適化 (大量学習向け)
+    # ---------------------------
+    # TensorBoard 及び CSV への書き込み頻度を制御し I/O/ディスク負荷を軽減
+    # 例: train 100 ステップに 1 回 / episode 10 回に 1 回
+    "tensorboard_train_log_every": 100,      # 1 なら毎ステップ
+    "tensorboard_episode_log_every": 100,
+    "tensorboard_flush_seconds": 120,        # 最低この秒数ごとに flush (0/None なら都度 flush)
+    # CSV 出力間引き (1=毎回)。間引いた行は欠番になる
+    "csv_train_log_every": 1,
+    "csv_episode_log_every": 1,
+    # MCTS ルート統計 JSONL を更に抑制したい場合 (disable_mcts_log と組み合わせ)
+    "mcts_jsonl_max_bytes": 50_000_000,     # 上限超過で以降追記停止 (約50MB)。0/None で無効
+    # ---------------------------
+    # CSV ログ制御
+    # ---------------------------
+    # True なら episodes.csv / train_updates.csv を一切生成しない
+    "disable_csv_logging": False,
+    # True なら逐次書き込みをせず、最後に 1 行だけ (最終エピソード指標 / 最終学習指標) を保存
+    # disable_csv_logging が True の場合は無視される
+    "csv_summary_only":True,
 }
 
 __all__ = ["ALPHA_ZERO_CONFIG"]
