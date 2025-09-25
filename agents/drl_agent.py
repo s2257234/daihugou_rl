@@ -92,6 +92,8 @@ class AlphaZeroAgent:
         self.temperature_low = self.config.get("temperature_low", 0.05)
         self.temperature_decay_moves = self.config.get("temperature_decay_moves", 20)
         self.move_count = 0  # エピソード内手数カウンタ
+        # 自己対戦エピソードカウンタ（温度スケジュール短縮用）
+        self.episodes_played = 0
 
         # 学習用ハイパーパラメータ
         self.lr = self.config.get("lr", 1e-4)
@@ -164,11 +166,8 @@ class AlphaZeroAgent:
         actions = list(root.children.keys())
         visits = [child.visit_count for child in root.children.values()]
 
-        # 温度決定 (序盤: high / 後半: low / 評価: near-greedy)
-        if training:
-            cur_temp = self.temperature if self.move_count < self.temperature_decay_moves else self.temperature_low
-        else:
-            cur_temp = 1e-6
+        # 温度決定 (手数/進行に応じたスケジュール)
+        cur_temp = self._select_temperature(training=training)
         pi = softmax_temperature_policy(visits, cur_temp)
 
         # MCTS 統計のサンプリングログ (低確率で記録)
@@ -220,6 +219,38 @@ class AlphaZeroAgent:
         self._phase_samples.append(stored)
         self.move_count += 1
         return action_env
+
+    # ---------------- Temperature schedule helpers ----------------
+    def _compute_high_temp_window(self) -> int:
+        """高温(τ=high)を適用する手数の上限を返す。
+
+        仕様:
+          - 初期は 10 手まで高温
+          - 自己対戦エピソード数が増えるごとに段階的に短縮
+          - 最低 2 手までは高温を維持
+
+        短縮レートは簡易に「decay_every エピソードごとに 1 手短縮」。
+        """
+        base = int(self.config.get("temp_high_moves_initial", 10))
+        min_win = int(self.config.get("temp_high_moves_min", 2))
+        decay_every = int(self.config.get("temp_high_moves_decay_every", 500))  # 例: 500epごとに-1
+        episodes = int(getattr(self, "episodes_played", 0))
+        reduction = (episodes // decay_every) if decay_every > 0 else 0
+        return max(min_win, base - reduction)
+
+    def _select_temperature(self, training: bool = True) -> float:
+        """現在手数と進行に応じて温度τを返す。
+
+        - 学習時: 先頭 high_window 手は τ=1.0、それ以降は τ=0.1
+        - 評価時: ほぼgreedy (τ≈0)
+        """
+        if not training:
+            return 1e-6
+        # 値は要件に合わせたデフォルト。必要なら config で上書き可能。
+        high_temp = float(self.config.get("temp_high_value", 1.0))
+        low_temp = float(self.config.get("temp_low_value", 0.1))
+        high_window = self._compute_high_temp_window()
+        return high_temp if self.move_count < high_window else low_temp
 
     # ---------------- Core (MCTS) ----------------
     def _run_mcts(self, env) -> PUCTNode:
@@ -759,6 +790,11 @@ class AlphaZeroAgent:
     def reset_episode(self):
         """エピソード開始時にカウンタ類を初期化."""
         self.move_count = 0
+        # 進行に応じた温度スケジュール短縮のため、エピソード数をカウント
+        try:
+            self.episodes_played += 1
+        except Exception:
+            self.episodes_played = int(getattr(self, "episodes_played", 0)) + 1
         self.episode_phase_total = 0
         self.episode_phase_correct = 0
 

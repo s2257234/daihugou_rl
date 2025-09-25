@@ -338,6 +338,12 @@ class Trainer:
             return self._self_play_parallel(num_episodes=num_episodes, workers=workers)
 
         start_time = time.time()
+        # 実行開始直後に 0% 進捗を表示して無音時間を減らす
+        if self.minimal_progress and self.use_progress_bar and num_episodes > 0:
+            bar, _pct = self._make_progress_bar(0, num_episodes)
+            line = f"[SELFPLAY] {bar} 0/{num_episodes}"
+            print(line, end='\r', flush=True)
+            self._last_progress_len = len(line)
         for ep in range(num_episodes):
             ep_start = time.time()
             if not self.minimal_progress and not self.use_progress_bar:
@@ -422,6 +428,13 @@ class Trainer:
 
         remaining = int(num_episodes)
         ckpt_interval = int(self.ckpt_interval or 0)
+
+        # 実行開始直後に 0% 進捗を表示（長いエピソードでも即表示）
+        if self.minimal_progress and self.use_progress_bar and num_episodes > 0:
+            bar, _pct = self._make_progress_bar(0, num_episodes)
+            line = f"[SELFPLAY*] {bar} 0/{num_episodes} (workers={workers})"
+            print(line, end='\r', flush=True)
+            last_progress_len = len(line)
 
         while remaining > 0:
             # 次のチェックポイント境界までの残り (0=無効なら全量)

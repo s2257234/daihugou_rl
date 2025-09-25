@@ -24,6 +24,13 @@ ALPHA_ZERO_CONFIG = {
     "dirichlet_epsilon": 0.25,       # ノイズ混合率 ε
     "temperature": 1.0,              # 方策サンプリング温度 (序盤高く終盤低くする調整可)
     "temperature_decay_moves": 20,   # この手数以降は温度を 0 (argmax) にする等のスケジューリング用目安
+    # 温度スケジュール（序盤高温→後半低温、自己対戦エピソード進行で高温手数を短縮）
+    # デフォルト: 最初の10手は τ=1.0、それ以降は τ=0.1。エピソードが進むと高温手数を段階的に短縮（最低2手を維持）
+    "temp_high_value": 1.0,             # 高温 τ
+    "temp_low_value": 0.1,              # 低温 τ
+    "temp_high_moves_initial": 10,      # 高温適用の初期手数
+    "temp_high_moves_min": 2,           # 高温適用の最低手数
+    "temp_high_moves_decay_every": 500, # 何エピソードごとに高温手数を1手短縮するか
     # 追加: MCTS 高速化オプション（デフォルト有効化）
     "mcts_batch_eval_size": 64,      # 葉ノードのバッチ評価サイズ（1で無効同等）
     "enable_mcts_tt": True,          # トランスポジションテーブル（NN結果キャッシュ）
