@@ -122,6 +122,11 @@ class AlphaZeroAgent:
         self.episode_phase_correct = 0
         # リプレイ追い出し検知
         self.lost_phase_samples = 0
+        # TT 統計
+        self.tt_hits = 0
+        self.tt_misses = 0
+        # pos weight (クラス不均衡対策) optional
+        self.pos_weight = float(self.config.get("value_pos_weight", 1.0))
 
     # ---------------- Public API ----------------
     def set_model(self, model):
@@ -421,7 +426,13 @@ class AlphaZeroAgent:
         exps = [_m.exp(x - mx) for x in logits]
         s = sum(exps)
         probs = [e / s for e in exps] if s > 0 else [1.0 / n] * n
-        return {legal[i]: probs[i] for i in range(n)}, float(value_scalar)
+        try:
+            out = {legal[i]: probs[i] for i in range(n)}
+        except Exception:
+            # フォールバック: サイズ不一致など
+            out = {a: (1.0/len(legal)) for a in legal}
+            value_scalar = 0.5
+        return out, float(value_scalar)
 
     # ---------------- Env helpers ----------------
     def _copy_env(self, env):
@@ -489,19 +500,113 @@ class AlphaZeroAgent:
             return None
 
     def _extract_state(self, env):
-        """学習用の簡易状態特徴を dict で抽出 (手札枚数 / 場枚数 / 手番ID / 革命フラグ)。"""
+        """状態特徴を抽出。
+        config.use_full_features が True の場合は拡張特徴量ベクトル full_input を生成。
+        full_input レイアウト (順序固定):
+            For each player i (0..N-1):
+              - 53 bits: 各カード所持 (標準52 + Joker1) (1/0)
+              - 1 bit : pass フラグ (現ターンでパス状態)
+              - 1 scalar: 残り枚数 (正規化 0..1, /53)
+            Field block:
+              - 1 bit revolution
+              - 7 bits combo type one-hot (empty,single,pair,triple,four,straight,joker)
+              - 13 bits field base rank one-hot (同ランク系: その rank, 階段: 先頭ランク, joker_single: none all zero, empty: all zero)
+              - 1 scalar: field_size / 13
+            Turn one-hot (N)
+        合計次元 = players * (53+1+1) + (1+7+13+1) + N
+        """
         try:
             g = env.game
             pid = g.turn
-            me = g.players[pid]
             rule_checker = getattr(g, "rule_checker", None)
             revo = bool(getattr(rule_checker, "revolution", False)) if rule_checker else False
-            return {
+            use_full = bool(getattr(self, 'config', {}).get('use_full_features', False))
+            base = {
+                "turn": pid,
+            }
+            me = g.players[pid]
+            base.update({
                 "hand_size": len(me.hand),
                 "field_size": len(g.current_field),
-                "turn": pid,
                 "revolution": revo,
-            }
+            })
+            if not use_full:
+                return base
+            # --- フル特徴生成 ---
+            num_players = len(g.players)
+            # カードインデックス: suit*13 + (rank-1) => 0..51, Joker => 52
+            def card_index(card):
+                if card.is_joker:
+                    return 52
+                suit_order = {'♠':0,'♥':1,'♦':2,'♣':3}
+                return suit_order.get(card.suit,0)*13 + (card.rank-1)
+            per_player_dim = 53 + 1 + 1
+            players_block = []
+            for i, pl in enumerate(g.players):
+                bits = [0.0]*53
+                for c in pl.hand:
+                    try:
+                        idx = card_index(c)
+                        if 0 <= idx < 53:
+                            bits[idx] = 1.0
+                    except Exception:
+                        pass
+                pass_bit = 1.0 if (i < len(g.passed) and g.passed[i]) else 0.0
+                remain_norm = len(pl.hand)/53.0
+                players_block.extend(bits + [pass_bit, remain_norm])
+            # Field combo type
+            field = g.current_field
+            combo_type_onehot = [0.0]*7  # empty,single,pair,triple,four,straight,joker_single
+            rank_onehot = [0.0]*13
+            field_size = len(field)
+            if field_size == 0:
+                combo_type_onehot[0] = 1.0
+                base_rank = None
+            else:
+                combo = rule_checker.classify_combo(field) if rule_checker else None
+                ctype = combo['type'] if combo else None
+                mapping = {
+                    'single':1,
+                    'pair':2,
+                    'triple':3,
+                    'four':4,
+                    'straight':5,
+                    'joker_single':6,
+                }
+                if ctype in mapping:
+                    combo_type_onehot[mapping[ctype]] = 1.0
+                base_rank = None
+                if combo:
+                    if ctype in ('single','pair','triple','four') and combo.get('rank') is not None:
+                        base_rank = combo['rank']
+                    elif ctype == 'straight':
+                        ranks = combo.get('ranks', [])
+                        base_rank = ranks[0] if ranks else None
+                if base_rank is not None and 1 <= base_rank <= 13:
+                    # rank 1..13 -> index 0..12 (A=1 -> 0)
+                    rank_onehot[base_rank-1] = 1.0
+            revolution_bit = 1.0 if revo else 0.0
+            field_size_norm = field_size/13.0
+            field_block = [revolution_bit] + combo_type_onehot + rank_onehot + [field_size_norm]
+            # turn one-hot
+            turn_onehot = [0.0]*num_players
+            if 0 <= pid < num_players:
+                turn_onehot[pid] = 1.0
+            full_vec = players_block + field_block + turn_onehot
+            base['full_input'] = full_vec
+            base['full_input_dim'] = len(full_vec)
+            # フル特徴量次元一貫性チェック
+            try:
+                if self.config.get('use_full_features'):
+                    cur_dim = len(full_vec)
+                    ref = getattr(self, '_full_input_dim_ref', None)
+                    if ref is None:
+                        self._full_input_dim_ref = cur_dim
+                    elif ref != cur_dim:
+                        print(f"[WARN] full_input_dim mismatch expected={ref} got={cur_dim}")
+            except Exception:
+                pass
+            return base
         except Exception:
             return {"turn": 0}
 
@@ -516,7 +621,11 @@ class AlphaZeroAgent:
             "value": value,
             "value_pred": value_pred,
             "model_version": getattr(self, 'model_version', 0),
+            "feature_version": 1 if (isinstance(state, dict) and 'full_input' in state) else 0,
         }
+        # フル特徴量モード時に legacy サンプル(=0) を破棄して無駄容量を防ぐ
+        if self.config.get('use_full_features') and sample['feature_version'] == 0:
+            return sample  # 破棄 (格納しない)。戻り値だけ返す。
         if self._use_shared and hasattr(self.replay_buffer, 'append'):
             self.replay_buffer.append(sample)
             return sample
@@ -603,7 +712,21 @@ class AlphaZeroAgent:
         """joblib からリプレイバッファを読み込み (無ければ空)。"""
         path = path or self.config.get("replay_path", "replay_buffer.joblib")
         try:
-            self.replay_buffer = joblib.load(path)
+            data = joblib.load(path)
+            # feature_version フィルタ (フル特徴量モード時)
+            if self.config.get('use_full_features'):
+                if isinstance(data, list):
+                    legacy = sum(1 for s in data if isinstance(s, dict) and s.get('feature_version',0)==0)
+                    if legacy > 0:
+                        # バックアップ
+                        try:
+                            bk = path + '.legacy_backup'
+                            joblib.dump(data, bk, compress=3)
+                        except Exception:
+                            pass
+                        data = [s for s in data if isinstance(s, dict) and s.get('feature_version',0)==1]
+                        print(f"[INFO] purged legacy replay samples={legacy} kept={len(data)}")
+            self.replay_buffer = data
         except FileNotFoundError:
             self.replay_buffer = []
 
@@ -638,6 +761,12 @@ class AlphaZeroAgent:
             self._optimizer = torch.optim.Adam(params, lr=self.lr, weight_decay=self.weight_decay)
 
         batch = batch_pool if len(batch_pool) <= batch_size else random.sample(batch_pool, batch_size)
+        # フル特徴量モード時に旧フォーマット(feature_version=0)サンプルを除外
+        if self.config.get('use_full_features'):
+            filtered = [s for s in batch if s.get('feature_version', 0) == 1]
+            if not filtered:
+                return {"loss": None, "reason": "no_full_feature_samples"}
+            batch = filtered
 
         policy_losses = []
         value_losses = []
@@ -702,7 +831,9 @@ class AlphaZeroAgent:
             v_t = torch.tensor(float(v_target), dtype=torch.float32, device=v_pred_t.device)
             eps = 1e-7
             v_clamped = v_pred_t.clamp(eps, 1 - eps)
-            value_loss = -(v_t * v_clamped.log() + (1 - v_t) * (1 - v_clamped).log())
+            # クラス不均衡対策 (pos_weight) 適用
+            pos_w = self.pos_weight if v_t.item() > 0.5 else 1.0
+            value_loss = - (pos_w * v_t * v_clamped.log() + (1 - v_t) * (1 - v_clamped).log())
             entropy = -(probs * log_probs).sum()
 
             policy_losses.append(policy_loss)
@@ -781,7 +912,15 @@ class AlphaZeroAgent:
             "value_brier": value_brier,
             "pos_rate": pos_rate,
             "cum_pos_rate": (self.total_positive / self.total_value_samples) if self.total_value_samples > 0 else None,
+            "tt_hit_rate": (self.tt_hits / max(1, (self.tt_hits + self.tt_misses))) if (self.tt_hits + self.tt_misses) > 0 else None,
         }
+        # pos_rate 警告
+        try:
+            warn_th = float(self.config.get('pos_rate_warn_threshold', 0.02))
+            if pos_rate is not None and pos_rate < warn_th:
+                print(f"[WARN] value positive sample rate low ({pos_rate:.2%}) < {warn_th:.2%}")
+        except Exception:
+            pass
         if self.logger:
             self.logger.log_train(metrics)
             self._logged_inside = True
@@ -816,7 +955,15 @@ class _AlphaZeroTTView(dict):
 
     def __contains__(self, k):
         store = self._agent._mcts_tt
-        return self._mk(k) in store
+        found = self._mk(k) in store
+        try:
+            if found:
+                self._agent.tt_hits += 1
+            else:
+                self._agent.tt_misses += 1
+        except Exception:
+            pass
+        return found
 
     def __getitem__(self, k):
         store = self._agent._mcts_tt

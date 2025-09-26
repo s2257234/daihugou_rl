@@ -34,15 +34,24 @@ class PolicyValueNet(nn.Module):
                  max_policy_size: int = 128,
                  hidden_size: int = 128,
                  num_players: int = 4,
-                 device: Optional[str] = None):
+                 device: Optional[str] = None,
+                 use_full_features: bool = False,
+                 full_feature_dim: Optional[int] = None):
         super().__init__()
         self.max_policy_size = max_policy_size
         self.num_players = num_players
         self.device = torch.device(device) if device else torch.device("cpu")
-        
+        self.use_full_features = use_full_features
 
-        # 入力特徴量: hand_size(1) + field_size(1) + turn_onehot(num_players)
-        input_dim = 2 + num_players
+        # 簡易入力: hand_size(1) + field_size(1) + turn_onehot(num_players)
+        base_input_dim = 2 + num_players
+        if self.use_full_features:
+            if full_feature_dim is None:
+                raise ValueError("use_full_features=True ですが full_feature_dim が指定されていません。")
+            input_dim = full_feature_dim
+        else:
+            input_dim = base_input_dim
+
         h = hidden_size
         self.backbone = nn.Sequential(
             nn.Linear(input_dim, h),
@@ -51,12 +60,12 @@ class PolicyValueNet(nn.Module):
             nn.ReLU(),
         )
         self.policy_head = nn.Linear(h, max_policy_size)
-        # value: 各プレイヤーが「次に上がる」確率 (multi-label) を 0~1 で出力 (Sigmoid)
+        # value: 各プレイヤーが「次に上がる」確率 (multi-label)
         self.value_head = nn.Sequential(
             nn.Linear(h, h),
             nn.ReLU(),
             nn.Linear(h, num_players),
-            nn.Sigmoid(),  # shape: (num_players,)
+            nn.Sigmoid(),
         )
         self.to(self.device)
 
@@ -64,10 +73,26 @@ class PolicyValueNet(nn.Module):
     # 状態エンコード
     # -----------------------------------------------------
     def _encode_state(self, state: Dict[str, Any]):
-        """辞書形式 state をテンソル特徴に変換。
-        想定キー: hand_size(int), field_size(int), turn(int)
-        未存在キーは 0 として扱う。
+        """状態辞書をテンソルに。
+        use_full_features=True かつ state['full_input'] が存在する場合はそれをそのまま使用。
+        それ以外は従来の hand_size / field_size / turn one-hot を構築。
         """
+        if self.use_full_features and "full_input" in state:
+            arr = state["full_input"]
+            # list/tuple -> tensor
+            if isinstance(arr, (list, tuple)):
+                return torch.tensor(list(arr), dtype=torch.float32, device=self.device)
+            # numpy array
+            try:
+                import numpy as _np
+                if isinstance(arr, _np.ndarray):
+                    return torch.tensor(arr, dtype=torch.float32, device=self.device)
+            except Exception:
+                pass
+            # torch tensor
+            if hasattr(arr, 'detach'):
+                return arr.detach().float().to(self.device)
+            raise ValueError("full_input の型がサポートされていません。")
         hand_size = float(state.get("hand_size", 0))
         field_size = float(state.get("field_size", 0))
         turn = int(state.get("turn", 0))
@@ -75,8 +100,7 @@ class PolicyValueNet(nn.Module):
         if 0 <= turn < self.num_players:
             turn_onehot[turn] = 1.0
         feat = [hand_size, field_size] + turn_onehot
-        x = torch.tensor(feat, dtype=torch.float32, device=self.device)
-        return x
+        return torch.tensor(feat, dtype=torch.float32, device=self.device)
 
     # -----------------------------------------------------
     # 推論
@@ -124,11 +148,22 @@ class PolicyValueNet(nn.Module):
     # 保存 / 読込ユーティリティ
     # -----------------------------------------------------
     def save(self, path: str):
+        # hidden_size は policy_head の in_features から取得 (backbone の中間次元 h)
+        hidden_size = self.policy_head.in_features
+        # 入力次元 (フル特徴量時は full_feature_dim, 簡易時は base 次元)
+        try:
+            input_dim = self.backbone[0].in_features  # type: ignore[index]
+        except Exception:
+            input_dim = None
         ckpt = {
             "state_dict": self.state_dict(),
             "max_policy_size": self.max_policy_size,
-            "hidden_size": self.policy_head.in_features,  # 便宜上
+            "hidden_size": hidden_size,
             "num_players": self.num_players,
+            # フル特徴量関連メタデータ (後方互換のため存在しない場合は簡易扱い)
+            "use_full_features": bool(getattr(self, "use_full_features", False)),
+            "full_feature_dim": int(input_dim) if getattr(self, "use_full_features", False) else None,
+            "model_format_version": 2,  # 1: 旧 (メタなし) / 2: フル特徴量対応
         }
         torch.save(ckpt, path)
 
@@ -148,18 +183,56 @@ class PolicyValueNet(nn.Module):
             max_policy_size = ckpt.get("max_policy_size", 128)
             hidden_size = ckpt.get("hidden_size", 128)
             num_players = ckpt.get("num_players", 4)
+            use_full = ckpt.get("use_full_features", False)
+            full_dim = ckpt.get("full_feature_dim", None)
+            # 後方互換: 旧 ckpt で use_full=true 判定したい場合は重み形状から推論
+            if not use_full:
+                try:
+                    w = state_dict.get("backbone.0.weight", None)
+                    if w is not None:
+                        base_dim = 2 + num_players
+                        # w shape: (hidden_size, input_dim)
+                        if hasattr(w, 'shape') and w.shape[1] != base_dim:
+                            # base と異なるならフル特徴量と推定
+                            use_full = True
+                            full_dim = w.shape[1]
+                except Exception:
+                    pass
         else:
             # 純粋な state_dict のみが保存されていた場合
             state_dict = ckpt
             max_policy_size = 128
             hidden_size = 128
             num_players = 4
-
-        model = PolicyValueNet(
-            max_policy_size=max_policy_size,
-            hidden_size=hidden_size,
-            num_players=num_players,
-        )
+            # 旧フォーマット (推論でフルか判定)
+            use_full = False
+            full_dim = None
+            try:
+                w = state_dict.get("backbone.0.weight", None)
+                if w is not None:
+                    base_dim = 2 + num_players
+                    if hasattr(w, 'shape') and w.shape[1] != base_dim:
+                        use_full = True
+                        full_dim = w.shape[1]
+            except Exception:
+                pass
+        if use_full:
+            if full_dim is None:
+                raise ValueError("Checkpoint indicates use_full_features=True ですが full_feature_dim が特定できません。")
+            model = PolicyValueNet(
+                max_policy_size=max_policy_size,
+                hidden_size=hidden_size,
+                num_players=num_players,
+                use_full_features=True,
+                full_feature_dim=int(full_dim),
+            )
+        else:
+            model = PolicyValueNet(
+                max_policy_size=max_policy_size,
+                hidden_size=hidden_size,
+                num_players=num_players,
+                use_full_features=False,
+            )
         model.load_state_dict(state_dict)
         return model
 

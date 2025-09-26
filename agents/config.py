@@ -142,6 +142,15 @@ ALPHA_ZERO_CONFIG = {
     # True なら逐次書き込みをせず、最後に 1 行だけ (最終エピソード指標 / 最終学習指標) を保存
     # disable_csv_logging が True の場合は無視される
     "csv_summary_only":True,
+    # ---------------------------
+    # 拡張特徴量 (フル状態入力) 設定
+    # ---------------------------
+    # True の場合、各プレイヤーの 53枚カード所持ビット + パスフラグ + 残枚数、
+    # 場の役分類フラグ (single/pair/triple/four/straight/joker_single/empty)、
+    # 革命フラグ、場枚数、場ランク(one-hot 13) と手番 one-hot を結合した
+    # 高次元ベクトル (full_input) を PolicyValueNet へ入力する。
+    # False の場合は従来の hand_size / field_size / turn one-hot の簡易入力。
+    "use_full_features": True,
 }
 
 __all__ = ["ALPHA_ZERO_CONFIG"]

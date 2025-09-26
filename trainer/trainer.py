@@ -80,17 +80,35 @@ def _selfplay_worker_entry(worker_id: int, episodes: int, config: Dict[str, Any]
     except Exception:
         pass
 
-    # モデル読込（CPU 推奨）
+    # モデル読込（CPU 推奨） + フル特徴量対応
     from agents.models import PolicyValueNet as _PVN
+    device = config.get("selfplay_worker_device", "cpu")
+    use_full = bool(config.get("use_full_features", False))
     try:
-        model = _PVN.load(model_path, map_location=config.get("selfplay_worker_device", "cpu"))
+        model = _PVN.load(model_path, map_location=device)
+        # 旧 ckpt で use_full_features が欠落しているが config が True の場合再構築
+        if use_full and not getattr(model, 'use_full_features', False):
+            # 後で環境初期化後に再構築
+            pass
     except Exception:
-        model = _PVN(
-            max_policy_size=config.get("max_policy_size", 128),
-            hidden_size=config.get("hidden_size", 128),
-            num_players=config.get("num_players", 4),
-            device=config.get("selfplay_worker_device", "cpu"),
-        )
+        # フォールバック: 仮モデル (フル時は base_dim で後から再構築)
+        try:
+            model = _PVN(
+                max_policy_size=config.get("max_policy_size", 128),
+                hidden_size=config.get("hidden_size", 128),
+                num_players=config.get("num_players", 4),
+                device=device,
+                use_full_features=use_full,
+                full_feature_dim=(2 + config.get("num_players", 4)) if use_full else None,
+            )
+        except Exception:
+            # 最低限簡易
+            model = _PVN(
+                max_policy_size=config.get("max_policy_size", 128),
+                hidden_size=config.get("hidden_size", 128),
+                num_players=config.get("num_players", 4),
+                device=device,
+            )
 
     # エージェントと環境を構築（共有リプレイは使わずローカルに蓄積）
     num_players = int(config.get("num_players", 4))
@@ -111,6 +129,26 @@ def _selfplay_worker_entry(worker_id: int, episodes: int, config: Dict[str, Any]
             ag.set_env_ref(env)
         if hasattr(ag, 'logger'):
             ag.logger = None
+
+    # フル特徴量なら最初の reset 後に次元確定して再構築
+    if use_full:
+        try:
+            env.reset()
+            probe_state = agents[0]._extract_state(env)
+            full_dim = probe_state.get('full_input_dim')
+            if full_dim and (not getattr(model, 'use_full_features', False) or getattr(model, 'backbone', None) and getattr(model.backbone[0], 'in_features', None) != full_dim):
+                model = _PVN(
+                    max_policy_size=config.get("max_policy_size", 128),
+                    hidden_size=config.get("hidden_size", 128),
+                    num_players=config.get("num_players", 4),
+                    device=device,
+                    use_full_features=True,
+                    full_feature_dim=full_dim,
+                )
+                for ag in agents:
+                    ag.set_model(model)
+        except Exception:
+            print("[WARN][worker] full feature rebuild failed, fallback simple")
 
     # エピソード実行ループ（Trainer._play_one_episode とほぼ同等の縮約版）
     total_episodes = int(episodes)
@@ -186,18 +224,31 @@ def _selfplay_daemon_worker(worker_id: int,
     except Exception:
         pass
 
-    # モデル読込（CPU 推奨）
+    # モデル読込（CPU 推奨） + フル特徴量対応
     from agents.models import PolicyValueNet as _PVN
     device = config.get("selfplay_worker_device", "cpu")
+    use_full = bool(config.get("use_full_features", False))
     try:
         model = _PVN.load(model_path, map_location=device)
+        if use_full and not getattr(model, 'use_full_features', False):
+            pass
     except Exception:
-        model = _PVN(
-            max_policy_size=config.get("max_policy_size", 128),
-            hidden_size=config.get("hidden_size", 128),
-            num_players=config.get("num_players", 4),
-            device=device,
-        )
+        try:
+            model = _PVN(
+                max_policy_size=config.get("max_policy_size", 128),
+                hidden_size=config.get("hidden_size", 128),
+                num_players=config.get("num_players", 4),
+                device=device,
+                use_full_features=use_full,
+                full_feature_dim=(2 + config.get("num_players", 4)) if use_full else None,
+            )
+        except Exception:
+            model = _PVN(
+                max_policy_size=config.get("max_policy_size", 128),
+                hidden_size=config.get("hidden_size", 128),
+                num_players=config.get("num_players", 4),
+                device=device,
+            )
 
     # モデル更新監視
     def _get_mtime(p):
@@ -295,6 +346,26 @@ def _selfplay_daemon_worker(worker_id: int,
     # 初期の対戦相手割当（プールがあれば活用）
     if enable_mix and mix_players > 0:
         _assign_opponents_from_pool()
+
+    # フル特徴量: 初期 reset で次元確定し必要なら再構築
+    if use_full:
+        try:
+            env.reset()
+            probe_state = agents[0]._extract_state(env)
+            full_dim = probe_state.get('full_input_dim')
+            if full_dim and (not getattr(model, 'use_full_features', False) or getattr(model, 'backbone', None) and getattr(model.backbone[0], 'in_features', None) != full_dim):
+                model = _PVN(
+                    max_policy_size=config.get("max_policy_size", 128),
+                    hidden_size=config.get("hidden_size", 128),
+                    num_players=config.get("num_players", 4),
+                    device=device,
+                    use_full_features=True,
+                    full_feature_dim=full_dim,
+                )
+                for ag in agents:
+                    ag.set_model(model)
+        except Exception:
+            print("[WARN][daemon_worker] full feature rebuild failed, fallback simple")
 
     while not (stop_event.is_set()):
         # 必要ならモデル更新
@@ -444,12 +515,27 @@ class Trainer:
                 resolved_device = "cpu"
         else:
             resolved_device = device_cfg
-        self.model = PolicyValueNet(
-            max_policy_size=self.config["max_policy_size"],
-            hidden_size=self.config["hidden_size"],
-            num_players=self.config["num_players"],
-            device=resolved_device,
-        )
+        # フル特徴量使用時は一旦ダミー生成し、後で初回状態から次元を取得して再構築する方式を避けるため
+        use_full = self.config.get("use_full_features", False)
+        if use_full:
+            # 一時インスタンス (full_feature_dim 後で差し替え。仮に base 次元で作る) -> 後続で lazy resize
+            # ただし簡易: 最初の環境 reset 後に full_input_dim を取得して再初期化
+            self.model = PolicyValueNet(
+                max_policy_size=self.config["max_policy_size"],
+                hidden_size=self.config["hidden_size"],
+                num_players=self.config["num_players"],
+                device=resolved_device,
+                use_full_features=True,
+                full_feature_dim= 2 + self.config["num_players"]  # 仮置き (後で再構築)
+            )
+        else:
+            self.model = PolicyValueNet(
+                max_policy_size=self.config["max_policy_size"],
+                hidden_size=self.config["hidden_size"],
+                num_players=self.config["num_players"],
+                device=resolved_device,
+                use_full_features=False,
+            )
         # ロガー生成
         self.logger = TrainingLogger(
             log_dir=self.config.get("log_dir", "logs"),
@@ -480,6 +566,49 @@ class Trainer:
         self.env = DaifugoSimpleEnv(num_players=self.config["num_players"], agent_classes=None)
         # 直ちに環境の agents を学習エージェント群で上書き (ウォームアップ0の場合の不整合防止)
         self.env.agents = self.agents
+        # フル特徴量モデル再構築 (初回状態から full_input_dim 取得)
+        if use_full:
+            try:
+                _ = self.env.reset()
+                sample_state = self.agents[0]._extract_state(self.env)
+                full_dim = sample_state.get('full_input_dim')
+                if full_dim is not None:
+                    resolved_device2 = resolved_device
+                    self.model = PolicyValueNet(
+                        max_policy_size=self.config["max_policy_size"],
+                        hidden_size=self.config["hidden_size"],
+                        num_players=self.config["num_players"],
+                        device=resolved_device2,
+                        use_full_features=True,
+                        full_feature_dim=full_dim,
+                    )
+                    # エージェントへ新モデルを再注入
+                    for ag in self.agents:
+                        ag.set_model(self.model)
+                        ag.set_model_version(self.model_version)
+                    if self.logger:
+                        self.logger.log_text(f"[model] Rebuilt full-feature model input_dim={full_dim}")
+            except Exception as e:
+                print(f"[WARN] full feature model rebuild failed: {e}")
+        # フルモード時: 旧フォーマットサンプル浄化 (初期残存している可能性に備える)
+        if self.config.get('use_full_features'):
+            for ag in self.agents:
+                try:
+                    if isinstance(ag.replay_buffer, list) and ag.replay_buffer:
+                        ag.replay_buffer = [s for s in ag.replay_buffer if s.get('feature_version',1)==1]
+                except Exception:
+                    pass
+        # 既存メタデータとの整合性チェック (存在すれば)
+        try:
+            meta_path = os.path.join(self.config['checkpoint_dir'], 'metadata.json')
+            if os.path.isfile(meta_path):
+                import json as _json
+                with open(meta_path, 'r', encoding='utf-8') as f:
+                    old_meta = _json.load(f)
+                if old_meta.get('use_full_features') != self.config.get('use_full_features'):
+                    print('[WARN] metadata.use_full_features differs from current config')
+        except Exception:
+            pass
         # 各エージェントへ環境参照を渡す (obs だけ渡される呼び出し互換のため)
         for ag in self.agents:
             if hasattr(ag, 'set_env_ref'):
@@ -1199,24 +1328,91 @@ class Trainer:
 
     def _save_checkpoint(self, version_tag: str | None = None):
         os.makedirs(self.config["checkpoint_dir"], exist_ok=True)
-        # 最新モデル保存
+        # アトミック保存ヘルパ
+        def _atomic_save(fn, save_callable):
+            tmp = fn + ".tmp"
+            try:
+                save_callable(tmp)
+                os.replace(tmp, fn)
+            except Exception as e:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+                print(f"[WARN] atomic save fallback ({fn}): {e}")
+                try:
+                    save_callable(fn)
+                except Exception as ee:
+                    print(f"[ERROR] save failed {fn}: {ee}")
+
+        # 最新モデル保存 (atomic)
         latest_path = self.config["checkpoint_path"]
         if self.model is not None:
-            self.model.save(latest_path)
+            _atomic_save(latest_path, lambda p: self.model.save(p))
         # バージョン付き保存
         if version_tag:
             ver_path = os.path.join(self.config["checkpoint_dir"], f"policy_value_{version_tag}.pt")
             if self.model is not None:
-                self.model.save(ver_path)
+                _atomic_save(ver_path, lambda p: self.model.save(p))
         # リプレイ保存: 共有モードなら共有バッファを保存、そうでなければ従来通り代表エージェント
         replay_path = self.config.get("replay_path", "replay_buffer.joblib")
         if self.shared_replay is not None:
             try:
+                # フル特徴量モードで legacy 混入していたらフィルタ
+                if self.config.get('use_full_features'):
+                    try:
+                        before = len(self.shared_replay)
+                        self.shared_replay.data = [s for s in self.shared_replay.data if s.get('feature_version',1)==1]
+                        after = len(self.shared_replay)
+                        if after < before:
+                            print(f"[INFO] shared replay purge legacy {before-after} samples (full mode)")
+                    except Exception:
+                        pass
                 self.shared_replay.save(replay_path)
             except Exception as e:
                 print(f"[WARN] shared replay save failed: {e}")
         else:
             self.agents[0].save_replay(replay_path)
+        # メタデータ保存
+        try:
+            # 簡易 config ハッシュ
+            import json, hashlib, time as _time
+            cfg_sorted = json.dumps(self.config, sort_keys=True, ensure_ascii=False).encode('utf-8')
+            cfg_hash = hashlib.md5(cfg_sorted).hexdigest()
+            meta = {
+                "model_version": self.model_version,
+                "use_full_features": bool(self.config.get('use_full_features')),\
+                "num_players": self.config.get('num_players'),
+                "hidden_size": self.config.get('hidden_size'),
+                "max_policy_size": self.config.get('max_policy_size'),
+                "seed": self.config.get('seed'),
+                "config_md5": cfg_hash,
+            }
+            try:
+                if self.model is not None and hasattr(self.model, 'backbone'):
+                    meta['full_feature_dim'] = getattr(self.model.backbone[0], 'in_features', None)
+            except Exception:
+                pass
+            meta['saved_at'] = _time.time()
+            meta_path = os.path.join(self.config['checkpoint_dir'], 'metadata.json')
+            def _write_meta(p):
+                with open(p, 'w', encoding='utf-8') as f:
+                    json.dump(meta, f, ensure_ascii=False, indent=2)
+            # atomic 書き込み
+            tmp_meta = meta_path + '.tmp'
+            try:
+                _write_meta(tmp_meta)
+                os.replace(tmp_meta, meta_path)
+            except Exception:
+                try:
+                    if os.path.exists(tmp_meta):
+                        os.remove(tmp_meta)
+                except Exception:
+                    pass
+                _write_meta(meta_path)
+        except Exception as e:
+            print(f"[WARN] metadata save failed: {e}")
 
     # -----------------------------------------------------
     # 直前モデルを対戦相手に混在させる
