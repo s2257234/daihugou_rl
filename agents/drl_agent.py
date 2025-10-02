@@ -542,6 +542,8 @@ class AlphaZeroAgent:
                 return base
             # --- フル特徴生成 ---
             num_players = len(g.players)
+            # 統一フォーマット次元: per_player(53bits + pass + remain =55) * N + field(22) + turn_onehot(N) = 56N + 22
+            expected_full_dim = 56 * num_players + 22
             # カードインデックス: suit*13 + (rank-1) => 0..51, Joker => 52
             def card_index(card):
                 if card.is_joker:
@@ -601,12 +603,22 @@ class AlphaZeroAgent:
             if 0 <= pid < num_players:
                 turn_onehot[pid] = 1.0
             full_vec = players_block + field_block + turn_onehot
+            # 次元検証 & 補正 (不足はゼロ埋め / 超過は切り詰め) 常に expected_full_dim に揃える
+            cur_len = len(full_vec)
+            if cur_len != expected_full_dim:
+                if cur_len < expected_full_dim:
+                    full_vec = full_vec + [0.0] * (expected_full_dim - cur_len)
+                else:
+                    full_vec = full_vec[:expected_full_dim]
+                if not hasattr(self, '_warned_full_dim_autofix'):
+                    print(f"[WARN] adjusted full_input length from {cur_len} to expected {expected_full_dim}")
+                    self._warned_full_dim_autofix = True  # type: ignore[attr-defined]
             base['full_input'] = full_vec
-            base['full_input_dim'] = len(full_vec)
+            base['full_input_dim'] = expected_full_dim
             # フル特徴量次元一貫性チェック
             try:
                 if self.config.get('use_full_features'):
-                    cur_dim = len(full_vec)
+                    cur_dim = expected_full_dim
                     ref = getattr(self, '_full_input_dim_ref', None)
                     if ref is None:
                         self._full_input_dim_ref = cur_dim
@@ -621,6 +633,43 @@ class AlphaZeroAgent:
     # ---------------- Replay buffer ----------------
     def _store_sample(self, state, legal_actions, pi, value, value_pred: Optional[float] = None):
         """リプレイサンプル1件を保存。共有バッファなら append の参照を返す."""
+        # ==============================================================
+        # Lossless モード (strict_lossless=True):
+        #   一切の量子化 / packbits 圧縮 / ID 化を行わず、元の float / 配列 / legal_actions を保持する。
+        #   これにより復元時に情報欠落の可能性がゼロになる代わりにメモリ使用量が増える。
+        #   想定用途: 正確な解析 / デバッグ / 再現性重視フェーズ。
+        # --------------------------------------------------------------
+        if self.config.get('strict_lossless', False):
+            sample = {
+                "player_id": self.player_id,
+                "state": state,  # full_input をそのまま保持
+                "legal_actions": legal_actions,
+                "pi": list(pi) if pi is not None else None,  # そのまま float 配列
+                "value": value,
+                "value_pred": value_pred,
+                "model_version": getattr(self, 'model_version', 0),
+                "feature_version": 1 if (isinstance(state, dict) and ('full_input' in state)) else 0,
+                "lossless": True,
+            }
+            # フル特徴量モード時に legacy を格納しないポリシーは維持
+            if self.config.get('use_full_features') and sample['feature_version'] == 0:
+                return sample
+            if self._use_shared and hasattr(self.replay_buffer, 'append'):
+                self.replay_buffer.append(sample)
+                return sample
+            # ローカル (list / deque) 互換処理
+            try:
+                from collections import deque as _dq
+                if isinstance(self.replay_buffer, _dq):
+                    self.replay_buffer.append(sample)
+                else:
+                    if len(self.replay_buffer) >= self.max_buffer_size:
+                        self.replay_buffer.pop(0)
+                    self.replay_buffer.append(sample)
+            except Exception:
+                pass
+            return sample
+        # ==============================================================
         # --- メモリ削減: full_input をコンパクト表現へ圧縮 (packbits + float16) ---
         try:
             if (self.config.get('use_full_features') and

@@ -99,7 +99,7 @@ def _selfplay_worker_entry(worker_id: int, episodes: int, config: Dict[str, Any]
                 num_players=config.get("num_players", 4),
                 device=device,
                 use_full_features=use_full,
-                full_feature_dim=(2 + config.get("num_players", 4)) if use_full else None,
+                full_feature_dim=(56 * config.get("num_players", 4) + 22) if use_full else None,
             )
         except Exception:
             # 最低限簡易
@@ -240,7 +240,7 @@ def _selfplay_daemon_worker(worker_id: int,
                 num_players=config.get("num_players", 4),
                 device=device,
                 use_full_features=use_full,
-                full_feature_dim=(2 + config.get("num_players", 4)) if use_full else None,
+                full_feature_dim=(56 * config.get("num_players", 4) + 22) if use_full else None,
             )
         except Exception:
             model = _PVN(
@@ -558,7 +558,7 @@ class Trainer:
                 num_players=self.config["num_players"],
                 device=resolved_device,
                 use_full_features=True,
-                full_feature_dim= 2 + self.config["num_players"]  # 仮置き (後で再構築)
+                full_feature_dim= 56 * self.config["num_players"] + 22  # 統一フォーマット (後で再構築可)
             )
         else:
             self.model = PolicyValueNet(
@@ -1227,7 +1227,7 @@ class Trainer:
                 num_players=self.config["num_players"],
                 device="cpu",
                 use_full_features=use_full,
-                full_feature_dim=full_dim if use_full else None,
+                full_feature_dim=(56 * self.config.get("num_players", 4) + 22) if use_full else None,
             )
             # strict=True でロードし shape 不一致を早期検出 (問題あれば例外キャッチ側で警告)
             snap.load_state_dict(self.model.state_dict(), strict=True)  # type: ignore[arg-type]

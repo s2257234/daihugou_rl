@@ -1,32 +1,67 @@
-"""AlphaZero 用 Policy-Value ネットワーク (初期版)
 
-目的:
-  - 環境状態(簡易特徴) -> (policy_logits, value) を出力
-  - policy_logits は固定長 (config 想定 max_policy_size) を出す。
-    実際の合法手リスト legal_actions が N 個なら、呼び出し側 (drl_agent.py) で
-    先頭 N 要素のみを利用して確率に正規化する運用を想定。
+"""PolicyValueNet 実装概要 (フル特徴専用 / model_format_version=3)
 
-制約 / 今後の拡張ポイント:
-  - 現在の state は dict 形式 {"hand_size", "field_size", "turn"} を想定 (簡易)。
-  - 本番ではカード種別 / 残り枚数 / 連番 / 階段 etc. を多チャネル one-hot に拡張する。
-  - マルチプレイヤー (4人大富豪) なので turn は one-hot (4次元) 埋め込み。
-  - value: 現在は単一スカラー (root 視点)。多人数報酬を分離したい場合はベクトル出力に変更可能。
+このファイルは AlphaZero 系大富豪エージェント用の Policy-Value ネットワークを提供する。
 
-使用方法:
-  model = PolicyValueNet(max_policy_size=128)
-  logits, value = model.forward(state_dict)
-  -> logits: Tensor(shape=[max_policy_size])
-     value : Tensor(shape=[1])  (tanh で -1~1)
+====================================
+設計方針 / 現状仕様
+====================================
+1. 入力特徴 (full_input のみ / 簡易入力廃止)
+    - 形式: 1 次元ベクトル (float32) 長さ full_feature_dim
+    - 推奨レイアウト (56 * N + 22)  ※ N = プレイヤー数
+         * 各プレイヤー i (0..N-1): 53 カード所持ビット + 1 pass ビット + 1 remain_norm = 55
+         * フィールドブロック: 1 revolution + 7 combo type + 13 rank one-hot + 1 field_size_norm = 22
+         * ターン one-hot: N (→ 合計 55N + 22 + N = 56N + 22)
+    - 生成は agents.drl_agent._extract_state で行い、full_input_dim を常に期待値に揃える。
+
+2. 圧縮形式 (full_compact / cfv1)
+    - 辞書キー: {'packed_bits','floats','binary_len','num_players','format','full_input_dim'}
+    - packed_bits: binary_len 個のビット列を packbits した bytes
+    - floats: 残りの連続値 (float16 配列)
+    - 復元: unpackbits → float32 変換 → floats(float16→float32) を結合し full_input
+    - モデルは state に full_input が無い場合 compact を自動展開 (展開失敗は無視)
+
+3. 入力検証 / 自動補正
+    - モデル内部 _encode_state で in_features と長さが異なる場合: pad または truncate
+    - 初回のみ警告 [WARN] full_input dim mismatch ...
+    - 根本的には生成側で常に正しい長さを保証することが前提 (補正は最終防衛線)
+
+4. 出力
+    - policy_head: shape [max_policy_size] (合法手リスト側で先頭 K 要素を切り出し softmax)
+    - value_head: shape [num_players] 各プレイヤーが「次に上がる / 勝利フェーズ達成」確率 (Sigmoid)
+    - value の意味合いは学習戦略に応じて再定義可能 (順位/報酬ベクトル拡張など)
+
+5. 保存 / ロード
+    - save() で以下メタ情報を付与: max_policy_size, hidden_size, num_players,
+      use_full_features=True, full_feature_dim, model_format_version=3
+    - load():
+         * state_dict ラップ形式 (現行 / v2 以前) と state_dict 直保存 Legacy を判別
+         * full_feature_dim 欠落時は backbone.0.weight の in_features から推定
+         * 簡易入力互換コードは削除済み (常にフル特徴モデルへ再構築)
+
+6. 後方互換ポリシー
+    - model_format_version < 3 でも weight shape から full_feature_dim 推定が成功すればロード可
+    - 旧 ckpt が簡易入力用に極小 in_features を持っている場合はロード時に ValueError で通知
+
+7. 例外戦略
+    - state に full_input / full_compact が無い場合は即 ValueError (簡易入力廃止を明示)
+    - compact 展開失敗は握りつぶし (フォーマット不正時) → その後 full_input 無ければ例外
+
+8. 想定拡張
+    - 追加特徴 (履歴, 役回数, 制約フラグ) は full_input 生成側で末尾に拡張し full_feature_dim を増加
+    - ネットワーク側は in_features 増分再学習で対応 (ロード互換は別途変換スクリプトで支援)
+
+9. 注意点
+    - pad/truncate が頻出する状態はデータ生成側のバグを示唆 → 早期修正を推奨
+    - value_head の解釈が将来変更される場合、学習済み ckpt の互換性に留意
+
 """
 from __future__ import annotations
 
 from typing import Dict, Any, Optional, List
 
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 
 
 class PolicyValueNet(nn.Module):
@@ -35,22 +70,24 @@ class PolicyValueNet(nn.Module):
                  hidden_size: int = 128,
                  num_players: int = 4,
                  device: Optional[str] = None,
-                 use_full_features: bool = False,
+                 use_full_features: bool = True,
                  full_feature_dim: Optional[int] = None):
+        """Policy-Value Net (フル特徴専用)
+
+        簡易入力 (hand_size/field_size/turn_onehot) のフォールバックを廃止し、常に
+        full_input もしくは full_compact (cfv1) を要求する。旧 ckpt との互換性維持のため
+        use_full_features 引数は残すが False 指定は例外とする。
+        """
         super().__init__()
+        if not use_full_features:
+            raise ValueError("簡易入力モードは廃止されました。必ず full_feature_dim を指定してください。")
+        if full_feature_dim is None:
+            raise ValueError("full_feature_dim が必須です。")
         self.max_policy_size = max_policy_size
         self.num_players = num_players
         self.device = torch.device(device) if device else torch.device("cpu")
-        self.use_full_features = use_full_features
-
-        # 簡易入力: hand_size(1) + field_size(1) + turn_onehot(num_players)
-        base_input_dim = 2 + num_players
-        if self.use_full_features:
-            if full_feature_dim is None:
-                raise ValueError("use_full_features=True ですが full_feature_dim が指定されていません。")
-            input_dim = full_feature_dim
-        else:
-            input_dim = base_input_dim
+        self.use_full_features = True
+        input_dim = full_feature_dim
 
         h = hidden_size
         self.backbone = nn.Sequential(
@@ -60,7 +97,6 @@ class PolicyValueNet(nn.Module):
             nn.ReLU(),
         )
         self.policy_head = nn.Linear(h, max_policy_size)
-        # value: 各プレイヤーが「次に上がる」確率 (multi-label)
         self.value_head = nn.Sequential(
             nn.Linear(h, h),
             nn.ReLU(),
@@ -69,22 +105,10 @@ class PolicyValueNet(nn.Module):
         )
         self.to(self.device)
 
-    # -----------------------------------------------------
-    # 状態エンコード
-    # -----------------------------------------------------
     def _encode_state(self, state: Dict[str, Any]):
-        """状態辞書をテンソルに。
-        - use_full_features=True の場合:
-            1) compact 形式 (state['full_compact']) があれば展開
-            2) full_input があればそれを利用
-        - それ以外は hand_size / field_size / turn one-hot 簡易特徴
-        compact 形式(cf v1):
-            {'packed_bits': bytes, 'floats': np.float16[N+1], 'binary_len': int, 'num_players':N}
-            復元時: bits(float32) + floats(float32) を結合
-        """
-        if self.use_full_features and ("full_input" in state or "full_compact" in state):
+        # フル特徴必須: full_input か full_compact が無ければ例外
+        if ("full_input" in state) or ("full_compact" in state):
             import numpy as _np
-            # compact 優先で展開 (展開済みは full_input にキャッシュ)
             if 'full_compact' in state and 'full_input' not in state:
                 try:
                     cf = state['full_compact']
@@ -103,101 +127,77 @@ class PolicyValueNet(nn.Module):
                                 floats_arr = _np.asarray(list(floats), dtype=_np.float32)
                         else:
                             floats_arr = _np.zeros(0, dtype=_np.float32)
-                        arr_cat = _np.concatenate([bits_arr, floats_arr])
-                        state['full_input'] = arr_cat  # キャッシュ
+                        state['full_input'] = _np.concatenate([bits_arr, floats_arr])
                 except Exception:
                     pass
             arr = state.get('full_input')
             if arr is None:
                 arr = []
-            # list/tuple -> tensor
-            if isinstance(arr, (list, tuple)):
-                return torch.tensor(list(arr), dtype=torch.float32, device=self.device)
-            # numpy array
+            expected_dim: Optional[int] = None
             try:
+                expected_dim = self.backbone[0].in_features  # type: ignore[index]
+            except Exception:
+                expected_dim = None
+
+            def _finalize_vec(seq_like):
+                # seq_like -> torch tensor with optional pad/truncate
+                import numpy as _np
+                vec = _np.asarray(list(seq_like), dtype=_np.float32)
+                if expected_dim is not None and vec.shape[0] != expected_dim:
+                    if vec.shape[0] < expected_dim:
+                        padded = _np.zeros(expected_dim, dtype=_np.float32)
+                        padded[:vec.shape[0]] = vec
+                        vec = padded
+                    else:
+                        vec = vec[:expected_dim]
+                    if not hasattr(self, '_warned_full_dim_mismatch'):
+                        print(f"[WARN] full_input dim mismatch (got={len(seq_like)}, expected={expected_dim}) -> auto pad/truncate")
+                        self._warned_full_dim_mismatch = True  # type: ignore[attr-defined]
+                return torch.tensor(vec, dtype=torch.float32, device=self.device)
+
+            if isinstance(arr, (list, tuple)):
+                return _finalize_vec(arr)
+            try:
+                import numpy as _np
                 if isinstance(arr, _np.ndarray):
-                    return torch.tensor(arr, dtype=torch.float32, device=self.device)
+                    return _finalize_vec(arr)
             except Exception:
                 pass
-            # torch tensor
             if hasattr(arr, 'detach'):
-                return arr.detach().float().to(self.device)
-            # フォールバック簡易特徴へ (破損対策)
-        hand_size = float(state.get("hand_size", 0))
-        field_size = float(state.get("field_size", 0))
-        turn = int(state.get("turn", 0))
-        turn_onehot = [0.0] * self.num_players
-        if 0 <= turn < self.num_players:
-            turn_onehot[turn] = 1.0
-        feat = [hand_size, field_size] + turn_onehot
-        # フル特徴量モデルだが legacy / 壊れたサンプルで full_input が無い場合のフォールバック
-        if self.use_full_features:
-            try:
-                exp = self.backbone[0].in_features  # type: ignore[index]
-            except Exception:
-                exp = None
-            if exp and len(feat) != exp:
-                # ゼロパディングして形状不一致による matmul エラーを防ぐ (情報欠落サンプル)
-                pad_vec = torch.zeros(exp, dtype=torch.float32, device=self.device)
-                n = min(len(feat), exp)
-                if n > 0:
-                    pad_vec[:n] = torch.tensor(feat[:n], dtype=torch.float32, device=self.device)
-                # 一度だけ警告
-                if not hasattr(self, '_warned_legacy_full_missing'):
-                    print(f"[WARN] missing full_input/full_compact for full-feature model -> zero padded (expected_dim={exp})")
-                    self._warned_legacy_full_missing = True  # type: ignore[attr-defined]
-                return pad_vec
-        return torch.tensor(feat, dtype=torch.float32, device=self.device)
+                t = arr.detach().float().to(self.device)
+                if expected_dim is not None and t.numel() != expected_dim:
+                    if t.numel() < expected_dim:
+                        padded = torch.zeros(expected_dim, dtype=torch.float32, device=self.device)
+                        padded[:t.numel()] = t
+                        t = padded
+                    else:
+                        t = t[:expected_dim]
+                    if not hasattr(self, '_warned_full_dim_mismatch'):
+                        print(f"[WARN] full_input tensor dim mismatch (got={t.numel()}, expected={expected_dim}) -> auto pad/truncate")
+                        self._warned_full_dim_mismatch = True  # type: ignore[attr-defined]
+                return t
 
-    # -----------------------------------------------------
-    # 推論
-    # -----------------------------------------------------
-    def forward(self, state: Dict[str, Any]):  # state は単一局面 (バッチ拡張は未対応)
-        """(policy_logits, value_vec) を返す。
+        raise ValueError("state に full_input / full_compact が存在しません (簡易入力廃止)。")
 
-        policy_logits: Tensor (max_policy_size,)
-        value_vec:    Tensor (num_players,) 各プレイヤーの『次に上がる』確率
-        """
+    def forward(self, state: Dict[str, Any]):
         x = self._encode_state(state)
         h = self.backbone(x)
         policy_logits = self.policy_head(h)
         value_vec = self.value_head(h)
         return policy_logits, value_vec
 
-    # -----------------------------------------------------
-    # バッチ推論（挙動互換のためオプション利用）
-    # -----------------------------------------------------
     def forward_batch(self, states: List[Dict[str, Any]]):
-        """複数 state をまとめて (policy_logits, value_vec) を返す。
-
-        戻り値:
-          policy_logits: Tensor (B, max_policy_size)
-          value_vec    : Tensor (B, num_players)
-
-        既存 forward と同じ計算をまとめて行うだけで、出力の意味は同一です。
-        """
         if not states:
-            # 空バッチ対策: ダミー1件で実行し、空を返す
             x = self._encode_state({})
-            h = self.backbone(x)
-            _ = self.policy_head(h)
-            _ = self.value_head(h)
-            import torch
+            _ = self.backbone(x)
             return torch.empty(0, self.max_policy_size, device=self.device), torch.empty(0, self.num_players, device=self.device)
-        import torch
         xs = torch.stack([self._encode_state(s) for s in states], dim=0)
         h = self.backbone(xs)
         policy_logits = self.policy_head(h)
         value_vec = self.value_head(h)
         return policy_logits, value_vec
 
-    # -----------------------------------------------------
-    # 保存 / 読込ユーティリティ
-    # -----------------------------------------------------
     def save(self, path: str):
-        # hidden_size は policy_head の in_features から取得 (backbone の中間次元 h)
-        hidden_size = self.policy_head.in_features
-        # 入力次元 (フル特徴量時は full_feature_dim, 簡易時は base 次元)
         try:
             input_dim = self.backbone[0].in_features  # type: ignore[index]
         except Exception:
@@ -205,22 +205,19 @@ class PolicyValueNet(nn.Module):
         ckpt = {
             "state_dict": self.state_dict(),
             "max_policy_size": self.max_policy_size,
-            "hidden_size": hidden_size,
+            "hidden_size": self.policy_head.in_features,
             "num_players": self.num_players,
-            # フル特徴量関連メタデータ (後方互換のため存在しない場合は簡易扱い)
-            "use_full_features": bool(getattr(self, "use_full_features", False)),
-            "full_feature_dim": int(input_dim) if getattr(self, "use_full_features", False) else None,
-            "model_format_version": 2,  # 1: 旧 (メタなし) / 2: フル特徴量対応
+            "use_full_features": True,
+            "full_feature_dim": int(input_dim) if input_dim else None,
+            "model_format_version": 3,
         }
         torch.save(ckpt, path)
 
     @staticmethod
     def load(path: str, map_location: Optional[str] = None) -> "PolicyValueNet":
-        # weights_only=True を優先し、非対応や旧形式はフォールバック
         try:
             ckpt = torch.load(path, map_location=map_location or "cpu", weights_only=True)
         except TypeError:
-            # 古いPyTorchで weights_only 未対応
             ckpt = torch.load(path, map_location=map_location or "cpu")
         except Exception:
             ckpt = torch.load(path, map_location=map_location or "cpu")
@@ -230,249 +227,27 @@ class PolicyValueNet(nn.Module):
             max_policy_size = ckpt.get("max_policy_size", 128)
             hidden_size = ckpt.get("hidden_size", 128)
             num_players = ckpt.get("num_players", 4)
-            use_full = ckpt.get("use_full_features", False)
-            full_dim = ckpt.get("full_feature_dim", None)
-            # 後方互換: 旧 ckpt で use_full=true 判定したい場合は重み形状から推論
-            if not use_full:
-                try:
-                    w = state_dict.get("backbone.0.weight", None)
-                    if w is not None:
-                        base_dim = 2 + num_players
-                        # w shape: (hidden_size, input_dim)
-                        if hasattr(w, 'shape') and w.shape[1] != base_dim:
-                            # base と異なるならフル特徴量と推定
-                            use_full = True
-                            full_dim = w.shape[1]
-                except Exception:
-                    pass
-        else:
-            # 純粋な state_dict のみが保存されていた場合
+            full_dim = ckpt.get("full_feature_dim")
+            if full_dim is None:
+                # 旧 ckpt 推定: backbone.0.weight から in_features
+                w = state_dict.get("backbone.0.weight", None)
+                if w is None:
+                    raise ValueError("旧チェックポイントから full_feature_dim を推定できません。")
+                full_dim = w.shape[1]
+        else:  # 完全旧形式 (state_dict 直保存)
             state_dict = ckpt
             max_policy_size = 128
             hidden_size = 128
             num_players = 4
-            # 旧フォーマット (推論でフルか判定)
-            use_full = False
-            full_dim = None
-            try:
-                w = state_dict.get("backbone.0.weight", None)
-                if w is not None:
-                    base_dim = 2 + num_players
-                    if hasattr(w, 'shape') and w.shape[1] != base_dim:
-                        use_full = True
-                        full_dim = w.shape[1]
-            except Exception:
-                pass
-        if use_full:
-            if full_dim is None:
-                raise ValueError("Checkpoint indicates use_full_features=True ですが full_feature_dim が特定できません。")
-            model = PolicyValueNet(
-                max_policy_size=max_policy_size,
-                hidden_size=hidden_size,
-                num_players=num_players,
-                use_full_features=True,
-                full_feature_dim=int(full_dim),
-            )
-        else:
-            model = PolicyValueNet(
-                max_policy_size=max_policy_size,
-                hidden_size=hidden_size,
-                num_players=num_players,
-                use_full_features=False,
-            )
+            w = state_dict.get("backbone.0.weight", None)
+            if w is None:
+                raise ValueError("旧形式 ckpt に backbone.0.weight が存在しません。")
+            full_dim = w.shape[1]
+
+        model = PolicyValueNet(max_policy_size=max_policy_size, hidden_size=hidden_size,
+                               num_players=num_players, use_full_features=True, full_feature_dim=int(full_dim))
         model.load_state_dict(state_dict)
         return model
 
 
 __all__ = ["PolicyValueNet"]
-
-# =============================================================
-# Stage2: 可変長アクション対応 Policy-Value ネットワーク
-# =============================================================
-
-
-class ActionPolicyValueNet(nn.Module):
-    """可変長合法手に対して (state_emb, action_feat) から逐次ロジットを算出するモデル。
-
-    特徴:
-      - state 埋め込みは従来同様 hand_size / field_size / turn one-hot
-      - action 特徴は以下:
-          [is_pass, num_cards, is_pair, is_straight, has_joker,
-           min_rank_norm, max_rank_norm, avg_rank_norm, span_norm]
-        (必要に応じて拡張可能)
-      - ロジット: joint_mlp(concat(state_emb, action_emb)) -> 1
-      - value: state_emb から算出
-
-    使用方法:
-        model = ActionPolicyValueNet()
-        logits, value = model.evaluate(state_dict, legal_actions)
-    """
-
-    def __init__(self,
-                 state_hidden: int = 128,
-                 action_hidden: int = 64,
-                 joint_hidden: int = 128,
-                 num_players: int = 4,
-                 device: Optional[str] = None):
-        super().__init__()
-        self.num_players = num_players
-        self.device = torch.device(device) if device else torch.device("cpu")
-        self.supports_variable_actions = True  # 検出用フラグ
-
-        state_in = 2 + num_players  # hand_size, field_size, turn_onehot
-        self.state_backbone = nn.Sequential(
-            nn.Linear(state_in, state_hidden),
-            nn.ReLU(),
-            nn.Linear(state_hidden, state_hidden),
-            nn.ReLU(),
-        )
-
-        self.action_backbone = nn.Sequential(
-            nn.Linear(9, action_hidden),
-            nn.ReLU(),
-            nn.Linear(action_hidden, action_hidden),
-            nn.ReLU(),
-        )
-
-        self.joint = nn.Sequential(
-            nn.Linear(state_hidden + action_hidden, joint_hidden),
-            nn.ReLU(),
-            nn.Linear(joint_hidden, 1),  # ロジット
-        )
-
-        self.value_head = nn.Sequential(
-            nn.Linear(state_hidden, state_hidden),
-            nn.ReLU(),
-            nn.Linear(state_hidden, 1),
-            nn.Sigmoid(),  # probability 0~1
-        )
-        self.to(self.device)
-
-        # ランク順 (昇順) 3..A 2 Joker (大富豪標準強さ: 3弱, 2強, Joker 最強想定)
-        self._rank_order = ["3","4","5","6","7","8","9","10","J","Q","K","A","2","JOKER"]
-        self._rank_index = {r:i for i,r in enumerate(self._rank_order)}
-        self._max_rank_idx = len(self._rank_order)-1
-
-    # ---------------- Public API ----------------
-    def evaluate(self, state: Dict[str, Any], legal_actions: List[Any]):
-        state_vec = self._encode_state(state)
-        state_emb = self.state_backbone(state_vec)
-        logits = []
-        for act in legal_actions:
-            feat_vec = self._encode_action(act)
-            act_emb = self.action_backbone(feat_vec)
-            joint = self.joint(torch.cat([state_emb, act_emb], dim=-1))
-            logits.append(joint.squeeze(-1).item())
-        value = self.value_head(state_emb).squeeze(-1).item()
-        return logits, value
-
-    # ---------------- Encoders ----------------
-    def _encode_state(self, state: Dict[str, Any]):
-        hand_size = float(state.get("hand_size", 0))
-        field_size = float(state.get("field_size", 0))
-        turn = int(state.get("turn", 0))
-        turn_onehot = [0.0]*self.num_players
-        if 0 <= turn < self.num_players:
-            turn_onehot[turn] = 1.0
-        feat = [hand_size, field_size] + turn_onehot
-        return torch.tensor(feat, dtype=torch.float32, device=self.device)
-
-    def _encode_action(self, action: Any):
-        # pass
-        if action in (None, "pass", "PASS"):
-            return torch.tensor([1,0,0,0,0,0,0,0,0], dtype=torch.float32, device=self.device)
-        cards = action
-        # 正規化: list[str] 想定 / そうでなければ文字列化
-        if not isinstance(cards, (list, tuple)):
-            cards = [str(cards)]
-        cards = [str(c) for c in cards]
-        ranks_idx = []
-        has_joker = 0
-        for c in cards:
-            r = self._extract_rank(c)
-            if r == "JOKER":
-                has_joker = 1
-            idx = self._rank_index.get(r, None)
-            if idx is not None:
-                ranks_idx.append(idx)
-        num_cards = len(cards)
-        is_pair = 1 if num_cards==2 and self._all_same_rank(cards) else 0
-        is_straight = 1 if (num_cards>=3 and self._is_straight(ranks_idx)) else 0
-        if ranks_idx:
-            mn = min(ranks_idx)
-            mx = max(ranks_idx)
-            avg = sum(ranks_idx)/len(ranks_idx)
-            span = mx - mn
-            mn_n = mn/self._max_rank_idx
-            mx_n = mx/self._max_rank_idx
-            avg_n = avg/self._max_rank_idx
-            span_n = span/max(1,self._max_rank_idx)
-        else:
-            mn_n=mx_n=avg_n=span_n=0.0
-        feat = [
-            0,  # is_pass
-            float(num_cards),
-            float(is_pair),
-            float(is_straight),
-            float(has_joker),
-            float(mn_n), float(mx_n), float(avg_n), float(span_n)
-        ]
-        return torch.tensor(feat, dtype=torch.float32, device=self.device)
-
-    # ---------------- Helpers ----------------
-    def _extract_rank(self, card_str: str) -> str:
-        s = card_str.upper()
-        if "JOKER" in s:
-            return "JOKER"
-        # remove suit symbols / letters
-        suits = ['S','H','D','C','♠','♥','♦','♣']
-        # keep digits and letters forming rank
-        filtered = ''.join(ch for ch in s if ch not in suits)
-        # map face cards
-        mapping = {"11":"J","12":"Q","13":"K","1":"A"}  # 1 -> A 対応保険
-        if filtered in mapping:
-            return mapping[filtered]
-        return filtered
-
-    def _all_same_rank(self, cards: List[str]) -> bool:
-        ranks = [self._extract_rank(c) for c in cards]
-        return len(set(ranks)) == 1
-
-    def _is_straight(self, idx_list: List[int]) -> bool:
-        if not idx_list:
-            return False
-        if len(idx_list) < 3:
-            return False
-        idx_list = sorted(idx_list)
-        # Joker を単純に無視 (高度な柔軟ストレート補完は後続)
-        for i in range(1, len(idx_list)):
-            if idx_list[i] - idx_list[i-1] != 1:
-                return False
-        return True
-
-    # ---------------- Save/Load ----------------
-    def save(self, path: str):
-        torch.save({"state_dict": self.state_dict(), "num_players": self.num_players}, path)
-
-    @staticmethod
-    def load(path: str, map_location: Optional[str] = None):
-        try:
-            ckpt = torch.load(path, map_location=map_location or "cpu", weights_only=True)
-        except TypeError:
-            ckpt = torch.load(path, map_location=map_location or "cpu")
-        except Exception:
-            ckpt = torch.load(path, map_location=map_location or "cpu")
-
-        if isinstance(ckpt, dict) and "state_dict" in ckpt:
-            state_dict = ckpt["state_dict"]
-            num_players = ckpt.get("num_players", 4)
-        else:
-            state_dict = ckpt
-            num_players = 4
-
-        model = ActionPolicyValueNet(num_players=num_players)
-        model.load_state_dict(state_dict)
-        return model
-
-
-__all__.append("ActionPolicyValueNet")

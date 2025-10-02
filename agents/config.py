@@ -68,6 +68,7 @@ ALPHA_ZERO_CONFIG = {
     "past_model_pool_size": 2,             # 過去2世代保持
     "opponent_mix_interval_episodes": 500, # 500エピソードごとに再割当
     "replay_path": "replay_buffer.joblib",     # リプレイバッファ保存先
+    "strict_lossless": False,        # True なら 圧縮しない
 
     # ---------------------------
     # ログ / デバッグ
