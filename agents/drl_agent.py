@@ -136,6 +136,22 @@ class AlphaZeroAgent:
         # pos weight (クラス不均衡対策) optional
         self.pos_weight = float(self.config.get("value_pos_weight", 1.0))
 
+        # --- 重複サンプルフィルタ構造 (シグネチャ頻度カウント) ---
+        self._dup_enabled = bool(self.config.get('enable_duplicate_filter', False))
+        if self._dup_enabled:
+            from collections import deque as _dq
+            self._dup_sig_queue = _dq(maxlen=int(self.config.get('duplicate_window_size', 5000) or 5000))
+            self._dup_sig_counts = {}
+            self._dup_skipped = 0
+            self._dup_kept = 0
+            self._dup_last_log = 0
+        else:
+            self._dup_sig_queue = None
+            self._dup_sig_counts = None
+            self._dup_skipped = 0
+            self._dup_kept = 0
+            self._dup_last_log = 0
+
     # ---------------- Public API ----------------
     def set_model(self, model):
         """後から学習済みモデルを差し替える."""
@@ -798,6 +814,53 @@ class AlphaZeroAgent:
             "model_version": getattr(self, 'model_version', 0),
             "feature_version": 1 if (isinstance(state, dict) and ('full_input' in state or 'full_compact' in state)) else 0,
         }
+        # ------------------ 重複サンプルフィルタ ------------------
+        if self._dup_enabled:
+            try:
+                sig_type = self.config.get('duplicate_signature_type', 'top_value_len')
+                top_idx = int(_np.argmax(pi_q)) if pi_q.size > 0 else -1
+                legal_len = int(len(acts_ids))
+                vq = int(value_pred_u8) if value_pred_u8 is not None else 255
+                if sig_type == 'top_value_len':
+                    sig = (top_idx, vq, legal_len)
+                else:
+                    sig = (top_idx, vq, legal_len)
+                max_cnt = int(self.config.get('duplicate_signature_max_count', 50) or 50)
+                q = self._dup_sig_queue
+                counts = self._dup_sig_counts
+                if q is not None and counts is not None:
+                    c = counts.get(sig, 0) + 1
+                    counts[sig] = c
+                    q.append(sig)
+                    # ウィンドウから溢れた古いシグネチャをデクリメント (deque maxlen 発動時に一括処理できないため周期的に再計算)
+                    # 簡易: ウィンドウ長が閾値に達したタイミングで O(n) 再カウント (コスト許容)
+                    if len(q) == q.maxlen and (len(q) % 997 == 0):  # 疑似周期 (素数で偏り軽減)
+                        new_counts = {}
+                        for s_ in q:
+                            new_counts[s_] = new_counts.get(s_, 0) + 1
+                        counts.clear(); counts.update(new_counts)
+                    if c > max_cnt:
+                        # スキップ (格納しない)
+                        self._dup_skipped += 1
+                        sample['in_buffer'] = False
+                        # ログ (interval)
+                        log_int = int(self.config.get('duplicate_log_interval', 0) or 0)
+                        if log_int > 0:
+                            total_seen = self._dup_skipped + self._dup_kept
+                            if total_seen - self._dup_last_log >= log_int:
+                                if self.logger:
+                                    self.logger.log_text(f"[dup] skipped={self._dup_skipped} kept={self._dup_kept} ratio={(self._dup_skipped/max(1,total_seen)):.3f}")
+                                else:
+                                    print(f"[dup] skipped={self._dup_skipped} kept={self._dup_kept} ratio={(self._dup_skipped/max(1,total_seen)):.3f}")
+                                self._dup_last_log = total_seen
+                        return sample
+                    else:
+                        self._dup_kept += 1
+                        sample['dup_sig'] = sig
+                        sample['in_buffer'] = True
+            except Exception:
+                pass
+        # ----------------------------------------------------------
         # (Option) raw pi を保持: 分析/デバッグのため。drop_raw_pi=False かつ pi 長さが legal_ids と一致する場合のみ。
         if not self.config.get('drop_raw_pi', True):
             try:

@@ -114,7 +114,7 @@ ALPHA_ZERO_CONFIG = {
     "selfplay_worker_device": "cpu",
     # 並行学習トリガ: 新規サンプルがこの数だけ取り込まれたら学習を1バースト起動
     # 小さすぎると学習バーストが細切れになり効率低下。大きすぎると応答が遅れる
-    "concurrent_min_new_samples_before_train": 1000,
+    "concurrent_min_new_samples_before_train": 5000,
     # 学習後の最新チェックポイント保存の最短間隔(秒)。0以下で毎回保存（高I/O）
     "concurrent_latest_save_every_sec": 1200.0,
     # ワーカー配布用モデル(pt)保存の最短間隔(秒)。0以下で毎回保存
@@ -184,6 +184,23 @@ ALPHA_ZERO_CONFIG = {
     # フル特徴量モデルで full_input / full_compact を欠いたサンプル (ゼロパディング対象) を学習から除外するか
     # True: train_step でスキップ (推奨) / False: ゼロベクトルで学習に含める
     "skip_zero_padded_full_samples": True,
+    
+    # ---------------------------
+    # 重複サンプルフィルタ設定
+    # ---------------------------
+    # True で有効化: _store_sample で (policy top1, value_pred(量子化), legal_ids数) 等から
+    # 簡易シグネチャを作り直近ウィンドウ内の過剰出現(>duplicate_signature_max_count)時に破棄。
+    # 情報量の低い連続同型局面の氾濫を抑制しメモリ圧縮と多様性向上を狙う。
+    "enable_duplicate_filter": True,
+    # シグネチャの保持ウィンドウサイズ (FIFO)。大きくし過ぎると計数コスト増。
+    "duplicate_window_size": 5000,
+    # 同一シグネチャを許容する最大回数 (この回数を超えると以降スキップ)。
+    "duplicate_signature_max_count": 50,
+    # スキップ数を一定間隔でログ出力するか (0/None で無効, >0 でその間隔毎に [dup] 行)。
+    "duplicate_log_interval": 2000,
+    # フィルタのシグネチャ構成: 'top_value_len' で (policy_top_idx, value_u8, legal_count)
+    # 将来拡張ポイント (例: 'hash_pi')。
+    "duplicate_signature_type": "top_value_len",
 }
 
 __all__ = ["ALPHA_ZERO_CONFIG"]
