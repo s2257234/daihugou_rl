@@ -99,6 +99,67 @@ class TrainingLogger:
         # ディスクフル検知フラグ
         self._disk_full = False
         self._disk_full_reason = None
+        # メモリスナップショット制御
+        self._last_mem_log_time = 0.0
+
+    # ---------------- Memory snapshot ----------------
+    def log_memory_snapshot(self, sample_count: int | None = None, force: bool = False):
+        """プロセス常駐メモリ(RSS)と1サンプルあたり概算サイズを events.log へ記録。
+
+        sample_count: リプレイバッファ等の総サンプル数 (呼び出し側で渡す)
+        force       : True なら間隔を無視して即記録
+
+        記録頻度は config['memory_log_interval_sec'] (デフォルト3600秒) で制御。
+        psutil が無ければ fallback で resource (Unix) / tracemalloc (概算) を試みる。
+        """
+        interval = float(self.cfg.get('memory_log_interval_sec', 3600) or 3600)
+        now = time.time()
+        if (not force) and interval > 0 and (now - self._last_mem_log_time) < interval:
+            return
+        self._last_mem_log_time = now
+        rss_mb = None
+        detail = {}
+        # psutil 優先
+        try:
+            import psutil  # type: ignore
+            p = psutil.Process()
+            rss_mb = p.memory_info().rss / (1024*1024)
+        except Exception:
+            # tracemalloc fallback (Python内ヒープのみ)
+            try:
+                import tracemalloc
+                if not tracemalloc.is_tracing():
+                    tracemalloc.start()
+                cur, peak = tracemalloc.get_traced_memory()
+                detail['tracemalloc_cur_mb'] = round(cur / (1024*1024), 3)
+                detail['tracemalloc_peak_mb'] = round(peak / (1024*1024), 3)
+            except Exception:
+                pass
+        if rss_mb is None:
+            # resource (Unix) は Windows では利用不可の場合あり -> 無視
+            try:
+                import resource  # type: ignore
+                rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                if rss_kb > 0:
+                    # macOS はバイト、Linux はKB の違いがあるため heuristics
+                    if rss_kb > 10 * 1024 * 1024:  # 10M KB 以上なら既にバイト値とみなし /1024^2
+                        rss_mb = rss_kb / (1024*1024)
+                    else:
+                        rss_mb = rss_kb / 1024  # assume KB
+            except Exception:
+                pass
+        # 1サンプルあたり概算
+        per_sample_kb = None
+        if rss_mb is not None and sample_count and sample_count > 0:
+            per_sample_kb = (rss_mb * 1024) / sample_count
+        meta_parts = [f"rss_mb={rss_mb:.2f}" if rss_mb is not None else "rss_mb=?"]
+        if per_sample_kb is not None:
+            meta_parts.append(f"per_sample_kb={per_sample_kb:.2f}")
+        if sample_count is not None:
+            meta_parts.append(f"samples={sample_count}")
+        for k,v in detail.items():
+            meta_parts.append(f"{k}={v}")
+        self.log_text("[mem] " + " ".join(meta_parts), also_print=False)
 
     # ---------------- Internal helpers ----------------
     def _disable_tensorboard(self, reason: str):

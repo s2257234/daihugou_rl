@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import random
 import copy
+from collections import deque
 from typing import Any, Dict, List, Optional
 import joblib
 
@@ -71,10 +72,17 @@ class AlphaZeroAgent:
         self.player_id = player_id
         self.config = config or ALPHA_ZERO_CONFIG
         self.model = model
-        # リプレイバッファ (共有 or ローカル list)。共有時は trainer 注入想定。
-        self.replay_buffer: Any = []
+
+        # リプレイバッファ (共有 or ローカル deque)。共有時は trainer から差し込まれる想定。
+        # 非共有の場合は O(1) で先頭追い出しが可能な deque(maxlen) を用いる。
         self.max_buffer_size = self.config.get("buffer_size", 50000)
         self._use_shared = self.config.get("use_shared_replay", False)
+        if not self._use_shared:
+            # ローカル: deque (FIFO 自動エビクション)
+            self.replay_buffer = deque(maxlen=self.max_buffer_size)
+        else:
+            # 共有バッファは trainer 側で後からセットされる。ここでは空の list プレースホルダ。
+            self.replay_buffer = []
 
         # MCTS 関連パラメータ
         self.num_simulations = self.config.get("num_simulations", 64)
@@ -613,25 +621,164 @@ class AlphaZeroAgent:
     # ---------------- Replay buffer ----------------
     def _store_sample(self, state, legal_actions, pi, value, value_pred: Optional[float] = None):
         """リプレイサンプル1件を保存。共有バッファなら append の参照を返す."""
+        # --- メモリ削減: full_input をコンパクト表現へ圧縮 (packbits + float16) ---
+        try:
+            if (self.config.get('use_full_features') and
+                self.config.get('enable_compact_full_input', True) and
+                isinstance(state, dict) and 'full_input' in state and 'full_compact' not in state):
+                fi = state.get('full_input')
+                import numpy as _np
+                fi_arr = _np.asarray(fi, dtype=_np.float32)
+                # num_players 推定 (len = 56N + 22)
+                total_len = fi_arr.shape[0]
+                # 56N + 22 = total_len -> N = (total_len - 22)/56
+                N = int((total_len - 22) // 56) if total_len >= 22 else self.config.get('num_players', 4)
+                if N > 0 and 56 * N + 22 == total_len:
+                    # binary_len = 55N + 21, float count = N + 1
+                    binary_indices = []
+                    float_indices = []
+                    # players block
+                    for p in range(N):
+                        base = p * 55
+                        # 53 card bits
+                        binary_indices.extend(range(base, base + 53))
+                        # pass bit
+                        binary_indices.append(base + 53)
+                        # remain_norm
+                        float_indices.append(base + 54)
+                    field_base = 55 * N
+                    # revolution
+                    binary_indices.append(field_base)
+                    # combo 7 bits
+                    binary_indices.extend(range(field_base + 1, field_base + 8))
+                    # rank 13 bits
+                    binary_indices.extend(range(field_base + 8, field_base + 21))
+                    # field_size_norm
+                    float_indices.append(field_base + 21)
+                    # turn one-hot N bits
+                    turn_start = field_base + 22
+                    binary_indices.extend(range(turn_start, turn_start + N))
+                    bin_vals = fi_arr[binary_indices]
+                    bin_bits = (bin_vals > 0.5).astype(_np.uint8)
+                    packed = _np.packbits(bin_bits).tobytes()
+                    float_vals = fi_arr[float_indices].astype(_np.float16)
+                    state['full_compact'] = {
+                        'packed_bits': packed,
+                        'floats': float_vals,
+                        'binary_len': int(bin_bits.shape[0]),
+                        'num_players': int(N),
+                        'format': 'cfv1',
+                        'full_input_dim': int(total_len),
+                    }
+                    # 元のベクトルは削除して常駐メモリ削減
+                    try:
+                        del state['full_input']
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # --- 追加メモリ削減: pi 量子化(uint16), value/value_pred を uint8、legal_actions を ID 化 ---
+        import numpy as _np
+        # グローバル action 辞書 (プロセス内共有) を lazy 初期化
+        global _ACTION_ID_MAP, _ACTION_ID_LIST
+        try:
+            _ACTION_ID_MAP  # type: ignore
+        except NameError:
+            _ACTION_ID_MAP = {}  # type: ignore
+            _ACTION_ID_LIST = []  # type: ignore
+
+        def _encode_actions(acts):
+            ids = []
+            for a in acts:
+                # None/pass も区別: 文字列化 (tuple/list は repr)
+                if a is None:
+                    key = 'PASS'
+                else:
+                    try:
+                        if isinstance(a, (list, tuple)):
+                            key = 'T:' + ','.join(map(str, a))
+                        else:
+                            key = 'S:' + str(a)
+                    except Exception:
+                        key = 'S:ERR'
+                if key not in _ACTION_ID_MAP:  # type: ignore
+                    _ACTION_ID_MAP[key] = len(_ACTION_ID_LIST)  # type: ignore
+                    _ACTION_ID_LIST.append(a)  # type: ignore
+                ids.append(_ACTION_ID_MAP[key])  # type: ignore
+            return _np.asarray(ids, dtype=_np.int32)
+
+        # pi 量子化
+        pi_arr = _np.asarray(pi, dtype=_np.float32)
+        s = float(pi_arr.sum())
+        if s <= 0:
+            if pi_arr.size > 0:
+                pi_arr[:] = 1.0 / pi_arr.size
+            s = 1.0
+        scale = 65535.0 / s
+        pi_q = _np.clip(_np.round(pi_arr * scale), 0, 65535).astype(_np.uint16)
+        diff = int(65535 - int(pi_q.sum()))
+        if diff != 0 and pi_q.size > 0:
+            i = int(_np.argmax(pi_q))
+            new_val = int(pi_q[i]) + diff
+            if 0 <= new_val <= 65535:
+                pi_q[i] = new_val  # type: ignore
+        # value / value_pred 量子化
+        def _q8(v):
+            if v is None:
+                return 255  # 特殊値 (未確定)
+            try:
+                return int(max(0, min(255, round(float(v) * 255))))
+            except Exception:
+                return 255
+        value_u8 = _q8(value)
+        value_pred_u8 = _q8(value_pred)
+        # legal actions を ID 配列化
+        acts_ids = _encode_actions(legal_actions or [])
+
         sample = {
             "player_id": self.player_id,
             "state": state,
-            "legal_actions": legal_actions,
-            "pi": pi,
-            "value": value,
-            "value_pred": value_pred,
+            # 量子化/圧縮表現
+            "pi_q": pi_q,
+            "pi_format": "u16_norm65535",
+            "legal_ids": acts_ids,
+            "actions_format": "id_v1",
+            "value_u8": value_u8,
+            "value_pred_u8": value_pred_u8,
+            "value": value,  # assign_values 更新対象
             "model_version": getattr(self, 'model_version', 0),
-            "feature_version": 1 if (isinstance(state, dict) and 'full_input' in state) else 0,
+            "feature_version": 1 if (isinstance(state, dict) and ('full_input' in state or 'full_compact' in state)) else 0,
         }
+        # (Option) raw pi を保持: 分析/デバッグのため。drop_raw_pi=False かつ pi 長さが legal_ids と一致する場合のみ。
+        if not self.config.get('drop_raw_pi', True):
+            try:
+                import numpy as _np
+                if len(pi) == len(acts_ids):
+                    sample['pi'] = _np.asarray(pi, dtype=_np.float16)  # 半精度で縮小
+            except Exception:
+                pass
+        # legal_actions のバックアップ (ID 復元で十分なら無効化してメモリ節約)
+        if self.config.get('enable_legal_actions_backup', False):
+            try:
+                sample['legal_actions'] = legal_actions
+            except Exception:
+                pass
+        # value_pred は value_pred_u8 に集約するため raw は保持しない
         # フル特徴量モード時に legacy サンプル(=0) を破棄して無駄容量を防ぐ
         if self.config.get('use_full_features') and sample['feature_version'] == 0:
             return sample  # 破棄 (格納しない)。戻り値だけ返す。
         if self._use_shared and hasattr(self.replay_buffer, 'append'):
+            # 共有リプレイ (ReplayBuffer.append 内でエビクション処理)
             self.replay_buffer.append(sample)
             return sample
-        if len(self.replay_buffer) >= self.max_buffer_size:  # 古いものをFIFOで削除
-            self.replay_buffer.pop(0)
-        self.replay_buffer.append(sample)
+        # ローカル deque: maxlen による自動 FIFO なのでそのまま append
+        if isinstance(self.replay_buffer, deque):
+            self.replay_buffer.append(sample)
+        else:
+            # 後方互換 (万一 list のまま残っているケース)
+            if len(self.replay_buffer) >= self.max_buffer_size:
+                self.replay_buffer.pop(0)
+            self.replay_buffer.append(sample)
         return sample
 
     def assign_values(self, samples: List[Any], value: float):
@@ -650,6 +797,11 @@ class AlphaZeroAgent:
                 if value > 0.5:
                     self.total_positive += 1
             rec["value"] = value
+            # 量子化フィールドも更新
+            try:
+                rec["value_u8"] = int(255 if value is None else max(0, min(255, round(float(value) * 255))))
+            except Exception:
+                pass
 
     def finalize_phase(self, winner_player_id: int, was_active: bool):
         """フェーズ終端処理: 勝者IDに基づき 0/1 ラベル付与 + 予測精度集計."""
@@ -779,11 +931,62 @@ class AlphaZeroAgent:
         variable = getattr(self.model, 'supports_variable_actions', False) and hasattr(self.model, 'evaluate')
 
         for sample in batch:
+            # --- 復元: legal_actions / pi ---
             legal_actions = sample.get("legal_actions")
-            pi_target = sample.get("pi")
+            if legal_actions is None and sample.get('actions_format') == 'id_v1' and 'legal_ids' in sample:
+                # ID から元アクションへ (必要時のみ)。学習上は長さ一致だけで良いならダミー化も可能。
+                try:
+                    global _ACTION_ID_LIST
+                    ids = sample['legal_ids']
+                    if hasattr(ids, 'tolist'):
+                        ids_list = ids.tolist()
+                    else:
+                        ids_list = list(ids)
+                    legal_actions = []
+                    for i in ids_list:
+                        try:
+                            legal_actions.append(_ACTION_ID_LIST[i])  # type: ignore
+                        except Exception:
+                            legal_actions.append('pass')
+                except Exception:
+                    legal_actions = None
+            # π 復元 (量子化優先)
+            if 'pi_q' in sample and sample.get('pi_format') == 'u16_norm65535':
+                try:
+                    import numpy as _np
+                    pi_q = sample['pi_q']
+                    if hasattr(pi_q, 'astype'):
+                        pi_arr = pi_q.astype(_np.float32)
+                    else:
+                        pi_arr = _np.asarray(list(pi_q), dtype=_np.float32)
+                    s_q = float(pi_arr.sum())
+                    if s_q <= 0:
+                        pi_target = [1.0 / len(pi_arr)] * int(len(pi_arr)) if len(pi_arr) > 0 else []
+                    else:
+                        pi_target = (pi_arr / s_q).tolist()
+                except Exception:
+                    pi_target = sample.get('pi')
+            else:
+                pi_target = sample.get("pi")
             v_target = sample.get("value")
+            if v_target is None and 'value_u8' in sample:
+                vu = sample.get('value_u8')
+                try:
+                    if isinstance(vu, int) and vu != 255:
+                        v_target = vu / 255.0
+                except Exception:
+                    pass
             if not legal_actions or not pi_target or v_target is None:
                 continue  # 無効サンプルスキップ
+            # フル特徴量モデルで zero padded サンプルを除外 (config 制御)
+            if self.config.get('use_full_features') and self.config.get('skip_zero_padded_full_samples', True):
+                try:
+                    st = sample.get('state') or {}
+                    # compact / full_input が一切無い場合 (models.PolicyValueNet で警告したケース)
+                    if ('full_compact' not in st) and ('full_input' not in st):
+                        continue
+                except Exception:
+                    pass
             n = len(legal_actions)
             # Forward
             if variable:
@@ -924,6 +1127,46 @@ class AlphaZeroAgent:
         if self.logger:
             self.logger.log_train(metrics)
             self._logged_inside = True
+            # メモリスナップショット (学習プレイヤーのみ想定: config.learning_player_id)
+            try:
+                lp = int(self.config.get('learning_player_id', 0))
+                if self.player_id == lp and hasattr(self.logger, 'log_memory_snapshot'):
+                    # 共有リプレイ形式かローカルかでサンプル数を取得
+                    sample_count = None
+                    try:
+                        if self._use_shared and hasattr(self.replay_buffer, '__len__'):
+                            sample_count = len(self.replay_buffer)
+                        elif isinstance(self.replay_buffer, list):
+                            sample_count = len(self.replay_buffer)
+                    except Exception:
+                        pass
+                    self.logger.log_memory_snapshot(sample_count=sample_count, force=False)
+            except Exception:
+                pass
+            # events.log へ周期的に TRAIN 指標を一行テキストとして追記 (軽量モニタ用)
+            try:
+                freq = int(self.config.get('events_log_train_every', 0) or 0)
+                if freq > 0:
+                    step = getattr(self.logger, 'update_step', None)
+                    # log_train 呼び出し後なので update_step は 1 インクリメント済み
+                    if step and (step % freq == 0):
+                        parts = [
+                            f"loss={metrics.get('loss'):.4f}" if metrics.get('loss') is not None else None,
+                            f"pl={metrics.get('policy_loss'):.4f}" if metrics.get('policy_loss') is not None else None,
+                            f"vl={metrics.get('value_loss'):.4f}" if metrics.get('value_loss') is not None else None,
+                            f"ent={metrics.get('entropy'):.3f}" if metrics.get('entropy') is not None else None,
+                            f"kl={metrics.get('policy_kl'):.4f}" if metrics.get('policy_kl') is not None else None,
+                            f"top1={metrics.get('policy_top1_match'):.3f}" if metrics.get('policy_top1_match') is not None else None,
+                            f"v_acc={metrics.get('value_acc'):.3f}" if metrics.get('value_acc') is not None else None,
+                            f"v_brier={metrics.get('value_brier'):.4f}" if metrics.get('value_brier') is not None else None,
+                            f"pos={metrics.get('pos_rate'):.3f}" if metrics.get('pos_rate') is not None else None,
+                            f"cum_pos={metrics.get('cum_pos_rate'):.3f}" if metrics.get('cum_pos_rate') is not None else None,
+                            f"samples={metrics.get('samples')}" if metrics.get('samples') is not None else None,
+                        ]
+                        line = " ".join(p for p in parts if p is not None)
+                        self.logger.log_text(f"[TRAIN] step={step} {line}", also_print=False)
+            except Exception:
+                pass
         return metrics
 
     def reset_episode(self):

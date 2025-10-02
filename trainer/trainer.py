@@ -398,6 +398,7 @@ def _selfplay_daemon_worker(worker_id: int,
                 ag.reset_episode()
         step_count = 0
         prev_rankings: List[int] = list(getattr(env.game, "rankings", []))
+        dbg_samples_before = [len(getattr(ag, 'replay_buffer', [])) for ag in agents if hasattr(ag, 'replay_buffer')]
         while not getattr(env.game, "done", False):
             if step_count >= max_steps:
                 break
@@ -417,11 +418,42 @@ def _selfplay_daemon_worker(worker_id: int,
                     for az in agents:
                         was_active = az.player_id not in prev_rankings
                         az.finalize_phase(winner_player_id=winner_id, was_active=was_active)
+                try:
+                    if config.get('debug_concurrent_worker', False):
+                        # 勝者発生時点で現在のフェーズ確定サンプル数をログ
+                        labeled_counts = []
+                        total_counts = []
+                        for az in agents:
+                            buf = getattr(az, 'replay_buffer', [])
+                            total_counts.append(len(buf) if buf is not None else 0)
+                            lc = 0
+                            for s in buf:
+                                if isinstance(s, dict) and s.get('value') is not None:
+                                    lc += 1
+                            labeled_counts.append(lc)
+                        print(f"[WORKER{worker_id}][phase] winners={new_winners} totals={total_counts} labeled={labeled_counts}")
+                except Exception:
+                    pass
                 prev_rankings = current_rankings
         # エピソード終端処理
         for az in agents:
             az.flush_unfinished_phase()
             az.finalize_game()
+        if config.get('debug_concurrent_worker', False):
+            try:
+                after_counts = []
+                labeled_after = []
+                for az in agents:
+                    buf = getattr(az, 'replay_buffer', [])
+                    after_counts.append(len(buf) if buf is not None else 0)
+                    la = 0
+                    for s in buf:
+                        if isinstance(s, dict) and s.get('value') is not None:
+                            la += 1
+                    labeled_after.append(la)
+                print(f"[WORKER{worker_id}][episode_end] steps={step_count} buf_total={after_counts} buf_labeled={labeled_after}")
+            except Exception:
+                pass
 
         # このエピソードで確定したサンプルを Queue へ送信
         for az in agents:
@@ -636,6 +668,14 @@ class Trainer:
                         print(f"[INFO] loaded replay size={len(self.shared_replay)}")
                 except Exception as e:
                     print(f"[WARN] replay load failed: {e}")
+        # 初期チェックポイント (空のリプレイと初期モデル) を要求された場合に保存
+        if self.config.get("initial_checkpoint_on_setup", False):
+            try:
+                self._save_checkpoint(version_tag=None)
+                if self.logger:
+                    self.logger.log_text("[init] initial checkpoint saved")
+            except Exception as e:
+                print(f"[WARN] initial checkpoint save failed: {e}")
 
     # ウォームアップ用: 他プレイヤーを簡易エージェントに差し替え
     def _apply_warmup_opponents(self):
@@ -768,8 +808,8 @@ class Trainer:
         *,
         total_episodes: int,
         workers: int | None = None,
-        updates_per_iter: int = 100,
-        queue_maxsize: int = 50000,
+        updates_per_iter: int = 50,
+        queue_maxsize: int = 15000,
         progress_print_every: int = 50,
     ):
         """自己対局をワーカープロセスで常時生成しつつ、親で学習を並行実行。
@@ -836,10 +876,15 @@ class Trainer:
         last_latest_ckpt_ts = 0.0
         last_blob_save_ts = 0.0
         # 親側で episodes_total_run を進めるため、event_queue からの "ep_done" をカウント
+        status_log_sec = float(self.config.get("concurrent_status_log_sec", 0) or 0)
+        status_log_include_mem = bool(self.config.get("status_log_include_memory", False))
+        debug_flag = bool(self.config.get("concurrent_debug_logging", False))
+        last_status_ts = time.time()
 
         def _drain_samples(max_items: int | None = None):
             nonlocal dst_buffer
             consumed = 0
+            skipped = 0
             while True:
                 if max_items is not None and consumed >= max_items:
                     break
@@ -847,6 +892,14 @@ class Trainer:
                     s = sample_queue.get_nowait()
                 except Exception:
                     break
+                # サンプルバリデーション
+                if not isinstance(s, dict):
+                    skipped += 1
+                    continue
+                # 量子化 pi_q のみを保持する新形式にも対応
+                if 'state' not in s or not ('pi' in s or 'pi_q' in s):
+                    skipped += 1
+                    continue
                 # 取り込み
                 if self.shared_replay is not None:
                     try:
@@ -859,6 +912,8 @@ class Trainer:
                     except Exception:
                         pass
                 consumed += 1
+            if debug_flag and skipped > 0:
+                print(f"[DEBUG] drain skipped={skipped} accepted={consumed} (reason: missing state or pi/pi_q)")
             return consumed
 
         try:
@@ -898,6 +953,24 @@ class Trainer:
                 # サンプル取り込み（少しずつ）
                 consumed_now = _drain_samples(max_items=500)
                 new_samples_since_train += int(consumed_now)
+                if debug_flag and consumed_now>0:
+                    print(f"[DEBUG] drained={consumed_now} total_new={new_samples_since_train} replay_size={len(self.shared_replay) if self.shared_replay else 'n/a'}")
+                # 追加デバッグ: 学習トリガ未達時に一定エピソードごとにラベル付サンプル比率を観測
+                if debug_flag and (ep_done % max(1, int(self.config.get('debug_status_interval_eps', 25))) == 0):
+                    try:
+                        if self.shared_replay is not None:
+                            total_rb = len(self.shared_replay)
+                            labeled_rb = 0
+                            try:
+                                # shared_replay.iter_all で全要素にアクセスできる前提
+                                for rec in self.shared_replay.iter_all():
+                                    if isinstance(rec, dict) and rec.get('value') is not None:
+                                        labeled_rb += 1
+                            except Exception:
+                                pass
+                            print(f"[DEBUG][parent] ep_done={ep_done} shared_replay_total={total_rb} labeled={labeled_rb}")
+                    except Exception:
+                        pass
 
                 # 新規サンプルがしきい値を超えたら学習を回す
                 now = time.time()
@@ -944,6 +1017,50 @@ class Trainer:
                                 last_blob_save_ts = now
                     # 学習トリガをリセット
                     new_samples_since_train = 0
+
+                # 定期ステータスログ
+                now2 = time.time()
+                if status_log_sec > 0 and (now2 - last_status_ts) >= status_log_sec:
+                    last_status_ts = now2
+                    try:
+                        replay_size = len(self.shared_replay) if self.shared_replay is not None else (len(dst_buffer) if dst_buffer is not None and hasattr(dst_buffer, '__len__') else None)
+                    except Exception:
+                        replay_size = None
+                    # 追加: 主要I/Oファイルサイズ (MB) を取得して status に添付
+                    io_parts = []
+                    try:
+                        log_dir = self.config.get('log_dir', 'logs')
+                        ev_path = os.path.join(log_dir, 'events.log')
+                        mcts_path = os.path.join(log_dir, 'mcts_samples.jsonl')
+                        ckpt_path = self.config.get('checkpoint_path', 'checkpoints/policy_value_latest.pt')
+                        def _mb(p):
+                            try:
+                                return os.path.getsize(p) / (1024*1024)
+                            except Exception:
+                                return None
+                        ev_mb = _mb(ev_path)
+                        mcts_mb = _mb(mcts_path)
+                        ckpt_mb = _mb(ckpt_path)
+                        if ev_mb is not None:
+                            io_parts.append(f"events:{ev_mb:.1f}MB")
+                        if mcts_mb is not None:
+                            io_parts.append(f"mcts:{mcts_mb:.1f}MB")
+                        if ckpt_mb is not None:
+                            io_parts.append(f"ckpt:{ckpt_mb:.1f}MB")
+                    except Exception:
+                        pass
+                    io_sizes_str = (" io_sizes=" + ",".join(io_parts)) if io_parts else ""
+                    msg = f"[status] ep_done={ep_done} train_it={train_it} new_since_train={new_samples_since_train} replay_size={replay_size} workers={workers}{io_sizes_str}"
+                    if self.logger:
+                        self.logger.log_text(msg)
+                        if status_log_include_mem:
+                            try:
+                                sample_cnt = replay_size
+                                self.logger.log_memory_snapshot(sample_count=sample_cnt, force=False)
+                            except Exception:
+                                pass
+                    else:
+                        print(msg)
 
             # 終了条件到達: ワーカー停止指示
             stop_event.set()
@@ -1094,13 +1211,26 @@ class Trainer:
             return
         try:
             # live モデル state_dict を CPU 上にコピー
+            # フル特徴量モデルの場合は input_dim を揃える必要がある (そうでないと 246->6 などの shape mismatch が発生)
+            use_full = getattr(self.model, 'use_full_features', False)
+            full_dim = None
+            if use_full:
+                try:
+                    # backbone 最初の Linear の in_features から復元
+                    full_dim = int(getattr(self.model.backbone[0], 'in_features'))  # type: ignore[index]
+                except Exception:
+                    # 取得失敗時はフォールバック (ロードで再度失敗する可能性あり)
+                    full_dim = None
             snap = PolicyValueNet(
                 max_policy_size=self.config["max_policy_size"],
                 hidden_size=self.config["hidden_size"],
                 num_players=self.config["num_players"],
                 device="cpu",
+                use_full_features=use_full,
+                full_feature_dim=full_dim if use_full else None,
             )
-            snap.load_state_dict(self.model.state_dict())  # type: ignore[arg-type]
+            # strict=True でロードし shape 不一致を早期検出 (問題あれば例外キャッチ側で警告)
+            snap.load_state_dict(self.model.state_dict(), strict=True)  # type: ignore[arg-type]
             self.past_models.append(snap)
             self._previous_model = snap  # 互換
             # 上限超過なら古いものから削除
@@ -1414,6 +1544,15 @@ class Trainer:
         except Exception as e:
             print(f"[WARN] metadata save failed: {e}")
 
+    # 即時保存用ヘルパ (ユーザーが強制的に現在状態を吐き出したい場合)
+    def force_save(self):
+        try:
+            self._save_checkpoint()
+            if self.logger:
+                self.logger.log_text("[force_save] checkpoint+replay saved")
+        except Exception as e:
+            print(f"[WARN] force_save failed: {e}")
+
     # -----------------------------------------------------
     # 直前モデルを対戦相手に混在させる
     # -----------------------------------------------------
@@ -1456,7 +1595,7 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=int, default=None, help="自己対局の並列ワーカー数。未指定は設定値を使用")
     # 並行実行オプション
     parser.add_argument("--concurrent", action="store_true", help="自己対局と学習を並行実行する常駐モードを有効化")
-    parser.add_argument("--concurrent-updates-per-iter", type=int, default=100, help="並行モードでの学習ステップ束ね数")
+    parser.add_argument("--concurrent-updates-per-iter", type=int, default=50, help="並行モードでの学習ステップ束ね数")
     parser.add_argument("--concurrent-queue-size", type=int, default=50000, help="並行モードでのサンプルQueueの最大長")
     parser.add_argument(
         "--total-episodes",

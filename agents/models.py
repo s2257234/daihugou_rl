@@ -74,17 +74,47 @@ class PolicyValueNet(nn.Module):
     # -----------------------------------------------------
     def _encode_state(self, state: Dict[str, Any]):
         """状態辞書をテンソルに。
-        use_full_features=True かつ state['full_input'] が存在する場合はそれをそのまま使用。
-        それ以外は従来の hand_size / field_size / turn one-hot を構築。
+        - use_full_features=True の場合:
+            1) compact 形式 (state['full_compact']) があれば展開
+            2) full_input があればそれを利用
+        - それ以外は hand_size / field_size / turn one-hot 簡易特徴
+        compact 形式(cf v1):
+            {'packed_bits': bytes, 'floats': np.float16[N+1], 'binary_len': int, 'num_players':N}
+            復元時: bits(float32) + floats(float32) を結合
         """
-        if self.use_full_features and "full_input" in state:
-            arr = state["full_input"]
+        if self.use_full_features and ("full_input" in state or "full_compact" in state):
+            import numpy as _np
+            # compact 優先で展開 (展開済みは full_input にキャッシュ)
+            if 'full_compact' in state and 'full_input' not in state:
+                try:
+                    cf = state['full_compact']
+                    if isinstance(cf, dict) and cf.get('format') == 'cfv1':
+                        bin_len = int(cf.get('binary_len', 0))
+                        packed = cf.get('packed_bits', b'')
+                        floats = cf.get('floats')
+                        if isinstance(packed, (bytes, bytearray)) and bin_len > 0:
+                            bits_arr = _np.unpackbits(_np.frombuffer(packed, dtype=_np.uint8))[:bin_len].astype(_np.float32)
+                        else:
+                            bits_arr = _np.zeros(bin_len, dtype=_np.float32)
+                        if floats is not None:
+                            try:
+                                floats_arr = _np.asarray(floats, dtype=_np.float16).astype(_np.float32)
+                            except Exception:
+                                floats_arr = _np.asarray(list(floats), dtype=_np.float32)
+                        else:
+                            floats_arr = _np.zeros(0, dtype=_np.float32)
+                        arr_cat = _np.concatenate([bits_arr, floats_arr])
+                        state['full_input'] = arr_cat  # キャッシュ
+                except Exception:
+                    pass
+            arr = state.get('full_input')
+            if arr is None:
+                arr = []
             # list/tuple -> tensor
             if isinstance(arr, (list, tuple)):
                 return torch.tensor(list(arr), dtype=torch.float32, device=self.device)
             # numpy array
             try:
-                import numpy as _np
                 if isinstance(arr, _np.ndarray):
                     return torch.tensor(arr, dtype=torch.float32, device=self.device)
             except Exception:
@@ -92,7 +122,7 @@ class PolicyValueNet(nn.Module):
             # torch tensor
             if hasattr(arr, 'detach'):
                 return arr.detach().float().to(self.device)
-            raise ValueError("full_input の型がサポートされていません。")
+            # フォールバック簡易特徴へ (破損対策)
         hand_size = float(state.get("hand_size", 0))
         field_size = float(state.get("field_size", 0))
         turn = int(state.get("turn", 0))
@@ -100,6 +130,23 @@ class PolicyValueNet(nn.Module):
         if 0 <= turn < self.num_players:
             turn_onehot[turn] = 1.0
         feat = [hand_size, field_size] + turn_onehot
+        # フル特徴量モデルだが legacy / 壊れたサンプルで full_input が無い場合のフォールバック
+        if self.use_full_features:
+            try:
+                exp = self.backbone[0].in_features  # type: ignore[index]
+            except Exception:
+                exp = None
+            if exp and len(feat) != exp:
+                # ゼロパディングして形状不一致による matmul エラーを防ぐ (情報欠落サンプル)
+                pad_vec = torch.zeros(exp, dtype=torch.float32, device=self.device)
+                n = min(len(feat), exp)
+                if n > 0:
+                    pad_vec[:n] = torch.tensor(feat[:n], dtype=torch.float32, device=self.device)
+                # 一度だけ警告
+                if not hasattr(self, '_warned_legacy_full_missing'):
+                    print(f"[WARN] missing full_input/full_compact for full-feature model -> zero padded (expected_dim={exp})")
+                    self._warned_legacy_full_missing = True  # type: ignore[attr-defined]
+                return pad_vec
         return torch.tensor(feat, dtype=torch.float32, device=self.device)
 
     # -----------------------------------------------------

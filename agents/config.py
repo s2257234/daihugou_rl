@@ -46,7 +46,7 @@ ALPHA_ZERO_CONFIG = {
     # ---------------------------
     # 学習 / 最適化
     # ---------------------------
-    "buffer_size": 200_000,           # リプレイバッファ最大サイズ
+    "buffer_size": 50000,           # リプレイバッファ最大サイズ
     "batch_size": 256,               # 学習バッチサイズ (train_step 実装時に利用)
     "lr": 1e-4,                      # 学習率
     "weight_decay": 1e-4,            # L2 正則化
@@ -62,10 +62,10 @@ ALPHA_ZERO_CONFIG = {
     "checkpoint_path": "checkpoints/policy_value_latest.pt",  # 直近モデル
     # 周期保存: 大量エピソード実行時にエピソード間隔で世代チェックポイントを残す
     # 例) 100000 エピソードで 2000 間隔 -> 50 個保存
-    "checkpoint_interval_episodes": 200,       # 0 / None なら無効
+    "checkpoint_interval_episodes": 1000,       # 0 / None なら無効
     "keep_previous_model_opponent": True,       # 直前世代モデルを一部プレイヤーに割当てて多様性確保
     "previous_model_mix_players": 2,            # 学習プレイヤー以外から2人を過去モデル化
-    "past_model_pool_size": 6,             # 過去6世代保持
+    "past_model_pool_size": 2,             # 過去2世代保持
     "opponent_mix_interval_episodes": 500, # 500エピソードごとに再割当
     "replay_path": "replay_buffer.joblib",     # リプレイバッファ保存先
 
@@ -84,13 +84,18 @@ ALPHA_ZERO_CONFIG = {
     # ログ / 可視化
     # ---------------------------
     "log_dir": "logs",              # ログ出力ディレクトリ (CSV / TensorBoard)
-    "enable_tensorboard": True,      # TensorBoard 出力を有効化
+    "enable_tensorboard": False,      # TensorBoard 出力を有効化
     "mcts_log_sample_rate": 0.15,    # MCTS ルート統計のサンプリング率
     "disable_mcts_log": True,        # True で mcts_samples.jsonl へ出力しない
     "clear_logs_on_start": True,     # 起動時に既存ログを消去 (Falseで残す)
+    # メモリスナップショット (events.log へ 1h 毎など)
+    "memory_log_interval_sec": 3600,
     # ETA 表示調整
     "eta_smoothing_alpha": 0.25,     # エピソード時間 EMA 係数 (0=平均,1=最新のみ)
     "monotonic_eta": True,           # 残り時間推定を単調減少にクランプ
+
+    "use_progress_bar": False,
+    "minimal_progress": False,  # 進捗表示を最小限に (ログ行数抑制)
 
     # ---------------------------
     # リプレイ共有 / 構造
@@ -102,17 +107,17 @@ ALPHA_ZERO_CONFIG = {
     # 自己対局 並列実行
     # ---------------------------
     # 並列ワーカー数 (0/1 で無効 = 単一プロセス)。Windows の spawn に対応。
-    "selfplay_workers": 16,
+    "selfplay_workers": 10,
     # ワーカープロセスでの推論デバイス。通常は CPU を推奨 (GPU 共有は非推奨)。
 
     "selfplay_worker_device": "cpu",
     # 並行学習トリガ: 新規サンプルがこの数だけ取り込まれたら学習を1バースト起動
     # 小さすぎると学習バーストが細切れになり効率低下。大きすぎると応答が遅れる
-    "concurrent_min_new_samples_before_train": 2000,
+    "concurrent_min_new_samples_before_train": 1000,
     # 学習後の最新チェックポイント保存の最短間隔(秒)。0以下で毎回保存（高I/O）
-    "concurrent_latest_save_every_sec": 300.0,
+    "concurrent_latest_save_every_sec": 1200.0,
     # ワーカー配布用モデル(pt)保存の最短間隔(秒)。0以下で毎回保存
-    "concurrent_blob_save_every_sec": 30.0,
+    "concurrent_blob_save_every_sec": 300.0,
     # ---------------------------
     # ハードウェア / デバイス
     # ---------------------------
@@ -125,7 +130,7 @@ ALPHA_ZERO_CONFIG = {
     # ---------------------------
     # TensorBoard 及び CSV への書き込み頻度を制御し I/O/ディスク負荷を軽減
     # 例: train 100 ステップに 1 回 / episode 10 回に 1 回
-    "tensorboard_train_log_every": 100,      # 1 なら毎ステップ
+    "tensorboard_train_log_every": 200,      # 1 なら毎ステップ
     "tensorboard_episode_log_every": 100,
     "tensorboard_flush_seconds": 120,        # 最低この秒数ごとに flush (0/None なら都度 flush)
     # CSV 出力間引き (1=毎回)。間引いた行は欠番になる
@@ -151,6 +156,33 @@ ALPHA_ZERO_CONFIG = {
     # 高次元ベクトル (full_input) を PolicyValueNet へ入力する。
     # False の場合は従来の hand_size / field_size / turn one-hot の簡易入力。
     "use_full_features": True,
+    # ---------------------------
+    # 追加: 保存・ステータス可視化 / デバッグ
+    # ---------------------------
+    # setup() 直後に初期モデル/空リプレイを checkpoint_path へ保存するか
+    "initial_checkpoint_on_setup": True,
+    # 並行モード train_concurrent で一定秒ごとに events.log へ進捗とバッファ統計を出す間隔 (0/None で無効)
+    "concurrent_status_log_sec": 300,
+    # 追加ステータスログにメモリスナップショットも含めるか
+    "status_log_include_memory": True,
+    # 追加詳細デバッグ (Queue drain / train trigger) を標準出力へ都度出すフラグ
+    "concurrent_debug_logging": False,
+
+    # ---------------------------
+    # メモリ最適化フラグ
+    # ---------------------------
+    # True の場合 legal_actions の元リストを各サンプルに残す (学習時の再構築コスト回避用)。
+    # False なら ID 化された legal_ids のみ保持しメモリ削減 (推奨)。
+    # drl_agent._store_sample 内で参照。
+    "enable_legal_actions_backup": False,
+    # True なら量子化 pi_q がある時は生の pi を捨てる (デフォルト: True)。
+    # False で raw pi も保持 (デバッグ/分析用途)。格納時は float16 へ変換しメモリ節約。
+    "drop_raw_pi": True,
+    # train_step の指標を events.log に行単位で書き出す頻度 (update 毎)。0/None で無効。
+    "events_log_train_every": 200,
+    # フル特徴量モデルで full_input / full_compact を欠いたサンプル (ゼロパディング対象) を学習から除外するか
+    # True: train_step でスキップ (推奨) / False: ゼロベクトルで学習に含める
+    "skip_zero_padded_full_samples": True,
 }
 
 __all__ = ["ALPHA_ZERO_CONFIG"]
