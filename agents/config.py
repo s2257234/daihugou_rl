@@ -114,7 +114,7 @@ ALPHA_ZERO_CONFIG = {
     "selfplay_worker_device": "cpu",
     # 並行学習トリガ: 新規サンプルがこの数だけ取り込まれたら学習を1バースト起動
     # 小さすぎると学習バーストが細切れになり効率低下。大きすぎると応答が遅れる
-    "concurrent_min_new_samples_before_train": 5000,
+    "concurrent_min_new_samples_before_train": 4000,
     # 学習後の最新チェックポイント保存の最短間隔(秒)。0以下で毎回保存（高I/O）
     "concurrent_latest_save_every_sec": 1200.0,
     # ワーカー配布用モデル(pt)保存の最短間隔(秒)。0以下で毎回保存
@@ -184,7 +184,7 @@ ALPHA_ZERO_CONFIG = {
     # フル特徴量モデルで full_input / full_compact を欠いたサンプル (ゼロパディング対象) を学習から除外するか
     # True: train_step でスキップ (推奨) / False: ゼロベクトルで学習に含める
     "skip_zero_padded_full_samples": True,
-    
+
     # ---------------------------
     # 重複サンプルフィルタ設定
     # ---------------------------

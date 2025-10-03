@@ -808,7 +808,7 @@ class Trainer:
         *,
         total_episodes: int,
         workers: int | None = None,
-        updates_per_iter: int = 50,
+        updates_per_iter: int = 15,
         queue_maxsize: int = 15000,
         progress_print_every: int = 50,
     ):

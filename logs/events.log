@@ -1,0 +1,67 @@
+[2025-10-03 04:39:30] [model] Rebuilt full-feature model input_dim=246
+[2025-10-03 04:39:30] [init] initial checkpoint saved
+[2025-10-03 04:40:37] [mem] rss_mb=989.38 per_sample_kb=253.22 samples=4001
+[2025-10-03 04:41:15] [snapshot] pool_size=1
+[2025-10-03 04:44:30] [status] ep_done=92 train_it=100 new_since_train=2871 replay_size=10883 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 04:49:30] [status] ep_done=144 train_it=150 new_since_train=3702 replay_size=15721 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 04:50:44] [TRAIN] step=200 loss=0.9626 pl=0.6989 vl=0.2644 ent=0.703 kl=0.4347 top1=0.699 v_acc=0.895 v_brier=0.0798 pos=0.203 samples=256
+[2025-10-03 04:54:30] [status] ep_done=193 train_it=200 new_since_train=3619 replay_size=19638 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 04:59:30] [status] ep_done=235 train_it=250 new_since_train=3159 replay_size=23178 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 05:01:58] [snapshot] pool_size=2
+[2025-10-03 05:04:30] [status] ep_done=262 train_it=300 new_since_train=1316 replay_size=25338 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 05:09:30] [status] ep_done=289 train_it=300 new_since_train=3138 replay_size=27160 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 05:14:30] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 05:19:30] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 05:24:31] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 05:29:30] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 05:34:30] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 05:39:30] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 05:44:31] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 05:44:31] [mem] rss_mb=9.77 per_sample_kb=0.36 samples=28072
+[2025-10-03 05:49:31] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 05:54:31] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 05:59:31] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 06:04:31] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 06:09:32] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 06:14:31] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 06:19:31] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 06:24:36] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 06:29:31] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 06:34:36] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 06:39:31] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 06:44:31] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 06:44:31] [mem] rss_mb=9.56 per_sample_kb=0.35 samples=28072
+[2025-10-03 06:49:31] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 06:54:35] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 06:59:34] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 07:04:31] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 07:09:31] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 07:14:32] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 07:19:37] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 07:24:32] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 07:29:32] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 07:34:32] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 07:39:32] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 07:44:32] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 07:44:32] [mem] rss_mb=9.73 per_sample_kb=0.35 samples=28072
+[2025-10-03 07:49:32] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 07:54:32] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 07:59:33] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 08:04:32] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 08:09:33] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 08:14:32] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 08:19:33] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 08:24:32] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 08:29:33] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 08:34:33] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 08:39:33] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 08:44:32] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 08:44:32] [mem] rss_mb=34.91 per_sample_kb=1.27 samples=28072
+[2025-10-03 08:49:32] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 08:54:33] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 08:59:33] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 09:04:33] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 09:09:33] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 09:14:33] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 09:19:33] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
+[2025-10-03 09:24:33] [status] ep_done=303 train_it=350 new_since_train=45 replay_size=28072 workers=10 io_sizes=events:0.0MB,ckpt:0.3MB
