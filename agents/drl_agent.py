@@ -965,12 +965,62 @@ class AlphaZeroAgent:
 
     # ---------------- Persistence ----------------
     def save_replay(self, path: Optional[str] = None):
-        """リプレイバッファを joblib で保存 (圧縮3)。"""
+        """リプレイバッファを保存し、必要ならメモリ解放(purge)。
+
+        動作:
+          - 共有リプレイ (ReplayBuffer インスタンス) の場合: ReplayBuffer.save を使用し、
+            config.purge_replay_after_save=True なら purge=True で呼ぶ。
+          - ローカル deque/list の場合: joblib.dump で直接保存し、purge 指定時は要素をクリア。
+
+        設定キー:
+          purge_replay_after_save: bool (デフォルト False)
+          trainer_only_replay_save: bool (True の場合、config.is_trainer_process が True でなければ何もしない)
+        """
         path = path or self.config.get("replay_path", "replay_buffer.joblib")
+        # --- Trainer ガード ---
+        if self.config.get('trainer_only_replay_save') and not self.config.get('is_trainer_process'):
+            return  # 非トレーナープロセス/スレッドでは保存しない
+        # purge のデフォルトは安全側(False)
+        purge = bool(self.config.get("purge_replay_after_save", False))
+        rb = getattr(self, 'replay_buffer', None)
+        # 共有 ReplayBuffer
+        if rb is not None and rb.__class__.__name__ == 'ReplayBuffer':
+            try:
+                # 新しい save API (purge 対応)
+                rb.save(path, purge=purge)
+            except TypeError:
+                # 互換: 古いバージョン (purgeパラメータ無し)
+                try:
+                    rb.save(path)
+                except Exception:
+                    joblib.dump(rb, path, compress=3)
+                if purge:
+                    try:
+                        rb.clear()
+                    except Exception:
+                        pass
+            except Exception:
+                # 最終フォールバック
+                try:
+                    joblib.dump(rb, path, compress=3)
+                except Exception:
+                    joblib.dump(rb, path)
+                if purge:
+                    try:
+                        rb.clear()
+                    except Exception:
+                        pass
+            return
+        # ローカル deque/list 格納形式
         try:
-            joblib.dump(self.replay_buffer, path, compress=3)
+            joblib.dump(rb, path, compress=3)
         except Exception:
-            joblib.dump(self.replay_buffer, path)
+            joblib.dump(rb, path)
+        if purge and hasattr(rb, 'clear'):
+            try:
+                rb.clear()
+            except Exception:
+                pass
 
     def load_replay(self, path: Optional[str] = None):
         """joblib からリプレイバッファを読み込み (無ければ空)。"""
