@@ -84,6 +84,33 @@ class ReplayBuffer:
                         pass
             self._data.clear()
 
+    # ---------------- High/Low Water Support ----------------
+    def shrink_to_size(self, target_size: int) -> int:
+        """古いサンプルから削り target_size 以下に縮小。
+
+        Returns: 削除した件数
+        """
+        if target_size < 0:
+            target_size = 0
+        removed = 0
+        with self._lock:
+            cur = len(self._data)
+            if cur <= target_size:
+                return 0
+            need = cur - target_size
+            for _ in range(need):
+                try:
+                    ev = self._data.popleft()
+                    if isinstance(ev, dict):
+                        try:
+                            ev["in_buffer"] = False
+                        except Exception:
+                            pass
+                    removed += 1
+                except Exception:
+                    break
+        return removed
+
     # ---------------- Persistence ----------------
     def save(self, path: str, purge: bool = False):
         with self._lock:
@@ -91,7 +118,40 @@ class ReplayBuffer:
 
     def _save_locked(self, path: str, purge: bool = False):
         import sys, traceback
-        allow_keys = {"player_id", "state", "pi", "value", "model_version", "feature_version", "legal_actions", "value_pred", "uid", "pi_q", "pi_format", "legal_ids", "actions_format", "value_u8", "value_pred_u8"}
+        # allow_keys から "pi" と "legal_actions" を除外し、量子化済み/ID化済みの最小構造のみを保存する。
+        # これにより再帰的な複雑構造の混入 (特に raw pi / backup legal_actions による巨大ネスト) リスクを下げる。
+        allow_keys = {
+            "player_id", "state", "value", "model_version", "feature_version", "value_pred",
+            "uid", "pi_q", "pi_format", "legal_ids", "actions_format", "value_u8", "value_pred_u8"
+        }
+
+        # 簡易ネスト深さ推定 (dict/list/tuple のみ辿る)。深すぎる場合は後でログに残す。
+        def _approx_depth(o, max_depth: int = 40):
+            stack = [(o, 1)]
+            md = 0
+            seen = set()
+            try:
+                while stack:
+                    obj, d = stack.pop()
+                    if d > md:
+                        md = d
+                    if d >= max_depth:
+                        return md, True
+                    oid = id(obj)
+                    if oid in seen:
+                        continue
+                    seen.add(oid)
+                    if isinstance(obj, dict):
+                        for v in obj.values():
+                            if isinstance(v, (dict, list, tuple)):
+                                stack.append((v, d + 1))
+                    elif isinstance(obj, (list, tuple)):
+                        for v in obj:
+                            if isinstance(v, (dict, list, tuple)):
+                                stack.append((v, d + 1))
+                return md, False
+            except Exception:
+                return md, False
 
         def _make_state_safe(st):
             if not isinstance(st, dict):
@@ -135,6 +195,7 @@ class ReplayBuffer:
             return st_safe
 
         safe_list: List[Dict[str, Any]] = []
+        deepest = (0, None)  # (depth, uid)
         for idx, s in enumerate(self._data):
             if not isinstance(s, dict):
                 continue
@@ -143,6 +204,19 @@ class ReplayBuffer:
                 st = d.get("state")
                 if st is not None:
                     d["state"] = _make_state_safe(st)
+                # ネスト深さ診断 (state 以外も含む) ※コスト低なので毎回
+                depth, clipped = _approx_depth(d)
+                if depth > deepest[0]:
+                    deepest = (depth, d.get("uid"))
+                if clipped:
+                    # 深さが閾値超え -> state を更に縮約 (full_input だけ残し他キー削減)
+                    try:
+                        st2 = d.get("state") or {}
+                        if isinstance(st2, dict):
+                            ks = {"full_input", "full_input_len", "full_input_dtype"}
+                            d["state"] = {k: v for k, v in st2.items() if k in ks}
+                    except Exception:
+                        pass
                 safe_list.append(d)
             except RecursionError as e:
                 print(f"[WARN] recursion while sanitizing sample idx={idx}: {e}")
@@ -150,6 +224,25 @@ class ReplayBuffer:
                 continue
             except Exception:
                 continue
+
+        # 追加の安全策: 異常に深い場合は最後に通知 (初回のみ表示) & 深さ>50なら shallow モード再生成
+        if deepest[0] > 50:
+            if not hasattr(self, '_warned_deep_sample'):
+                print(f"[WARN] replay save: detected deep nested sample depth={deepest[0]} uid={deepest[1]} -> shallow sanitizing")
+                self._warned_deep_sample = True
+            new_list = []
+            for d in safe_list:
+                depth, clipped = _approx_depth(d)
+                if depth > 50:
+                    try:
+                        # shallow: state を完全除去 (再学習には pi_q / value 系で十分)
+                        d2 = {k: v for k, v in d.items() if k != 'state'}
+                        new_list.append(d2)
+                    except Exception:
+                        new_list.append(d)
+                else:
+                    new_list.append(d)
+            safe_list = new_list
 
         payload = {"maxlen": self.maxlen, "next_id": self._next_id, "data": safe_list}
         orig_limit = sys.getrecursionlimit()
@@ -180,6 +273,25 @@ class ReplayBuffer:
                 joblib.dump(payload, path, compress=0)
                 return
             except RecursionError:
+                # さらに縮約: state を全削除した ultra-minimal 形式で再試行
+                try:
+                    minimal = []
+                    for d in safe_list:
+                        d2 = {k: v for k, v in d.items() if k != 'state'}
+                        minimal.append(d2)
+                    joblib.dump({"maxlen": self.maxlen, "next_id": self._next_id, "data": minimal}, path, compress=0)
+                    print(f"[WARN] ultra-minimal replay saved (state stripped) samples={len(minimal)}")
+                    if purge:
+                        for s in self._data:
+                            if isinstance(s, dict):
+                                try:
+                                    s["in_buffer"] = False
+                                except Exception:
+                                    pass
+                        self._data.clear()
+                    return
+                except Exception:
+                    pass
                 def _can_dump(sub):
                     try:
                         joblib.dump({"maxlen": self.maxlen, "next_id": self._next_id, "data": sub}, path + '.probe', compress=0)

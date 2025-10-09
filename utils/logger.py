@@ -1,4 +1,4 @@
-import os, json, csv, time
+import os, json, csv, time, atexit
 from typing import Dict, Any, Optional
 
 class TrainingLogger:
@@ -72,7 +72,26 @@ class TrainingLogger:
         self.mcts_jsonl_max_bytes = int(self.cfg.get("mcts_jsonl_max_bytes", 0) or 0)
         self._last_tb_flush_time = time.time()
         self._mcts_size_capped = False
-        # headers
+        # --- バッファリング設定 (新規) ---
+        self._buffer_enabled = bool(self.cfg.get("log_buffer_enabled", True))
+        # CSV 共通: レコード数閾値 / 時間間隔
+        self._buf_flush_interval = float(self.cfg.get("log_buffer_flush_interval_sec", 5.0) or 5.0)
+        self._buf_max_records = int(self.cfg.get("log_buffer_max_records", 64) or 64)
+        # テキスト(events.log) 用: 行数閾値 / 時間間隔
+        self._text_buf_max_lines = int(self.cfg.get("log_text_buffer_max_lines", 200) or 200)
+        self._text_buf_flush_interval = float(self.cfg.get("log_text_flush_interval_sec", 5.0) or 5.0)
+
+        # 内部バッファ
+        self._train_buf = []  # list[list]
+        self._episode_buf = []
+        self._text_buf = []  # list[str]
+        # 最終フラッシュ時刻
+        now_ts = time.time()
+        self._last_train_flush = now_ts
+        self._last_episode_flush = now_ts
+        self._last_text_flush = now_ts
+
+        # headers (既存挙動維持: ただし即時ファイル生成はバッファ有効時も保持)
         if not self.disable_csv and not self.csv_summary_only:
             if not os.path.exists(self.train_csv):
                 with open(self.train_csv, "w", newline="", encoding="utf-8") as f:
@@ -102,64 +121,16 @@ class TrainingLogger:
         # メモリスナップショット制御
         self._last_mem_log_time = 0.0
 
+        # atexit で強制 flush (プロセス終了前に残バッファを吐き出す)
+        try:
+            atexit.register(self._atexit_flush)
+        except Exception:
+            pass
+
     # ---------------- Memory snapshot ----------------
     def log_memory_snapshot(self, sample_count: int | None = None, force: bool = False):
-        """プロセス常駐メモリ(RSS)と1サンプルあたり概算サイズを events.log へ記録。
-
-        sample_count: リプレイバッファ等の総サンプル数 (呼び出し側で渡す)
-        force       : True なら間隔を無視して即記録
-
-        記録頻度は config['memory_log_interval_sec'] (デフォルト3600秒) で制御。
-        psutil が無ければ fallback で resource (Unix) / tracemalloc (概算) を試みる。
-        """
-        interval = float(self.cfg.get('memory_log_interval_sec', 3600) or 3600)
-        now = time.time()
-        if (not force) and interval > 0 and (now - self._last_mem_log_time) < interval:
-            return
-        self._last_mem_log_time = now
-        rss_mb = None
-        detail = {}
-        # psutil 優先
-        try:
-            import psutil  # type: ignore
-            p = psutil.Process()
-            rss_mb = p.memory_info().rss / (1024*1024)
-        except Exception:
-            # tracemalloc fallback (Python内ヒープのみ)
-            try:
-                import tracemalloc
-                if not tracemalloc.is_tracing():
-                    tracemalloc.start()
-                cur, peak = tracemalloc.get_traced_memory()
-                detail['tracemalloc_cur_mb'] = round(cur / (1024*1024), 3)
-                detail['tracemalloc_peak_mb'] = round(peak / (1024*1024), 3)
-            except Exception:
-                pass
-        if rss_mb is None:
-            # resource (Unix) は Windows では利用不可の場合あり -> 無視
-            try:
-                import resource  # type: ignore
-                rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                if rss_kb > 0:
-                    # macOS はバイト、Linux はKB の違いがあるため heuristics
-                    if rss_kb > 10 * 1024 * 1024:  # 10M KB 以上なら既にバイト値とみなし /1024^2
-                        rss_mb = rss_kb / (1024*1024)
-                    else:
-                        rss_mb = rss_kb / 1024  # assume KB
-            except Exception:
-                pass
-        # 1サンプルあたり概算
-        per_sample_kb = None
-        if rss_mb is not None and sample_count and sample_count > 0:
-            per_sample_kb = (rss_mb * 1024) / sample_count
-        meta_parts = [f"rss_mb={rss_mb:.2f}" if rss_mb is not None else "rss_mb=?"]
-        if per_sample_kb is not None:
-            meta_parts.append(f"per_sample_kb={per_sample_kb:.2f}")
-        if sample_count is not None:
-            meta_parts.append(f"samples={sample_count}")
-        for k,v in detail.items():
-            meta_parts.append(f"{k}={v}")
-        self.log_text("[mem] " + " ".join(meta_parts), also_print=False)
+        """(無効化) 以前は RSS / per-sample メモリをログに出力していたが要求により出力停止。"""
+        return
 
     # ---------------- Internal helpers ----------------
     def _disable_tensorboard(self, reason: str):
@@ -232,26 +203,30 @@ class TrainingLogger:
         if self.csv_summary_only:
             self._last_train_metrics = dict(metrics)
         if (not self.disable_csv) and (not self.csv_summary_only) and (self.update_step % self.csv_train_every) == 0:
-            try:
-                with open(self.train_csv, "a", newline="", encoding="utf-8") as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        self.update_step,
-                        metrics.get("policy_loss"),
-                        metrics.get("value_loss"),
-                        metrics.get("entropy"),
-                        metrics.get("loss"),
-                        metrics.get("value_acc"),
-                        metrics.get("value_brier"),
-                        metrics.get("policy_kl"),
-                        metrics.get("policy_top1_match"),
-                        metrics.get("pos_rate"),
-                        metrics.get("cum_pos_rate"),
-                        metrics.get("samples"),
-                    ])
-            except OSError as e:
-                self._mark_disk_full(e, 'train_csv')
-                return
+            row = [
+                self.update_step,
+                metrics.get("policy_loss"),
+                metrics.get("value_loss"),
+                metrics.get("entropy"),
+                metrics.get("loss"),
+                metrics.get("value_acc"),
+                metrics.get("value_brier"),
+                metrics.get("policy_kl"),
+                metrics.get("policy_top1_match"),
+                metrics.get("pos_rate"),
+                metrics.get("cum_pos_rate"),
+                metrics.get("samples"),
+            ]
+            if self._buffer_enabled:
+                self._train_buf.append(row)
+                self._maybe_flush_train()
+            else:
+                try:
+                    with open(self.train_csv, "a", newline="", encoding="utf-8") as f:
+                        csv.writer(f).writerow(row)
+                except OSError as e:
+                    self._mark_disk_full(e, 'train_csv')
+                    return
         # TensorBoard 間引き
         if self.tb and not self._disk_full and (self.update_step % self.tb_train_every) == 0:
             try:
@@ -296,23 +271,27 @@ class TrainingLogger:
         if self.csv_summary_only:
             self._last_episode_metrics = dict(metrics)
         if (not self.disable_csv) and (not self.csv_summary_only) and (self.episode_idx % self.csv_episode_every) == 0:
-            try:
-                with open(self.episode_csv, "a", newline="", encoding="utf-8") as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        self.episode_idx,
-                        metrics.get("avg_rank"),
-                        metrics.get("first_rate"),
-                        metrics.get("episode_len"),
-                        metrics.get("phase_acc"),
-                        metrics.get("phase_win_rate"),
-                        metrics.get("phase_wins"),
-                        metrics.get("phase_attempts"),
-                        metrics.get("cum_phase_win_rate"),
-                    ])
-            except OSError as e:
-                self._mark_disk_full(e, 'episode_csv')
-                return
+            row = [
+                self.episode_idx,
+                metrics.get("avg_rank"),
+                metrics.get("first_rate"),
+                metrics.get("episode_len"),
+                metrics.get("phase_acc"),
+                metrics.get("phase_win_rate"),
+                metrics.get("phase_wins"),
+                metrics.get("phase_attempts"),
+                metrics.get("cum_phase_win_rate"),
+            ]
+            if self._buffer_enabled:
+                self._episode_buf.append(row)
+                self._maybe_flush_episode()
+            else:
+                try:
+                    with open(self.episode_csv, "a", newline="", encoding="utf-8") as f:
+                        csv.writer(f).writerow(row)
+                except OSError as e:
+                    self._mark_disk_full(e, 'episode_csv')
+                    return
         if self.tb and not self._disk_full and (self.episode_idx % self.tb_ep_every) == 0:
             try:
                 for k,v in metrics.items():
@@ -357,20 +336,25 @@ class TrainingLogger:
         - also_print=True の場合は標準出力にも表示
         """
         if not self._disk_full:
-            try:
-                ts = time.strftime('%Y-%m-%d %H:%M:%S')
-                line = f"[{ts}] {text}\n"
-                path = os.path.join(self.log_dir, filename)
-                os.makedirs(self.log_dir, exist_ok=True)
-                with open(path, 'a', encoding='utf-8') as f:
-                    f.write(line)
+            ts = time.strftime('%Y-%m-%d %H:%M:%S')
+            line = f"[{ts}] {text}\n"
+            if self._buffer_enabled:
+                self._text_buf.append(line)
                 if also_print:
                     print(line.strip())
-            except OSError as e:
-                self._mark_disk_full(e, 'text')
-            except Exception:
-                # その他エラーは無視
-                pass
+                self._maybe_flush_text()
+            else:
+                try:
+                    path = os.path.join(self.log_dir, filename)
+                    os.makedirs(self.log_dir, exist_ok=True)
+                    with open(path, 'a', encoding='utf-8') as f:
+                        f.write(line)
+                    if also_print:
+                        print(line.strip())
+                except OSError as e:
+                    self._mark_disk_full(e, 'text')
+                except Exception:
+                    pass
 
         if self.tb and not self._disk_full:
             try:
@@ -394,6 +378,9 @@ class TrainingLogger:
             return
         try:
             if self._last_train_metrics:
+                # バッファ内に未flush列があれば先に出す
+                if self._buffer_enabled and self._train_buf:
+                    self._flush_train(force=True)
                 if not os.path.exists(self.train_csv):
                     with open(self.train_csv, 'w', newline='', encoding='utf-8') as f:
                         writer = csv.writer(f)
@@ -411,6 +398,8 @@ class TrainingLogger:
                         m.get("pos_rate"), m.get("cum_pos_rate"), m.get("samples")
                     ])
             if self._last_episode_metrics:
+                if self._buffer_enabled and self._episode_buf:
+                    self._flush_episode(force=True)
                 if not os.path.exists(self.episode_csv):
                     with open(self.episode_csv, 'w', newline='', encoding='utf-8') as f:
                         writer = csv.writer(f)
@@ -428,5 +417,108 @@ class TrainingLogger:
                     ])
         except Exception as e:
             print(f"[TrainingLogger] write_csv_summaries failed: {e}")
+
+    # --------------- バッファ flush 支援メソッド ---------------
+    def _maybe_flush_train(self):
+        if self._disk_full:
+            self._train_buf.clear()
+            return
+        now = time.time()
+        if (len(self._train_buf) >= self._buf_max_records) or ((now - self._last_train_flush) >= self._buf_flush_interval):
+            self._flush_train()
+
+    def _maybe_flush_episode(self):
+        if self._disk_full:
+            self._episode_buf.clear()
+            return
+        now = time.time()
+        if (len(self._episode_buf) >= self._buf_max_records) or ((now - self._last_episode_flush) >= self._buf_flush_interval):
+            self._flush_episode()
+
+    def _maybe_flush_text(self):
+        if self._disk_full:
+            self._text_buf.clear()
+            return
+        now = time.time()
+        if (len(self._text_buf) >= self._text_buf_max_lines) or ((now - self._last_text_flush) >= self._text_buf_flush_interval):
+            self._flush_text()
+
+    def _flush_train(self, force: bool = False):
+        if not self._train_buf:
+            return
+        try:
+            with open(self.train_csv, 'a', newline='', encoding='utf-8') as f:
+                w = csv.writer(f)
+                for r in self._train_buf:
+                    w.writerow(r)
+        except OSError as e:
+            self._mark_disk_full(e, 'train_csv')
+            self._train_buf.clear()
+            return
+        except Exception:
+            # 失敗時バッファを残す (再flush機会) force なら破棄
+            if force:
+                self._train_buf.clear()
+            return
+        self._train_buf.clear()
+        self._last_train_flush = time.time()
+
+    def _flush_episode(self, force: bool = False):
+        if not self._episode_buf:
+            return
+        try:
+            with open(self.episode_csv, 'a', newline='', encoding='utf-8') as f:
+                w = csv.writer(f)
+                for r in self._episode_buf:
+                    w.writerow(r)
+        except OSError as e:
+            self._mark_disk_full(e, 'episode_csv')
+            self._episode_buf.clear()
+            return
+        except Exception:
+            if force:
+                self._episode_buf.clear()
+            return
+        self._episode_buf.clear()
+        self._last_episode_flush = time.time()
+
+    def _flush_text(self, force: bool = False):
+        if not self._text_buf:
+            return
+        path = os.path.join(self.log_dir, 'events.log')
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+            with open(path, 'a', encoding='utf-8') as f:
+                f.writelines(self._text_buf)
+        except OSError as e:
+            self._mark_disk_full(e, 'text')
+            self._text_buf.clear()
+            return
+        except Exception:
+            if force:
+                self._text_buf.clear()
+            return
+        self._text_buf.clear()
+        self._last_text_flush = time.time()
+
+    def flush_buffers(self, force: bool = False):
+        """外部コール用: すべてのバッファを即時 flush."""
+        if not self._buffer_enabled:
+            return
+        self._flush_train(force=force)
+        self._flush_episode(force=force)
+        self._flush_text(force=force)
+
+    def _atexit_flush(self):  # pragma: no cover (プロセス終了パス)
+        try:
+            self.flush_buffers(force=True)
+        except Exception:
+            pass
+
+    def __del__(self):  # pragma: no cover
+        try:
+            self.flush_buffers(force=True)
+        except Exception:
+            pass
 
 __all__ = ["TrainingLogger"]

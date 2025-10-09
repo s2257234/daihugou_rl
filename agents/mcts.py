@@ -169,7 +169,16 @@ def run_puct_mcts(root_env_copy,
                   policy_value_batch_fn=None,
                   batch_eval_size: int = 1,
                   transposition_table: dict | None = None,
-                  state_key_fn = None):
+                  state_key_fn = None,
+                  determinize_fn = None,
+                  early_stop_enable: bool = False,
+                  early_stop_min_sims: int = 16,
+                  early_stop_visit_ratio: float = 0.75,
+                  early_stop_gap_ratio: float = 0.10,
+                  early_stop_log_sample_rate: float = 0.0,
+                  early_stop_post_min_batch: int | None = None,
+                  early_stop_debug: bool = False,
+                  early_stop_logger=None):
     """AlphaZero 風 PUCT MCTS 実行 (正規化 & 欠損補完対応版)。"""
     # ルート合法手
     legal_root = get_legal_actions_fn(root_env_copy)
@@ -227,6 +236,12 @@ def run_puct_mcts(root_env_copy,
         g_new.current_field = list(g.current_field)
         g_new.passed = list(g.passed)
         g_new.rankings = list(getattr(g, 'rankings', []))
+        # 行動履歴コピー (存在すれば)
+        try:
+            if hasattr(g, '_action_history'):
+                g_new._action_history = list(getattr(g, '_action_history'))
+        except Exception:
+            pass
         # 重要: rule_checker, deck は共有すると副作用が本番へ伝播するので deepcopy
         try:
             g_new.rule_checker = copy.deepcopy(g.rule_checker)
@@ -270,6 +285,16 @@ def run_puct_mcts(root_env_copy,
     # --------------------------------------
     sims_done = 0
     batch_eval_size = max(1, int(batch_eval_size or 1))
+    # 早期停止後の細粒度バッチサイズ（有効な場合）
+    post_min_batch = None
+    if early_stop_post_min_batch is not None:
+        try:
+            pm = int(early_stop_post_min_batch)
+            if pm > 1:
+                post_min_batch = pm
+        except Exception:
+            post_min_batch = None
+
     while sims_done < num_simulations:
         # 1バッチ分の葉を収集
         leaf_nodes = []
@@ -277,8 +302,18 @@ def run_puct_mcts(root_env_copy,
         leaf_keys = []
         leaf_legal = []
         virtual_counts = {}
-        for _ in range(min(batch_eval_size, num_simulations - sims_done)):
+        # min_sims を超えたらバッチサイズを縮小（より細かな early stop タイミング）
+        cur_batch_size = batch_eval_size
+        if post_min_batch and early_stop_enable and sims_done >= early_stop_min_sims:
+            cur_batch_size = min(cur_batch_size, post_min_batch)
+        for _ in range(min(cur_batch_size, num_simulations - sims_done)):
             env_copy = _fast_clone(root_env_copy)
+            # --- Imperfect information support: determinization ---
+            if determinize_fn is not None:
+                try:
+                    determinize_fn(env_copy, root_env_copy, root_player_id)
+                except Exception:
+                    pass  # フォールバックでそのまま
             node = root
             # 選択
             while node.children:
@@ -383,6 +418,44 @@ def run_puct_mcts(root_env_copy,
             node.backup(leaf_value)
 
         sims_done += len(leaf_nodes)
+
+        # ---------------- Early Stop 判定 ----------------
+        if early_stop_enable and sims_done >= max(1, early_stop_min_sims):
+            try:
+                total_visits = sum(ch.visit_count for ch in root.children.values())
+                if total_visits > 0 and root.children:
+                    # ソートして上位2
+                    vs = sorted((ch.visit_count for ch in root.children.values()), reverse=True)
+                    top = vs[0]
+                    second = vs[1] if len(vs) > 1 else 0
+                    top_ratio = top / max(1, total_visits)
+                    gap_ratio = (top - second) / max(1, total_visits)
+                    # デバッグ出力（低頻度）
+                    if early_stop_debug and early_stop_logger:
+                        import random as _rdbg
+                        if _rdbg.random() < 0.02:  # 2% サンプリング
+                            try:
+                                early_stop_logger.log_text(f"[mcts-early-stop-debug] sims={sims_done} top_ratio={top_ratio:.3f} gap={gap_ratio:.3f} batch={cur_batch_size} post_min_batch={post_min_batch}")
+                            except Exception:
+                                pass
+                    if top_ratio >= early_stop_visit_ratio and gap_ratio >= early_stop_gap_ratio:
+                        # ログ (低頻度サンプリング)
+                        if early_stop_logger and early_stop_log_sample_rate > 0.0:
+                            import random as _r
+                            if _r.random() < early_stop_log_sample_rate:
+                                try:
+                                    early_stop_logger.log_text(f"[mcts-early-stop] sims={sims_done} top_ratio={top_ratio:.3f} gap={gap_ratio:.3f} children={len(root.children)}")
+                                except Exception:
+                                    pass
+                        break
+            except Exception:
+                pass
+    # root へ実行実績メタデータを付与 (呼び出し側計測用)
+    try:
+        root._actual_simulations = sims_done  # type: ignore[attr-defined]
+        root._early_stopped = bool(sims_done < num_simulations)  # type: ignore[attr-defined]
+    except Exception:
+        pass
     return root
 
 

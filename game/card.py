@@ -85,6 +85,32 @@ class Card:
             self.joker_as_rank == other.joker_as_rank
         )
 
+    @staticmethod
+    def from_string(s: str):
+        """文字列表現から Card を生成。
+
+        期待形式:
+          - 'JOKER' (大小無視)
+          - '<suit><rank>' 例: '♠A', '♦10', '♥7'
+        rank は A,J,Q,K を 1,11,12,13 に正規化。
+        不正形式は Joker として扱わず fallback で rank=None を返す (上位ロジックで保護)。
+        """
+        if not isinstance(s, str):
+            return Card(is_joker=True)
+        u = s.upper()
+        if u.startswith('JOKER'):
+            return Card(is_joker=True)
+        if len(s) < 2:
+            return Card(is_joker=True)
+        suit = s[0]
+        rank_part = s[1:]
+        map_face = {'A':1,'J':11,'Q':12,'K':13}
+        try:
+            rank = map_face.get(rank_part.upper(), int(rank_part))
+        except Exception:
+            rank = None
+        return Card(suit=suit, rank=rank, is_joker=False if rank is not None else True)
+
 # トランプのデッキを表すクラス（ジョーカー2枚を含む）
 class CardDeck:
     

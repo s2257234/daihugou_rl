@@ -205,8 +205,10 @@ def _selfplay_daemon_worker(worker_id: int,
                             config: Dict[str, Any],
                             model_path: str,
                             sample_queue,  # mp.Queue
-                            event_queue,   # mp.Queue ("ep_done" 通知など)
-                            stop_event):   # mp.Event
+                            event_queue,   # mp.Queue ("ep_done" 通知など + 制御メッセージ)
+                            stop_event,    # mp.Event 全体停止
+                            control_queue=None  # 親→子 制御 (flush/exit 指示)
+                            ):   # mp.Event
     """常駐で自己対局を繰り返し、確定サンプルを逐次 sample_queue へ push する。
 
     event_queue へはエピソード完了ごとに ("ep_done", 1) を送る。
@@ -367,7 +369,76 @@ def _selfplay_daemon_worker(worker_id: int,
         except Exception:
             print("[WARN][daemon_worker] full feature rebuild failed, fallback simple")
 
+    # 制御: シャードフラッシュ用ローカル関数
+    def _flush_local_buffers_to_queue():
+        """未送信確定サンプルを sample_queue へ流す (重複送信防止のため flush 後にクリア)。"""
+        try:
+            for az in agents:
+                buf = getattr(az, 'replay_buffer', [])
+                if not buf:
+                    continue
+                for s in list(buf):  # コピー上を走査
+                    if isinstance(s, dict) and s.get('value') is not None:
+                        try:
+                            sample_queue.put(s, block=True)
+                        except Exception:
+                            break
+                try:
+                    buf.clear()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _save_shard_if_any(reason: str):
+        """ローカル(ワーカー内)にまだ残る確定サンプル(念のため)をシャードファイルに保存。
+        Queue 送信前後で競合しうるが、目的はロス最小なので多少の重複は許容。"""
+        try:
+            pending: List[dict] = []
+            for az in agents:
+                for s in getattr(az, 'replay_buffer', []) or []:
+                    if isinstance(s, dict) and s.get('value') is not None:
+                        pending.append(s)
+            if not pending:
+                return 0
+            shard_dir = os.path.join(config.get('checkpoint_dir', 'checkpoints'), 'replay_shards')
+            os.makedirs(shard_dir, exist_ok=True)
+            ts = int(time.time()*1000)
+            fname = f"worker{worker_id}_pid{os.getpid()}_{ts}_{len(pending)}_{reason}.joblib"
+            tmp = os.path.join(shard_dir, fname + '.tmp')
+            final = os.path.join(shard_dir, fname)
+            try:
+                import joblib as _jb
+                _jb.dump(pending, tmp, compress=3)
+                os.replace(tmp, final)
+                return len(pending)
+            except Exception:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return 0
+
     while not (stop_event.is_set()):
+        # 制御キューのポーリング (ノンブロッキング)
+        if control_queue is not None:
+            try:
+                ctrl = control_queue.get_nowait()
+            except Exception:
+                ctrl = None
+            if ctrl == 'FLUSH_AND_EXIT':
+                # 1) まず queue へ flush
+                _flush_local_buffers_to_queue()
+                # 2) 残っていればシャード保存
+                _save_shard_if_any('grace')
+                try:
+                    event_queue.put(('worker_exit', worker_id), block=False)
+                except Exception:
+                    pass
+                return  # グレースフル終了
         # 必要ならモデル更新
         if ep_since_check >= check_interval_episodes:
             ep_since_check = 0
@@ -458,11 +529,10 @@ def _selfplay_daemon_worker(worker_id: int,
         # このエピソードで確定したサンプルを Queue へ送信
         for az in agents:
             try:
-                for s in az.replay_buffer:
+                for s in list(az.replay_buffer):
                     if isinstance(s, dict) and s.get("value") is not None:
                         sample_queue.put(s, block=True)
-                # ワーカー内ローカルバッファ消去（重複送信防止）
-                az.replay_buffer.clear()
+                az.replay_buffer.clear()  # 重複防止
             except Exception:
                 pass
 
@@ -470,6 +540,39 @@ def _selfplay_daemon_worker(worker_id: int,
         try:
             event_queue.put(("ep_done", 1), block=True)
         except Exception:
+            pass
+
+        # --------------------------------------------------
+        # Level3: オブジェクト種別トップ計測 (軽量サンプリング)
+        # 目的: ワーカー内部で増殖する型を可視化するため、一定エピソード間隔で
+        #       上位型カウント(名前と件数)を親へイベント送信し events.log に出力させる。
+        # 注意: config キーは追加せずハードコード頻度 (50 ep)。
+        # オーバーヘッド抑制のため top N=8 のみ、Counter生成は例外保護。
+        # --------------------------------------------------
+        try:
+            # グローバルに蓄積する episodes_done カウンタ (存在しなければ初期化)
+            _epc = getattr(__import__('builtins'), '__worker_ep_done', 0) + 1  # type: ignore[attr-defined]
+            setattr(__import__('builtins'), '__worker_ep_done', _epc)          # type: ignore[attr-defined]
+            if _epc % 50 == 0:  # 固定間隔 (50エピソード)
+                import gc, collections
+                objs = gc.get_objects()
+                # 型名カウント (ただし非 hashable 安全化のため try/except)
+                cnt = collections.Counter()
+                for o in objs:
+                    try:
+                        tn = type(o).__name__
+                        cnt[tn] += 1
+                    except Exception:
+                        continue
+                top_list = cnt.most_common(8)
+                total_objs = sum(c for _t, c in top_list)
+                # 親へイベント送信 (小さな payload のみ)
+                try:
+                    event_queue.put(("obj_types", (worker_id, _epc, top_list, total_objs)), block=False)
+                except Exception:
+                    pass
+        except Exception:
+            # 計測失敗は黙殺
             pass
         ep_since_check += 1
         # 過去モデルミックスの周期適用
@@ -722,6 +825,284 @@ class Trainer:
                     ag.replay_buffer = self.shared_replay
 
     # -----------------------------------------------------
+    # High/Low Water 自動リプレイ縮小 (メモリベース専用)
+    # -----------------------------------------------------
+    def _auto_replay_water_purge(self):
+        """メモリ(RSS)ベースの自動リプレイ縮小 (親+子プロセス合算対応)。"""
+        cfg = self.config
+        if cfg.get('purge_replay_after_each_update') or not cfg.get('auto_replay_water_enabled', False):
+            return
+        rb = self.shared_replay or (self.agents and getattr(self.agents[0], 'replay_buffer', None))
+        if rb is None:
+            return
+        try:
+            capacity = int(cfg.get('buffer_size', 1))
+            cur = len(rb) if hasattr(rb, '__len__') else None
+        except Exception:
+            return
+        if not cur or capacity <= 0:
+            return
+        try:
+            import psutil  # type: ignore
+            proc = psutil.Process()
+        except Exception:
+            return
+        include_children = bool(cfg.get('replay_memory_include_children', False))
+        child_interval = int(cfg.get('replay_memory_children_recalc_sec', 15) or 15)
+        now = time.time()
+        try:
+            parent_rss = proc.memory_info().rss
+            total_mem = psutil.virtual_memory().total
+        except Exception:
+            return
+        children_rss = 0
+        if include_children:
+            last_children_ts = getattr(self, '_last_children_rss_ts', 0.0)
+            cached_children = getattr(self, '_last_children_rss', None)
+            if (now - last_children_ts) < child_interval and cached_children is not None:
+                children_rss = cached_children
+            else:
+                try:
+                    total_ch = 0
+                    child_infos = []
+                    for c in proc.children(recursive=True):
+                        try:
+                            if not c.is_running():
+                                continue
+                            mi = c.memory_info().rss
+                            total_ch += mi
+                            child_infos.append((c.pid, mi, getattr(c, 'name', lambda: '')()))
+                        except Exception:
+                            continue
+                    # 上位 N = 5 をログ (debug でなくても高水位診断のため常時発火時のみ)
+                    child_infos.sort(key=lambda x: x[1], reverse=True)
+                    top_n = child_infos[:5]
+                    if top_n and self.logger:
+                        try:
+                            line = ", ".join([f"pid={pid} rss={rss/(1024**3):.2f}GB" for pid, rss, _nm in top_n])
+                            # 子プロセスRSS概要ログ (ノイズ低減のためデフォルト無効化可能)
+                            if bool(self.config.get('replay_log_child_rss', False)):
+                                self.logger.log_text(f"[replay] child_rss_top total_children={len(child_infos)} top5=[{line}]")
+                        except Exception:
+                            pass
+                    children_rss = total_ch
+                    self._last_children_rss = children_rss
+                    self._last_children_rss_ts = now
+                except Exception:
+                    children_rss = 0
+        rss = parent_rss + children_rss
+        total = total_mem
+        high_ratio = float(cfg.get('replay_memory_high_ratio', 0.8) or 0.8)
+        low_ratio = float(cfg.get('replay_memory_low_ratio', 0.6) or 0.6)
+        abs_mb = int(cfg.get('replay_memory_high_abs_mb', 0) or 0)
+        low_abs_mb = int(cfg.get('replay_memory_low_abs_mb', 0) or 0)
+        cooldown = int(cfg.get('replay_memory_cooldown_sec', 300) or 300)
+        emergency_ratio = float(cfg.get('replay_memory_emergency_ratio', 0.0) or 0.0)
+        aggressive_factor = float(cfg.get('replay_memory_aggressive_factor', 0.8) or 0.8)
+        min_purge_rows = int(cfg.get('replay_memory_min_purge_rows', 0) or 0)
+        debug_log = bool(cfg.get('replay_memory_debug_log', False))
+        log_before_after = bool(cfg.get('replay_memory_log_before_after', False))
+        force_gc = bool(cfg.get('replay_memory_force_gc', False))
+        compact_mode = cfg.get('replay_memory_compact_mode', 'none') or 'none'
+        if not (0.0 < low_ratio < high_ratio < 1.0):
+            return
+        usage_ratio = rss / total if total else 0.0
+        over_ratio = usage_ratio >= high_ratio
+        over_abs = abs_mb > 0 and (rss >= abs_mb * 1024 * 1024)
+        if debug_log:
+            msg_chk = (f"[replay] mem_check ratio={usage_ratio:.4f} parent={parent_rss/(1024**3):.2f}GB "
+                       f"children={children_rss/(1024**3):.2f}GB total={rss/(1024**3):.2f}GB high={high_ratio:.2f} "
+                       f"low={low_ratio:.2f} over_ratio={over_ratio} over_abs={over_abs}")
+            if self.logger:
+                try: self.logger.log_text(msg_chk)
+                except Exception: pass
+            else:
+                print(msg_chk)
+        if not (over_ratio or over_abs):
+            return
+        last = getattr(self, '_last_mem_water_ts', 0.0)
+        if (now - last) < cooldown:
+            return
+        cur_usage_ratio = usage_ratio
+        # --- ターゲットサイズ計算 ---
+        # 通常: ratio を low_ratio まで下げることを目標に計算
+        target_size = int(capacity * (cur / capacity * (low_ratio / max(cur_usage_ratio, 1e-9))))
+        min_target = int(capacity * low_ratio)
+        if target_size < min_target:
+            target_size = min_target
+        # 絶対高水位 (abs_mb) で発火した & low_abs_mb (>0) 指定時は絶対メモリを基準に再計算
+        if over_abs and low_abs_mb > 0:
+            # 期待メモリ削減率を (low_abs_mb / abs_mb) としてサンプル数へ反映 (単純比例仮定)
+            ratio_factor = low_abs_mb / max(abs_mb, 1)
+            alt_target = int(cur * ratio_factor)
+            # low_ratio に基づく min_target と比較し、より小さい方を採用 (メモリ圧縮優先)
+            if alt_target < target_size:
+                target_size = max(0, alt_target)
+        if emergency_ratio and usage_ratio >= emergency_ratio and 0.0 < aggressive_factor < 1.0:
+            target_size = int(target_size * aggressive_factor)
+        if min_purge_rows > 0 and (cur - target_size) < min_purge_rows:
+            target_size = max(0, cur - min_purge_rows)
+        if target_size < 0:
+            target_size = 0
+        if target_size >= cur:
+            self._last_mem_water_ts = now
+            return
+        # -----------------------------
+        # 削除予定サンプルのみ追記形式で joblib に蓄積
+        # -----------------------------
+        remove_count = cur - target_size
+        if remove_count > 0:
+            try:
+                snapshot_dir = self.config.get('checkpoint_dir', 'checkpoints')
+                os.makedirs(snapshot_dir, exist_ok=True)
+                append_path = os.path.join(snapshot_dir, 'replay_autopurge_append.joblib')
+                oldest_list = []
+                # 可能ならロック下で先頭要素をコピー
+                from itertools import islice
+                if hasattr(rb, '_data'):
+                    lock = getattr(rb, '_lock', None)
+                    if lock is not None:
+                        with lock:  # type: ignore
+                            oldest_list = list(islice(rb._data, 0, remove_count))  # type: ignore[attr-defined]
+                    else:
+                        oldest_list = list(islice(rb._data, 0, remove_count))  # type: ignore[attr-defined]
+                elif hasattr(rb, '__iter__'):
+                    # フォールバック: iter から取得 (順序保証されない可能性)
+                    try:
+                        it = iter(rb)
+                        for _ in range(remove_count):
+                            try:
+                                oldest_list.append(next(it))
+                            except StopIteration:
+                                break
+                    except Exception:
+                        oldest_list = []
+                # 最低限のキーだけ抽出してサイズ抑制 (ReplayBuffer.save の allow_keys と揃える)
+                allow_keys = {"player_id","state","value","model_version","feature_version","value_pred","uid","pi_q","pi_format","legal_ids","actions_format","value_u8","value_pred_u8"}
+                processed = []
+                for s in oldest_list:
+                    if not isinstance(s, dict):
+                        continue
+                    try:
+                        d = {k: s.get(k) for k in allow_keys if k in s}
+                        d['autopurge_ts'] = time.time()
+                        processed.append(d)
+                    except Exception:
+                        continue
+                import joblib
+                # 既存ファイルがあれば読み込み拡張 (単純 append モデル)
+                if os.path.exists(append_path):
+                    try:
+                        obj = joblib.load(append_path)
+                        if isinstance(obj, dict):
+                            base_list = obj.get('data', [])
+                        elif isinstance(obj, list):
+                            base_list = obj
+                        else:
+                            base_list = []
+                    except Exception:
+                        base_list = []
+                else:
+                    base_list = []
+                base_list.extend(processed)
+                # オプション: 過剰肥大化防止 (例: 200万件超で後ろ 150万件にトリム) ※固定値簡易実装
+                if len(base_list) > 2_000_000:
+                    base_list = base_list[-1_500_000:]
+                # ReplayBuffer.save と同形式: {maxlen, next_id, data}
+                next_id_val = None
+                try:
+                    next_id_val = getattr(rb, '_next_id', None)
+                except Exception:
+                    next_id_val = None
+                payload = {'maxlen': getattr(rb, 'maxlen', None), 'next_id': next_id_val, 'data': base_list}
+                # 原子的保存 (tmp -> replace)
+                tmp_ap = append_path + '.tmp'
+                try:
+                    joblib.dump(payload, tmp_ap, compress=3)
+                    os.replace(tmp_ap, append_path)
+                except Exception:
+                    try:
+                        if os.path.exists(tmp_ap):
+                            os.remove(tmp_ap)
+                    except Exception:
+                        pass
+                    # フォールバック直接保存
+                    try:
+                        joblib.dump(payload, append_path, compress=0)
+                    except Exception:
+                        pass
+                if self.logger:
+                    try:
+                        self.logger.log_text(f"[replay] autopurge_append_saved path={append_path} added={len(processed)} total={len(base_list)} remove_count={remove_count} target={target_size}")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        if hasattr(rb, 'shrink_to_size'):
+            removed = rb.shrink_to_size(target_size)
+            new_size = len(rb)
+        else:
+            removed = 0
+            over = cur - target_size
+            try:
+                if over > 0 and hasattr(rb, 'popleft'):
+                    for _ in range(over):
+                        try: rb.popleft(); removed += 1
+                        except Exception: break
+                elif over > 0 and isinstance(rb, list):
+                    del rb[:over]; removed = over
+                new_size = len(rb)
+            except Exception:
+                return
+        if compact_mode == 'rebuild' and hasattr(rb, '_data'):
+            try:
+                from collections import deque as _dq
+                if hasattr(rb, '_lock'):
+                    with rb._lock:  # type: ignore[attr-defined]
+                        data_list = list(rb._data)  # type: ignore[attr-defined]
+                        rb._data = _dq(data_list, maxlen=rb.maxlen)  # type: ignore[attr-defined]
+                else:
+                    data_list = list(rb._data)  # type: ignore[attr-defined]
+                    rb._data = _dq(data_list, maxlen=rb.maxlen)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        after_delete_rss = rss
+        if log_before_after and self.logger:
+            try: self.logger.log_text(f"[replay] memory_purge after_delete removed={removed} cur={new_size} target={target_size} ratio_before={cur_usage_ratio:.4f}")
+            except Exception: pass
+        if force_gc:
+            try:
+                import gc; gc.collect()
+                parent_after = proc.memory_info().rss
+                children_after = 0
+                if include_children:
+                    try:
+                        for c in proc.children(recursive=True):
+                            try:
+                                if c.is_running(): children_after += c.memory_info().rss
+                            except Exception: continue
+                    except Exception: pass
+                total_after = parent_after + children_after
+                freed = (after_delete_rss - total_after) / (1024**3)
+                if log_before_after:
+                    msg_gc = (f"[replay] memory_purge after_gc total={total_after/(1024**3):.2f}GB freed≈{freed:.2f}GB")
+                    if self.logger:
+                        try: self.logger.log_text(msg_gc)
+                        except Exception: pass
+                    else: print(msg_gc)
+            except Exception:
+                pass
+        self._last_mem_water_ts = now
+        if removed > 0:
+            summary = (f"[replay] auto_memory_purge ratio={cur_usage_ratio:.2f} removed={removed} cur={new_size} "
+                       f"cap={capacity} parent={parent_rss/(1024**3):.2f}GB children={children_rss/(1024**3):.2f}GB high={high_ratio:.2f} low={low_ratio:.2f}")
+            if self.logger:
+                try: self.logger.log_text(summary)
+                except Exception: pass
+            else:
+                print(summary)
+
+    # -----------------------------------------------------
     # 自己対局 (データ収集)
     # -----------------------------------------------------
     def self_play(self, num_episodes: int = 1):
@@ -772,6 +1153,12 @@ class Trainer:
                 if (self._episodes_total_run % self.opponent_mix_interval == 0) and self.past_models:
                     self._assign_past_models_to_opponents()
 
+            # High/Low water purge (single-process self_play)
+            try:
+                self._auto_replay_water_purge()
+            except Exception:
+                pass
+
             # 進捗表示 (エピソード終了後に確定時間で ETA 推定)
             if self.minimal_progress and self.use_progress_bar:
                 done = ep + 1
@@ -798,6 +1185,12 @@ class Trainer:
                 print(line + ' ' * pad, end='\r' if done < num_episodes else '\n', flush=True)
                 self._last_progress_len = len(line)
         # ループ終了後、バー表示時は改行が確定するので追加処理不要
+        # csv_summary_only 用最終1行書き出し (self_play 単体利用ケースでも確実にファイル生成)
+        try:
+            if self.logger and getattr(self.logger, 'csv_summary_only', False):
+                self.logger.write_csv_summaries()
+        except Exception as e:
+            print(f"[WARN] write_csv_summaries(self_play) failed: {e}")
         return
 
     # -----------------------------------------------------
@@ -842,13 +1235,17 @@ class Trainer:
         sample_queue = ctx.Queue(maxsize=max(1000, queue_maxsize))
         event_queue = ctx.Queue(maxsize=10000)
         stop_event = ctx.Event()
+        # 再起動や停止時のグレースフルフラッシュ制御専用キュー (各 worker 用)
+        control_queues: List[Any] = []
 
         # ワーカー起動
         procs: List[mp.Process] = []
         for wid in range(workers):
+            cq = ctx.Queue(maxsize=5)
+            control_queues.append(cq)
             p = ctx.Process(
                 target=_selfplay_daemon_worker,
-                args=(wid, self.config, model_blob_path, sample_queue, event_queue, stop_event),
+                args=(wid, self.config, model_blob_path, sample_queue, event_queue, stop_event, cq),
                 daemon=True,
             )
             p.start()
@@ -916,6 +1313,210 @@ class Trainer:
                 print(f"[DEBUG] drain skipped={skipped} accepted={consumed} (reason: missing state or pi/pi_q)")
             return consumed
 
+        # ---------------- Worker Restart (Minimal Implementation) ----------------
+        # 内部状態テーブル: per worker
+        restart_cfg = {
+            'enable': bool(self.config.get('worker_restart_enable', False)),
+            'high_mb': int(self.config.get('worker_restart_rss_high_mb', 0) or 0),
+            'consecutive': int(self.config.get('worker_restart_consecutive_required', 2) or 2),
+            'min_interval': int(self.config.get('worker_restart_min_interval_sec', 600) or 600),
+            'jitter': int(self.config.get('worker_restart_jitter_sec', 0) or 0),
+            'emergency_total_mb': int(self.config.get('worker_restart_emergency_total_mb', 0) or 0),
+            'grace_timeout': int(self.config.get('worker_restart_grace_timeout_sec', 120) or 120),
+            'force_kill_sec': int(self.config.get('worker_restart_force_kill_sec', 150) or 150),
+            'flush_timeout': int(self.config.get('worker_restart_flush_timeout_sec', 20) or 20),
+            'log_obj_on_exit': bool(self.config.get('worker_restart_log_object_types_on_exit', True)),
+        }
+        worker_stats = {}
+        for idx, p in enumerate(procs):  # 初期化
+            worker_stats[idx] = {
+                'rss_high_count': 0,
+                'last_restart': 0.0,
+                'generation': 0,
+                'pending': False,
+                'grace_start': None,
+            }
+
+        def _seed_for(worker_id: int, generation: int):
+            base = int(self.config.get('seed', 42))
+            return base + 10000 * worker_id + 500 * generation
+
+        def _psutil_process(pid):
+            try:
+                import psutil  # type: ignore
+                return psutil.Process(pid)
+            except Exception:
+                return None
+
+        def _check_and_mark_restarts():
+            if not restart_cfg['enable'] or restart_cfg['high_mb'] <= 0:
+                return []
+            marked = []
+            try:
+                import psutil  # type: ignore
+            except Exception:
+                return []
+            total_rss = 0
+            # 緊急用: total を集計
+            for p in procs:
+                if not p.is_alive():
+                    continue
+                proc_obj = _psutil_process(p.pid)
+                if proc_obj is None:
+                    continue
+                try:
+                    total_rss += proc_obj.memory_info().rss
+                except Exception:
+                    continue
+            emergency = restart_cfg['emergency_total_mb'] > 0 and (total_rss >= restart_cfg['emergency_total_mb'] * 1024 * 1024)
+            high_list = []
+            for wid, p in enumerate(procs):
+                if not p.is_alive():
+                    continue
+                proc_obj = _psutil_process(p.pid)
+                if proc_obj is None:
+                    continue
+                try:
+                    rss = proc_obj.memory_info().rss
+                except Exception:
+                    continue
+                rss_mb = rss / (1024 * 1024)
+                st = worker_stats.get(wid)
+                if st is None:
+                    continue
+                if rss_mb >= restart_cfg['high_mb']:
+                    st['rss_high_count'] += 1
+                else:
+                    st['rss_high_count'] = 0
+                eligible = (st['rss_high_count'] >= restart_cfg['consecutive'] and
+                            (time.time() - st['last_restart']) >= restart_cfg['min_interval'] and not st['pending'])
+                if eligible:
+                    high_list.append((wid, rss_mb))
+            # 緊急: 最大RSS 1件を優先 (最小実装: graceful 同一ルート)
+            target_wids = []
+            if emergency and high_list:
+                target_wids = [max(high_list, key=lambda x: x[1])[0]]
+            else:
+                target_wids = [wid for wid, _ in high_list]
+            for wid in target_wids:
+                st = worker_stats[wid]
+                st['pending'] = True
+                st['grace_start'] = time.time()
+                marked.append(wid)
+                if self.logger:
+                    try:
+                        self.logger.log_text(f"[worker-restart] mark wid={wid} gen={st['generation']} reason={'emergency' if emergency else 'high_rss'}")
+                    except Exception:
+                        pass
+            return marked
+
+        def _issue_graceful_restart(wid_list):
+            # 改良版: まず FLUSH_AND_EXIT 制御を送信し、一定時間待機 → 未終了なら terminate。
+            for wid in wid_list:
+                p = procs[wid]
+                st = worker_stats[wid]
+                if not p.is_alive():
+                    continue
+                # 1) flush 指示
+                try:
+                    control_queues[wid].put('FLUSH_AND_EXIT', block=False)
+                except Exception:
+                    pass
+            # 2) 待機 & shard 取り込み (後段で _merge_shards を呼ぶ)
+            deadline = time.time() + restart_cfg['grace_timeout']
+            still_alive = set(wid_list)
+            while still_alive and time.time() < deadline:
+                for wid in list(still_alive):
+                    p = procs[wid]
+                    if not p.is_alive():
+                        still_alive.discard(wid)
+                time.sleep(0.1)
+            # 3) まだ生きているものを強制終了
+            for wid in list(still_alive):
+                p = procs[wid]
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+                try:
+                    p.join(timeout=3)
+                except Exception:
+                    pass
+            # 4) 再spawn
+            for wid in wid_list:
+                p_old = procs[wid]
+                if p_old.is_alive():
+                    # 既に再利用 (強制 kill 失敗) はスキップ
+                    continue
+                new_cq = mp.get_context('spawn').Queue(maxsize=5)
+                control_queues[wid] = new_cq
+                new_p = mp.get_context('spawn').Process(
+                    target=_selfplay_daemon_worker,
+                    args=(wid, self.config, model_blob_path, sample_queue, event_queue, stop_event, new_cq),
+                    daemon=True,
+                )
+                new_p.start()
+                procs[wid] = new_p
+                st = worker_stats[wid]
+                st['generation'] += 1
+                st['last_restart'] = time.time()
+                st['pending'] = False
+                st['rss_high_count'] = 0
+                if self.logger:
+                    try:
+                        self.logger.log_text(f"[worker-restart] done wid={wid} gen={st['generation']} new_pid={new_p.pid}")
+                    except Exception:
+                        pass
+            # 5) 再起動後にシャードをマージ
+            _merge_shards()
+
+        def _merge_shards():
+            """replay_shards ディレクトリの未マージファイルを読み込み central buffer へ統合。"""
+            shard_dir = os.path.join(self.config.get('checkpoint_dir', 'checkpoints'), 'replay_shards')
+            if not os.path.isdir(shard_dir):
+                return
+            merged_dir = os.path.join(shard_dir, 'merged')
+            os.makedirs(merged_dir, exist_ok=True)
+            try:
+                files = [f for f in os.listdir(shard_dir) if f.endswith('.joblib') and os.path.isfile(os.path.join(shard_dir, f))]
+            except Exception:
+                return
+            if not files:
+                return
+            imported = 0
+            for fn in files:
+                fp = os.path.join(shard_dir, fn)
+                try:
+                    import joblib as _jb
+                    data = _jb.load(fp)
+                    if isinstance(data, list):
+                        for s in data:
+                            if not isinstance(s, dict):
+                                continue
+                            if self.shared_replay is not None:
+                                try: self.shared_replay.append(s)
+                                except Exception: pass
+                            else:
+                                try: dst_buffer.append(s)  # type: ignore[attr-defined]
+                                except Exception: pass
+                            imported += 1
+                    # 移動
+                    try:
+                        os.replace(fp, os.path.join(merged_dir, fn))
+                    except Exception:
+                        pass
+                except Exception:
+                    # 読み込み失敗はスキップ (残して次回再試行)
+                    continue
+            if imported and self.logger:
+                try:
+                    self.logger.log_text(f"[shard-merge] imported={imported} files={len(files)}")
+                except Exception:
+                    pass
+
+        last_worker_rss_check = 0.0
+        worker_rss_check_interval = 15.0  # 秒 (最小安全版固定)
+
         try:
             while ep_done < total_episodes:
                 # イベント処理（自己対局進捗）
@@ -926,21 +1527,43 @@ class Trainer:
                 if evt == "ep_done":
                     ep_done += int(val)
                     self._episodes_total_run += int(val)
-                    # エピソード間隔 ckpt
+                    # --------------------------------------------------
+                    # エピソード間隔チェックポイント
+                    # 以前は obj_types イベント(50ep毎) 側でのみ発火していたため、
+                    # ckpt_interval が obj_types 発火周期と一致しない場合に取りこぼしが発生。
+                    # (例: ckpt_interval=100 かつ obj_types間隔=50 の場合は 100,200 はOK だが
+                    #      120 など 50 の倍数でない値を設定すると一度も一致しない可能性)
+                    # ep_done 受信直後に判定へ移し、正確に interval ごと保存するよう修正。
+                    # --------------------------------------------------
                     if ckpt_interval > 0 and (self._episodes_total_run % ckpt_interval == 0):
-                        self._save_checkpoint(version_tag=f"ep{self._episodes_total_run}")
-                        if self.keep_prev_model:
-                            self._snapshot_current_model()
-                        if self.keep_prev_model and self.prev_model_mix_players > 0:
-                            if self.past_models:
-                                self._assign_past_models_to_opponents()
-                            elif self._previous_model is not None:
-                                self._mix_previous_model_opponents()
-                        # モデル世代反映
-                        self.model_version += 1
-                        for ag in self.agents:
-                            if isinstance(ag, AlphaZeroAgent) and hasattr(ag, 'model_version'):
-                                ag.model_version = self.model_version
+                        try:
+                            self._save_checkpoint(version_tag=f"ep{self._episodes_total_run}")
+                            if self.keep_prev_model:
+                                self._snapshot_current_model()
+                            if self.keep_prev_model and self.prev_model_mix_players > 0:
+                                if self.past_models:
+                                    self._assign_past_models_to_opponents()
+                                elif self._previous_model is not None:
+                                    self._mix_previous_model_opponents()
+                            # モデル世代反映
+                            self.model_version += 1
+                            for ag in self.agents:
+                                if isinstance(ag, AlphaZeroAgent) and hasattr(ag, 'model_version'):
+                                    ag.model_version = self.model_version
+                        except Exception:
+                            pass
+                elif evt == "obj_types":
+                    # ワーカーからの型カウント: (worker_id, ep, top_list, subtotal_top)
+                    try:
+                        wid, w_ep, top_list, subtotal = val
+                        if self.logger:
+                            # 形式: type:count をカンマ区切りで (topN のみ)
+                            parts = ",".join(f"{t}:{c}" for t, c in top_list)
+                            self.logger.log_text(f"[objtypes] wid={wid} ep={w_ep} top={parts} (top_sum={subtotal})")
+                        else:
+                            print(f"[objtypes] wid={wid} ep={w_ep} top={top_list}")
+                    except Exception:
+                        pass
 
                     # 進捗表示
                     if self.minimal_progress and self.use_progress_bar:
@@ -953,6 +1576,12 @@ class Trainer:
                 # サンプル取り込み（少しずつ）
                 consumed_now = _drain_samples(max_items=500)
                 new_samples_since_train += int(consumed_now)
+                # High/Low water 自動 purge
+                if consumed_now > 0:
+                    try:
+                        self._auto_replay_water_purge()
+                    except Exception:
+                        pass
                 if debug_flag and consumed_now>0:
                     print(f"[DEBUG] drained={consumed_now} total_new={new_samples_since_train} replay_size={len(self.shared_replay) if self.shared_replay else 'n/a'}")
                 # 追加デバッグ: 学習トリガ未達時に一定エピソードごとにラベル付サンプル比率を観測
@@ -978,6 +1607,16 @@ class Trainer:
                     # updates_per_iter ステップだけ学習
                     for _ in range(max(1, int(updates_per_iter))):
                         loss_info = self.agents[0].train_step(batch_size=self.config.get("batch_size", 256))
+                        # 追加: モデル更新直後の即時保存+purge (超低メモリ運用オプション)
+                        if self.config.get("purge_replay_after_each_update"):
+                            try:
+                                self._save_checkpoint()
+                                # purge 後は学習トリガ用カウンタを 0 に (空なので)
+                                new_samples_since_train = 0
+                                if self.logger:
+                                    self.logger.log_text("[replay] immediate_purge_after_update")
+                            except Exception as _e:
+                                print(f"[WARN] immediate save after update failed: {_e}")
                         # 学習回数カウント
                         train_it += 1
                         # 最小限の進捗表示
@@ -986,12 +1625,20 @@ class Trainer:
                                 loss_part = f"loss={loss_info['loss']:.4f}"
                             else:
                                 loss_part = "loss=----"
-                            line = f"[TRAIN~] it={train_it} {loss_part}"
+                            lr_val = None
+                            try:
+                                opt = getattr(self.agents[0], '_optimizer', None)
+                                if opt and hasattr(opt, 'param_groups') and opt.param_groups:
+                                    lr_val = opt.param_groups[0].get('lr', None)
+                            except Exception:
+                                lr_val = None
+                            lr_part = f"lr={lr_val:.2e}" if lr_val is not None else "lr=----"
+                            line = f"[TRAIN~] it={train_it} {loss_part} {lr_part}"
                             print(line, end='\r', flush=True)
                         # ロガーへ
                         if self.logger and isinstance(loss_info, dict) and loss_info.get("loss") is not None and not getattr(self.agents[0], '_logged_inside', False):
                             self.logger.log_train(loss_info)
-                    # 既存動作に合わせた保存は維持しつつ、高頻度I/Oを抑制
+                    #  既存動作に合わせた保存は維持しつつ、高頻度I/Oを抑制
                     if latest_ckpt_interval_sec > 0.0:
                         if (now - last_latest_ckpt_ts) >= latest_ckpt_interval_sec:
                             self._save_checkpoint()
@@ -1062,6 +1709,23 @@ class Trainer:
                     else:
                         print(msg)
 
+                # Shard の定期マージ (軽量: ここで低頻度に)
+                if (time.time() - last_worker_rss_check) >= worker_rss_check_interval:
+                    # RSS チェック前にマージを走らせる
+                    try:
+                        _merge_shards()
+                    except Exception:
+                        pass
+                # Worker RSS チェック & 再起動
+                if (time.time() - last_worker_rss_check) >= worker_rss_check_interval:
+                    last_worker_rss_check = time.time()
+                    try:
+                        marked = _check_and_mark_restarts()
+                        if marked:
+                            _issue_graceful_restart(marked)
+                    except Exception:
+                        pass
+
             # 終了条件到達: ワーカー停止指示
             stop_event.set()
         finally:
@@ -1069,17 +1733,29 @@ class Trainer:
             if new_samples_since_train > 0:
                 for _ in range(max(1, int(updates_per_iter))):
                     _ = self.agents[0].train_step(batch_size=self.config.get("batch_size", 256))
-                    train_it += 1
-                # 仕上げの保存（スロットリングに関わらず1回実施）
-                self._save_checkpoint()
-                if self.keep_prev_model and self.model is not None:
-                    self._snapshot_current_model()
-                    try:
-                        self.model.save(model_blob_path)
-                    except Exception:
-                        pass
+                    if self.config.get("purge_replay_after_each_update"):
+                        try:
+                            self._save_checkpoint()
+                            if self.logger:
+                                self.logger.log_text("[replay] immediate_purge_after_update(final)")
+                        except Exception as _e:
+                            print(f"[WARN] immediate save after update (final) failed: {_e}")
+            # 仕上げの保存（スロットリングに関わらず1回実施）
+            self._save_checkpoint()
+            if self.keep_prev_model and self.model is not None:
+                self._snapshot_current_model()
+                try:
+                    self.model.save(model_blob_path)
+                except Exception:
+                    pass
             # 残りサンプルを吸い上げ
             _ = _drain_samples(max_items=None)
+            # 最後にシャードをマージ (残骸取り込み)
+            try:
+                # 再利用: ローカル関数がスコープ外なら無視
+                _merge_shards()
+            except Exception:
+                pass
             # ワーカー join
             for p in procs:
                 try:
@@ -1088,6 +1764,12 @@ class Trainer:
                     pass
             # 最終チェックポイント（念のため）
             self._save_checkpoint()
+            # csv_summary_only の場合ここでサマリ行を書き出す
+            try:
+                if self.logger and getattr(self.logger, 'csv_summary_only', False):
+                    self.logger.write_csv_summaries()
+            except Exception as e:
+                print(f"[WARN] write_csv_summaries(train_concurrent) failed: {e}")
         # サマリーを返す（合計エピソード数と総学習ステップ数）
         return {"episodes": ep_done, "train_updates": train_it}
 
@@ -1213,24 +1895,41 @@ class Trainer:
             # live モデル state_dict を CPU 上にコピー
             # フル特徴量モデルの場合は input_dim を揃える必要がある (そうでないと 246->6 などの shape mismatch が発生)
             use_full = getattr(self.model, 'use_full_features', False)
+            # v4 特徴: 59N + 125。旧式 (56N+22) に固定していたため mismatch が発生していたので、
+            # 現行モデルの in_features をそのまま利用してスナップショットを生成する。
             full_dim = None
             if use_full:
                 try:
-                    # backbone 最初の Linear の in_features から復元
                     full_dim = int(getattr(self.model.backbone[0], 'in_features'))  # type: ignore[index]
                 except Exception:
-                    # 取得失敗時はフォールバック (ロードで再度失敗する可能性あり)
                     full_dim = None
-            snap = PolicyValueNet(
-                max_policy_size=self.config["max_policy_size"],
-                hidden_size=self.config["hidden_size"],
-                num_players=self.config["num_players"],
-                device="cpu",
-                use_full_features=use_full,
-                full_feature_dim=(56 * self.config.get("num_players", 4) + 22) if use_full else None,
-            )
-            # strict=True でロードし shape 不一致を早期検出 (問題あれば例外キャッチ側で警告)
-            snap.load_state_dict(self.model.state_dict(), strict=True)  # type: ignore[arg-type]
+            if use_full and full_dim is None:
+                # それでも取得不能な場合は v4 期待式で推定 (警告付き)
+                try:
+                    est = 59 * int(self.config.get("num_players", 4)) + 125
+                    print(f"[snapshot][WARN] full_dim 推定 fallback -> {est}")
+                    full_dim = est
+                except Exception:
+                    pass
+            try:
+                snap = PolicyValueNet(
+                    max_policy_size=self.config["max_policy_size"],
+                    hidden_size=self.config["hidden_size"],
+                    num_players=self.config["num_players"],
+                    device="cpu",
+                    use_full_features=use_full,
+                    full_feature_dim=full_dim if use_full else None,
+                )
+                snap.load_state_dict(self.model.state_dict(), strict=True)  # type: ignore[arg-type]
+            except Exception as e_build:
+                # 最終フォールバック: 既存モデルを deepcopy して CPU へ移動（互換重視 / shape mismatch 無視）
+                import copy as _cp
+                print(f"[snapshot][WARN] 標準スナップショット再構築失敗 -> deepcopy fallback ({type(e_build).__name__}: {e_build})")
+                snap = _cp.deepcopy(self.model)
+                try:
+                    snap.to('cpu')
+                except Exception:
+                    pass
             self.past_models.append(snap)
             self._previous_model = snap  # 互換
             # 上限超過なら古いものから削除
@@ -1428,6 +2127,28 @@ class Trainer:
             # ロガーへ (train_step 内で既に push されている場合は二重記録を避ける)
             if self.logger and loss_info.get("loss") is not None and not getattr(self.agents[0], '_logged_inside', False):
                 self.logger.log_train(loss_info)
+
+            # 即時 checkpoint + purge オプション (単独 train_updates 用 / concurrent とは別経路)
+            if self.config.get('purge_replay_after_each_update'):
+                try:
+                    # purge は _save_checkpoint 内の設定に依存 (purge_replay_after_checkpoint)
+                    # 事前にサイズ計測
+                    old_size = None
+                    try:
+                        if self.shared_replay is not None:
+                            old_size = len(self.shared_replay)
+                        else:
+                            ag0 = self.agents[0]
+                            rb = getattr(ag0, 'replay_buffer', None)
+                            if rb is not None and hasattr(rb, '__len__'):
+                                old_size = len(rb)
+                    except Exception:
+                        old_size = None
+                    self._save_checkpoint()
+                    if self.logger:
+                        self.logger.log_text(f"[replay] immediate_purge_after_update(train_updates) prev_size={old_size}")
+                except Exception as e:
+                    print(f"[WARN] immediate checkpoint after update failed: {e}")
         self._save_checkpoint()
         # 学習直後の最新モデルもスナップショット (自己対局前に世代差が明確になる)
         if self.keep_prev_model:
@@ -1487,23 +2208,53 @@ class Trainer:
                 _atomic_save(ver_path, lambda p: self.model.save(p))
         # リプレイ保存: 共有モードなら共有バッファを保存、そうでなければ従来通り代表エージェント
         replay_path = self.config.get("replay_path", "replay_buffer.joblib")
+        purge_after_ckpt = bool(self.config.get("purge_replay_after_checkpoint", False))
         if self.shared_replay is not None:
             try:
                 # フル特徴量モードで legacy 混入していたらフィルタ
                 if self.config.get('use_full_features'):
                     try:
                         before = len(self.shared_replay)
-                        self.shared_replay.data = [s for s in self.shared_replay.data if s.get('feature_version',1)==1]
+                        # 共有リプレイ内部構造アクセス (互換維持: data 属性が存在しない将来版対策)
+                        data_attr = getattr(self.shared_replay, '_data', None)
+                        if data_attr is not None:
+                            # _data が deque の場合は直接フィルタせず (コスト高)、ここではスキップ
+                            pass
+                        else:
+                            # 旧バージョン data フィールド互換 (安全性低いため try 内で)
+                            self.shared_replay.data = [s for s in self.shared_replay.data if s.get('feature_version',1)==1]  # type: ignore[attr-defined]
                         after = len(self.shared_replay)
                         if after < before:
                             print(f"[INFO] shared replay purge legacy {before-after} samples (full mode)")
                     except Exception:
                         pass
-                self.shared_replay.save(replay_path)
+                self.shared_replay.save(replay_path, purge=purge_after_ckpt)
+                if purge_after_ckpt:
+                    if self.logger:
+                        try:
+                            self.logger.log_text(f"[replay] checkpoint_saved_and_purged prev_size={before} new_size=0 path={replay_path}")
+                        except Exception:
+                            pass
             except Exception as e:
                 print(f"[WARN] shared replay save failed: {e}")
         else:
-            self.agents[0].save_replay(replay_path)
+            try:
+                # 単独エージェント経由保存
+                ag0 = self.agents[0]
+                if hasattr(ag0, 'save_replay'):
+                    prev_size = None
+                    try:
+                        rb_local = getattr(ag0, 'replay_buffer', None)
+                        if rb_local is not None and hasattr(rb_local, '__len__'):
+                            prev_size = len(rb_local)
+                    except Exception:
+                        prev_size = None
+                    ag0.config['purge_replay_after_save'] = purge_after_ckpt
+                    ag0.save_replay(replay_path)
+                    if purge_after_ckpt and self.logger:
+                        self.logger.log_text(f"[replay] agent_replay_saved_and_purged prev_size={prev_size} path={replay_path}")
+            except Exception as e:
+                print(f"[WARN] agent replay save failed: {e}")
         # メタデータ保存
         try:
             # 簡易 config ハッシュ

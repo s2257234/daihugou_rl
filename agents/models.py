@@ -8,11 +8,24 @@
 ====================================
 1. 入力特徴 (full_input のみ / 簡易入力廃止)
     - 形式: 1 次元ベクトル (float32) 長さ full_feature_dim
-    - 推奨レイアウト (56 * N + 22)  ※ N = プレイヤー数
-         * 各プレイヤー i (0..N-1): 53 カード所持ビット + 1 pass ビット + 1 remain_norm = 55
-         * フィールドブロック: 1 revolution + 7 combo type + 13 rank one-hot + 1 field_size_norm = 22
-         * ターン one-hot: N (→ 合計 55N + 22 + N = 56N + 22)
-    - 生成は agents.drl_agent._extract_state で行い、full_input_dim を常に期待値に揃える。
+    - 最新レイアウト v4 (v3 + FieldCards + PlayHistory) : 59N + 125
+        * Self 55
+        * OppSummary 5(N-1)
+        * Field 22
+        * FieldCards 53
+        * PlayHistory 53
+        * Belief 53(N-1)
+        * Turn N
+        合計: (55 + 22 + 53 + 53) + 58(N-1) + N = 59N + 125
+    - 直前レイアウト v3 (部分観測 + belief, rank4) : 59N + 19
+        * Self: 53 card bits + pass + remain = 55
+        * OppSummary: (remain + rank4 one-hot) * (N-1) = 5(N-1)
+        * Field: 1 revolution + 7 combo + 13 rank base + 1 field_size_norm = 22
+        * Belief: 53 * (N-1)
+        * Turn: N  → 合計 59N + 19
+    - 旧レイアウト v2 (rank5) : 60N + 18 （互換読み込みのみ。新規生成しない）
+    - さらに旧フル情報 v1 : 56N + 22 （全プレイヤー手札ビットを含む完全情報）
+    - 生成は `agents.drl_agent._extract_state` が行い、full_input_dim を常に期待値に揃える。
 
 2. 圧縮形式 (full_compact / cfv1)
     - 辞書キー: {'packed_bits','floats','binary_len','num_players','format','full_input_dim'}
@@ -97,11 +110,11 @@ class PolicyValueNet(nn.Module):
             nn.ReLU(),
         )
         self.policy_head = nn.Linear(h, max_policy_size)
+        # value_head: ロジット出力 (Sigmoid は呼び出し側で適用 / BCEWithLogitsLoss 用)
         self.value_head = nn.Sequential(
             nn.Linear(h, h),
             nn.ReLU(),
             nn.Linear(h, num_players),
-            nn.Sigmoid(),
         )
         self.to(self.device)
 
@@ -211,6 +224,21 @@ class PolicyValueNet(nn.Module):
             "full_feature_dim": int(input_dim) if input_dim else None,
             "model_format_version": 3,
         }
+        # 非同期 I/O 設定が利用可能ならオフロード
+        try:
+            from agents.config import ALPHA_ZERO_CONFIG as _CFG
+        except Exception:
+            _CFG = {}
+        enable_async = bool(_CFG.get("enable_async_io", False))
+        if enable_async:
+            try:
+                from utils.async_io import get_async_io
+                aio = get_async_io(_CFG)
+                if aio:
+                    aio.enqueue_torch_save(ckpt, path)
+                    return
+            except Exception:
+                pass
         torch.save(ckpt, path)
 
     @staticmethod
@@ -247,6 +275,14 @@ class PolicyValueNet(nn.Module):
         model = PolicyValueNet(max_policy_size=max_policy_size, hidden_size=hidden_size,
                                num_players=num_players, use_full_features=True, full_feature_dim=int(full_dim))
         model.load_state_dict(state_dict)
+        # map_location を指定していた場合はモデル本体をそのデバイスへ移動し device 属性を同期
+        if map_location:
+            try:
+                dev = torch.device(map_location)
+                model.to(dev)
+                model.device = dev  # type: ignore[attr-defined]
+            except Exception:
+                pass
         return model
 
 

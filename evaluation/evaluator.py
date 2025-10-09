@@ -72,20 +72,36 @@ class Evaluator:
                 self.tb_writer = SummaryWriter(log_dir=os.path.join(elo_dir, "tb_eval"))
             except Exception as e:
                 print(f"[WARN] TensorBoard writer init failed: {e}")
-        # モデル読み込み
-        self.model = PolicyValueNet(
-            max_policy_size=self.config["max_policy_size"],
-            hidden_size=self.config["hidden_size"],
-            num_players=self.config["num_players"],
-            device=self.device,
-        )
+        # モデル読み込み (full_feature_dim 必須化に対応)
+        # 優先: 既存 ckpt から load (full_feature_dim を内部推定)
         if os.path.exists(self.checkpoint_path):
             try:
-                self.model.load(self.checkpoint_path)
+                self.model = PolicyValueNet.load(self.checkpoint_path, map_location=self.device)
+                # map_location で device に乗らないケース (cpu→cuda) を補正
+                try:
+                    self.model.to(self.device)  # type: ignore[arg-type]
+                except Exception:
+                    pass
             except Exception as e:
-                print(f"[WARN] checkpoint load failed: {e}")
+                print(f"[WARN] checkpoint load failed ({e}) -> fallback new model")
+                full_dim = 56 * self.config["num_players"] + 22
+                self.model = PolicyValueNet(
+                    max_policy_size=self.config["max_policy_size"],
+                    hidden_size=self.config["hidden_size"],
+                    num_players=self.config["num_players"],
+                    device=self.device,
+                    full_feature_dim=full_dim,
+                )
         else:
             print(f"[WARN] checkpoint not found: {self.checkpoint_path}. Using random initialized model.")
+            full_dim = 56 * self.config["num_players"] + 22
+            self.model = PolicyValueNet(
+                max_policy_size=self.config["max_policy_size"],
+                hidden_size=self.config["hidden_size"],
+                num_players=self.config["num_players"],
+                device=self.device,
+                full_feature_dim=full_dim,
+            )
         # 評価用 AlphaZeroAgent (player_id=0 固定)
         self.eval_agent = AlphaZeroAgent(player_id=0, model=self.model, config=self.config)
         # ここでプレイヤー順序を確定 (P0=評価対象)

@@ -458,10 +458,31 @@ class DaifugoSimpleEnv:
     def _encode_card(self, card):
         if card is None:
             return -1 # 場が空の場合は -1
-        if card.is_joker:
-            return 53 # ジョーカーは 53 としてエンコード
-        suit_map = {'♠': 0, '♥': 1, '♦': 2, '♣': 3}
-        return suit_map[card.suit] * 13 + (card.rank - 1)
+        try:
+            # Card オブジェクト想定
+            if getattr(card, 'is_joker', False):
+                return 53
+            suit_map = {'♠': 0, '♥': 1, '♦': 2, '♣': 3}
+            s = getattr(card, 'suit', None)
+            r = getattr(card, 'rank', None)
+            if s in suit_map and isinstance(r, int):
+                return suit_map[s] * 13 + (r - 1)
+        except Exception:
+            pass
+        # 文字列 fallback: 例 '♦7'
+        try:
+            if isinstance(card, str):
+                if card.lower() == 'joker':
+                    return 53
+                suit = card[0]
+                rank_part = card[1:]
+                suit_map = {'♠': 0, '♥': 1, '♦': 2, '♣': 3}
+                if suit in suit_map:
+                    rank = int(rank_part)
+                    return suit_map[suit] * 13 + (rank - 1)
+        except Exception:
+            pass
+        return -1  # 不明形式
 
     def _get_obs(self):
         player = self.game.players[self.game.turn]  # 現在のプレイヤー

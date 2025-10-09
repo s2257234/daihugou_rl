@@ -829,6 +829,3 @@
 [2025-10-09 18:12:07] [status] ep_done=2842 train_it=4050 new_since_train=1111 replay_size=8018 workers=10 io_sizes=events:0.1MB,ckpt:0.4MB
 [2025-10-09 18:17:07] [status] ep_done=2847 train_it=4050 new_since_train=1283 replay_size=8190 workers=10 io_sizes=events:0.1MB,ckpt:0.4MB
 [2025-10-09 18:22:07] [status] ep_done=2849 train_it=4050 new_since_train=1370 replay_size=8277 workers=10 io_sizes=events:0.1MB,ckpt:0.4MB
-[2025-10-09 18:27:07] [status] ep_done=2849 train_it=4050 new_since_train=1370 replay_size=8277 workers=10 io_sizes=events:0.1MB,ckpt:0.4MB
-[2025-10-09 18:32:07] [status] ep_done=2852 train_it=4050 new_since_train=1563 replay_size=8470 workers=10 io_sizes=events:0.1MB,ckpt:0.4MB
-[2025-10-09 18:37:07] [status] ep_done=2853 train_it=4050 new_since_train=1623 replay_size=8530 workers=10 io_sizes=events:0.1MB,ckpt:0.4MB

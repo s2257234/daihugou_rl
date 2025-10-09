@@ -152,6 +152,29 @@ class AlphaZeroAgent:
             self._dup_kept = 0
             self._dup_last_log = 0
 
+        # 行動履歴 (determinization 制約用): list of dict {pid, action, field_before, revo}
+        self._action_history: List[Dict[str, Any]] = []
+
+        # ---- 並列 determinization プール関連 (lazy init) ----
+        self._det_pool = None            # deque of determinization assignments
+        self._det_pool_lock = None       # threading.Lock
+        self._det_pool_thread = None     # worker thread
+        self._det_stop_event = None      # threading.Event
+        self._det_cfg = {
+            'capacity': int(self.config.get('det_pool_capacity', 128)),
+            'refill_ratio': float(self.config.get('det_pool_refill_threshold', 0.3)),
+            'workers': int(self.config.get('det_workers', 1)),  # 未来拡張 (現状 1 のみ)
+            'sampling': str(self.config.get('det_pool_sampling', 'fifo')),  # fifo|random
+            'retry_max': int(self.config.get('det_retry_max', 8)),
+        }
+        self._det_stats = {
+            'generated': 0,
+            'pool_hits': 0,
+            'pool_fallback_inline': 0,
+            'discard_mismatch': 0,
+            'retries_total': 0,
+        }
+
     # ---------------- Public API ----------------
     def set_model(self, model):
         """後から学習済みモデルを差し替える."""
@@ -190,8 +213,19 @@ class AlphaZeroAgent:
             env = self.env_ref
         if env is None:
             return None
-
+        # ---- MCTS 実行 & 性能計測 ----
+        import time as _perf_t
+        _t0 = _perf_t.time()
         root = self._run_mcts(env)
+        _mcts_ms = (_perf_t.time() - _t0) * 1000.0
+        # 実際のシミュレーション数 (Early Stop 計測)
+        # mcts-sims ログはユーザ要望により無効化（以前は平均/直近シミュレーション数を一定間隔で記録）
+        # ここでは何も行わず静粛化。
+        try:
+            # 参照だけ保持しておく (将来の分析用に必要になったら復帰しやすいよう)
+            _ = getattr(root, '_actual_simulations', None)
+        except Exception:
+            pass
         actions = list(root.children.keys())
         visits = [child.visit_count for child in root.children.values()]
 
@@ -228,6 +262,7 @@ class AlphaZeroAgent:
                     })
             except Exception:
                 pass
+        # per-move [perf] ログは削除済 (必要なら Git 履歴から復元可能)
 
         # π に従い行動サンプリング (行動なしなら pass)
         chosen = random.choices(actions, weights=pi, k=1)[0] if actions else "pass"
@@ -247,6 +282,33 @@ class AlphaZeroAgent:
         stored = self._store_sample(state_repr, serialized_legal, pi, None, value_pred=value_scalar_for_store)
         self._phase_samples.append(stored)
         self.move_count += 1
+
+        # --- 行動履歴へ記録 (determinization 用) ---
+        try:
+            g = env.game
+            combo_type = None
+            try:
+                rc = getattr(g, 'rule_checker', None)
+                if rc and hasattr(rc, 'classify_combo') and g.current_field:
+                    cinfo = rc.classify_combo(g.current_field)
+                    if cinfo:
+                        combo_type = cinfo.get('type')
+            except Exception:
+                combo_type = None
+            hist_entry = {
+                "pid": g.turn,  # 行動直前の手番 (action 適用前に抽出済 root.turn)
+                "action": action_env if action_env is not None else "pass",
+                "field_before": [str(c) for c in getattr(g, 'current_field', [])],
+                "revo": bool(getattr(getattr(g, 'rule_checker', None), 'revolution', False)),
+                "combo_type": combo_type,
+            }
+            self._action_history.append(hist_entry)
+            # 環境へも埋め込み (クローンが参照できるよう)
+            if not hasattr(g, '_action_history'):
+                g._action_history = []  # type: ignore
+            g._action_history.append(hist_entry)  # type: ignore
+        except Exception:
+            pass
         return action_env
 
     # ---------------- Temperature schedule helpers ----------------
@@ -285,6 +347,13 @@ class AlphaZeroAgent:
     def _run_mcts(self, env) -> PUCTNode:
         """環境を軽量コピーし PUCT MCTS を実行してルートノードを返す."""
         env_copy = self._copy_env(env)
+
+        # 並列 determinization プール lazy 起動
+        if self.config.get('enable_parallel_determinization'):
+            try:
+                self._maybe_start_det_pool(env)
+            except Exception:
+                pass
 
         def policy_value_fn(e):  # ノード展開時に prior と value を取得
             return self._policy_value(e)
@@ -372,6 +441,20 @@ class AlphaZeroAgent:
             # 失敗時は逐次版へフォールバック
             return [self._policy_value(e) for e in env_list]
 
+        # Determinization (imperfect information + pass 制約)
+        det_enable = bool(self.config.get('enable_determinization', True))
+        def _determinize(e_clone, original_env, root_pid):
+            if not det_enable:
+                return
+            # 並列 pool 有効なら取得を試みる
+            if self.config.get('enable_parallel_determinization', True):
+                used = self._apply_from_det_pool(e_clone, original_env, root_pid)
+                if used:
+                    return
+            # フォールバック: インライン生成
+            self._det_stats['pool_fallback_inline'] = self._det_stats.get('pool_fallback_inline',0) + 1
+            self._inline_determinize(e_clone, original_env, root_pid)
+
         return run_puct_mcts(
             root_env_copy=env_copy,
             num_simulations=self.num_simulations,
@@ -385,6 +468,15 @@ class AlphaZeroAgent:
             root_player_id=getattr(env.game, "turn", 0),
             batch_eval_size=self.mcts_batch_eval_size,
             transposition_table=TT,
+            determinize_fn=_determinize if det_enable else None,
+            early_stop_enable=bool(self.config.get('mcts_early_stop_enable', False)),
+            early_stop_min_sims=int(self.config.get('mcts_early_stop_min_sims', 16)),
+            early_stop_visit_ratio=float(self.config.get('mcts_early_stop_visit_ratio', 0.75)),
+            early_stop_gap_ratio=float(self.config.get('mcts_early_stop_gap_ratio', 0.10)),
+            early_stop_log_sample_rate=float(self.config.get('mcts_early_stop_log_sample_rate', 0.0)),
+            early_stop_post_min_batch=int(self.config.get('mcts_early_stop_post_min_batch', 0) or 0),
+            early_stop_debug=bool(self.config.get('mcts_early_stop_debug', False)),
+            early_stop_logger=self.logger,
         )
 
     def _policy_value(self, env):
@@ -422,9 +514,10 @@ class AlphaZeroAgent:
                     logits_t = logits_t[:n]
                     pid = getattr(self, 'player_id', 0)
                     if hasattr(value_vec_t, 'shape') and 0 <= pid < value_vec_t.shape[0]:
-                        value_scalar = float(value_vec_t[pid].item())
+                        # value_vec_t はロジット。Sigmoid で確率化。
+                        value_scalar = float(value_vec_t[pid].sigmoid().item())
                     else:
-                        value_scalar = float(value_vec_t[0].item())
+                        value_scalar = float(value_vec_t[0].sigmoid().item())
                     logits = logits_t.tolist() if hasattr(logits_t, 'tolist') else list(logits_t)
         except Exception:
             # フォールバック（従来通り）
@@ -439,9 +532,9 @@ class AlphaZeroAgent:
                 logits_t = logits_t[:n]
                 pid = getattr(self, 'player_id', 0)
                 try:
-                    value_scalar = float(value_vec_t[pid].item())
+                    value_scalar = float(value_vec_t[pid].sigmoid().item())
                 except Exception:
-                    value_scalar = float(value_vec_t[0].item())
+                    value_scalar = float(value_vec_t[0].sigmoid().item())
                 logits = logits_t.tolist() if hasattr(logits_t, 'tolist') else list(logits_t)
 
         # softmax 正規化
@@ -481,6 +574,278 @@ class AlphaZeroAgent:
             pass
         new_env.game = g_new
         return new_env
+
+    # ------------ Determinization helpers (parallel pool) ------------
+    def _maybe_start_det_pool(self, env):
+        if self._det_pool is not None:
+            return
+        try:
+            import threading
+            from collections import deque as _dq
+            self._det_pool = _dq(maxlen=self._det_cfg['capacity'])
+            self._det_pool_lock = threading.Lock()
+            self._det_stop_event = threading.Event()
+            # ルート基準情報 (手番 / 革命) を記録し mismatch で破棄
+            g = env.game
+            self._det_root_signature = {
+                'num_players': len(getattr(g, 'players', [])),
+                'revo': bool(getattr(getattr(g,'rule_checker',None),'revolution',False)),
+                'root_turn': getattr(g, 'turn', 0),
+            }
+            self._det_pool_thread = threading.Thread(target=self._determinization_worker, daemon=True)
+            self._det_pool_thread.start()
+            try:
+                if self.logger:
+                    self.logger.log_text(f"[det-pool-init] cap={self._det_cfg['capacity']} refill={self._det_cfg['refill_ratio']} sig={self._det_root_signature}")
+            except Exception:
+                pass
+        except Exception as e:
+            # 失敗時は無視してインライン動作へ (ただし可視化)
+            try:
+                print(f"[DetPool][ERROR] 起動失敗: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+            self._det_pool = None
+
+    def _determinization_worker(self):
+        import time, random as _r
+        while self._det_stop_event and not self._det_stop_event.is_set():
+            try:
+                # 充足チェック
+                with self._det_pool_lock:
+                    cur_len = len(self._det_pool)
+                    cap = self._det_cfg['capacity']
+                refill_threshold = int(self._det_cfg['capacity'] * self._det_cfg['refill_ratio'])
+                if cur_len >= cap or cur_len > refill_threshold and cur_len > 0:
+                    time.sleep(0.002)
+                    continue
+                # 生成元となる env_ref から shallow copy して root 基準で determinization
+                base_env = self.env_ref
+                if base_env is None:
+                    time.sleep(0.01)
+                    continue
+                env_clone = self._copy_env(base_env)
+                ok, assignment = self._build_single_determinization(env_clone, base_env, getattr(base_env.game,'turn',0))
+                if ok and assignment:
+                    # 署名整合性判定
+                    g = base_env.game
+                    sig = {
+                        'num_players': len(getattr(g, 'players', [])),
+                        'revo': bool(getattr(getattr(g,'rule_checker',None),'revolution',False)),
+                        'root_turn': getattr(g,'turn',0),
+                    }
+                    if sig != getattr(self, '_det_root_signature', sig):
+                        self._det_stats['discard_mismatch'] += 1
+                        # root_turn だけが変わっているケースでは署名を更新して再利用性を確保
+                        try:
+                            prev = getattr(self, '_det_root_signature', None)
+                            if prev and prev.get('num_players') == sig['num_players'] and prev.get('revo') == sig['revo'] and prev.get('root_turn') != sig['root_turn']:
+                                self._det_root_signature = sig  # ターン進行に追随
+                                if self.logger and (self._det_stats['discard_mismatch'] % 50 == 1):
+                                    self.logger.log_text(f"[det-pool-update] root_turn change prev={prev.get('root_turn')} new={sig['root_turn']} discards={self._det_stats['discard_mismatch']}")
+                            else:
+                                if self.logger and (self._det_stats['discard_mismatch'] % 100 == 1):
+                                    self.logger.log_text(f"[det-pool-mismatch] discards={self._det_stats['discard_mismatch']} prev={prev} cur={sig}")
+                        except Exception:
+                            pass
+                        time.sleep(0.001)
+                        continue
+                    with self._det_pool_lock:
+                        if len(self._det_pool) < self._det_cfg['capacity']:
+                            self._det_pool.append(assignment)
+                            self._det_stats['generated'] += 1
+                else:
+                    # 軽く待機して再トライ (過剰ループ抑制)
+                    time.sleep(0.001)
+            except Exception as e:
+                try:
+                    print(f"[DetPool][ERROR] worker 例外: {type(e).__name__}: {e}")
+                except Exception:
+                    pass
+                time.sleep(0.005)
+
+    def _apply_from_det_pool(self, e_clone, original_env, root_pid) -> bool:
+        if self._det_pool is None:
+            return False
+        try:
+            import random as _r
+            with self._det_pool_lock:
+                if not self._det_pool:
+                    return False
+                if self._det_cfg['sampling'] == 'random':
+                    idx = _r.randrange(len(self._det_pool))
+                    # deque は index pop 不直接 -> 回転
+                    for _ in range(idx):
+                        self._det_pool.append(self._det_pool.popleft())
+                    assignment = self._det_pool.popleft()
+                else:
+                    assignment = self._det_pool.popleft()
+            # 適用
+            g_new = e_clone.game
+            from game.card import Card
+            for pid, cards_str in assignment['hands'].items():
+                if pid == root_pid:
+                    continue
+                try:
+                    g_new.players[pid].hand = [Card.from_string(s) if hasattr(Card,'from_string') else Card(s) for s in cards_str]
+                except Exception:
+                    g_new.players[pid].hand = list(cards_str)
+            self._det_stats['pool_hits'] += 1
+            return True
+        except Exception as e:
+            try:
+                print(f"[DetPool][ERROR] apply 失敗: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+            return False
+
+    # --- Inline fallback determinization (直接適用) ---
+    def _inline_determinize(self, e_clone, original_env, root_pid):
+        self._build_single_determinization(e_clone, original_env, root_pid, apply_direct=True)
+
+    # コア生成: apply_direct=False なら (ok, assignment_dict) を返す
+    def _build_single_determinization(self, e_clone, original_env, root_pid, apply_direct=False):
+        try:
+            g_orig = original_env.game
+            g_new = e_clone.game
+            history = getattr(g_orig, '_action_history', []) or []
+            root_hand_ids = {str(c) for c in g_orig.players[root_pid].hand}
+            field_ids = {str(c) for c in g_orig.current_field}
+            # デッキ総カード
+            all_cards: list[str] = []
+            try:
+                if hasattr(g_orig, 'deck') and g_orig.deck:
+                    all_cards = [str(c) for c in g_orig.deck]
+            except Exception:
+                pass
+            if not all_cards:
+                for p in g_orig.players:
+                    all_cards.extend(str(c) for c in p.hand)
+                all_cards.extend(field_ids)
+                all_cards = list(dict.fromkeys(all_cards))
+            known = set(root_hand_ids) | field_ids
+            for rid in getattr(g_orig, 'rankings', []):
+                if rid != root_pid:
+                    known.update(str(c) for c in g_orig.players[rid].hand)
+            for h in history:
+                act = h.get('action')
+                if isinstance(act, (list, tuple)):
+                    known.update(str(c) for c in act)
+            unknown_seed = [cid for cid in all_cards if cid not in known]
+            # pass 制約抽出
+            pass_reqs = []
+            for h in history:
+                if h.get('action') == 'pass':
+                    fb = h.get('field_before') or []
+                    if not fb:
+                        continue
+                    cnt = len(fb)
+                    ranks = []
+                    for s in fb:
+                        core = s[:-1]
+                        try:
+                            ranks.append(int(core))
+                        except Exception:
+                            pass
+                    if not ranks:
+                        continue
+                    base_rank = min(ranks)
+                    pass_reqs.append({
+                        'pid': h.get('pid'), 'count': cnt, 'min_rank': base_rank,
+                        'revo': bool(h.get('revo', False)), 'combo_type': h.get('combo_type'),
+                        'size': cnt, 'ranks_ref': sorted(ranks),
+                    })
+            def rank_of(cid: str):
+                core = cid[:-1]
+                try:
+                    return int(core)
+                except Exception:
+                    return 0
+            import random as _r
+            opp_ids = [i for i in range(len(g_new.players)) if i != root_pid]
+            max_retry = max(1, int(self._det_cfg.get('retry_max', 8)))
+            for attempt in range(max_retry):
+                unknown = list(unknown_seed)
+                _r.shuffle(unknown)
+                cursor = 0
+                assignment_hands = {}
+                for i in opp_ids:
+                    p_new = g_new.players[i]
+                    sz = len(p_new.hand)
+                    pick = unknown[cursor:cursor+sz]
+                    cursor += sz
+                    assignment_hands[i] = list(pick)
+                # 矛盾検査
+                consistent = True
+                for req in pass_reqs:
+                    pidc = req['pid']
+                    if pidc == root_pid or pidc is None:
+                        continue
+                    hand_ids = set(assignment_hands.get(pidc, []))
+                    counts = {}
+                    for cid in hand_ids:
+                        r = rank_of(cid)
+                        counts[r] = counts.get(r, 0) + 1
+                    combo_type = req.get('combo_type')
+                    feas = []
+                    if combo_type == 'straight':
+                        size_req = req.get('size', req['count'])
+                        min_rank_ref = req['min_rank']
+                        ranks_sorted = sorted(counts.keys())
+                        if ranks_sorted:
+                            for idx in range(len(ranks_sorted)):
+                                window = ranks_sorted[idx:idx+size_req]
+                                if len(window) < size_req:
+                                    break
+                                if all(window[i+1]-window[i] == 1 for i in range(size_req-1)):
+                                    if req['revo']:
+                                        if window[0] <= min_rank_ref:
+                                            feas.append(tuple(window))
+                                    else:
+                                        if window[0] >= min_rank_ref:
+                                            feas.append(tuple(window))
+                    else:
+                        if not req['revo']:
+                            feas = [r for r,cnt in counts.items() if r >= req['min_rank'] and cnt >= req['count']]
+                        else:
+                            feas = [r for r,cnt in counts.items() if r <= req['min_rank'] and cnt >= req['count']]
+                    if feas:
+                        consistent = False
+                        break
+                if consistent:
+                    # 適用または返却
+                    if apply_direct:
+                        from game.card import Card
+                        for pid, cards_str in assignment_hands.items():
+                            if pid == root_pid:
+                                continue
+                            try:
+                                g_new.players[pid].hand = [Card.from_string(s) if hasattr(Card,'from_string') else Card(s) for s in cards_str]
+                            except Exception:
+                                g_new.players[pid].hand = list(cards_str)
+                        return True, None
+                    else:
+                        self._det_stats['retries_total'] += attempt
+                        return True, {'hands': assignment_hands}
+            # 全リトライ失敗 -> 最後を採用 (安全側)
+            if apply_direct:
+                from game.card import Card
+                for pid, cards_str in assignment_hands.items():
+                    if pid == root_pid:
+                        continue
+                    try:
+                        g_new.players[pid].hand = [Card.from_string(s) if hasattr(Card,'from_string') else Card(s) for s in cards_str]
+                    except Exception:
+                        g_new.players[pid].hand = list(cards_str)
+                return True, None
+            else:
+                return False, None
+        except Exception as e:
+            try:
+                print(f"[DetBuild][ERROR] 例外: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+            return False, None
 
     def _get_legal_actions(self, env) -> List[Any]:
         """現在手番プレイヤーの合法手集合を可変長リストで返す (最後に必ず pass を追加)。"""
@@ -524,65 +889,97 @@ class AlphaZeroAgent:
             return None
 
     def _extract_state(self, env):
-        """状態特徴を抽出。
-        config.use_full_features が True の場合は拡張特徴量ベクトル full_input を生成。
-        full_input レイアウト (順序固定):
-            For each player i (0..N-1):
-              - 53 bits: 各カード所持 (標準52 + Joker1) (1/0)
-              - 1 bit : pass フラグ (現ターンでパス状態)
-              - 1 scalar: 残り枚数 (正規化 0..1, /53)
-            Field block:
-              - 1 bit revolution
-              - 7 bits combo type one-hot (empty,single,pair,triple,four,straight,joker)
-              - 13 bits field base rank one-hot (同ランク系: その rank, 階段: 先頭ランク, joker_single: none all zero, empty: all zero)
-              - 1 scalar: field_size / 13
-            Turn one-hot (N)
-        合計次元 = players * (53+1+1) + (1+7+13+1) + N
-        """
+        """部分観測用特徴量 (full_input v4)。
+
+                レイアウト (rank クラス 4 種: daifugo,fugo,hinmin,daihinmin):
+                    Self(55):  自分手札53bit + pass1 + remain_norm1
+                    OppSummary( (1 + 4) * (N-1) = 5(N-1) ): 各 opponent の remain_norm1 + rank one-hot(4)
+                    Field(22): revolution1 + combo7 + base_rank13 + field_size_norm1
+                    FieldCards(53): 現在場に出ている具体カードビット
+                    PlayHistory(53): これまで公開された(場 or 自分が保持して見えた)カードフラグ
+                    Belief(53*(N-1)): opponent ごとのカード存在確率 (所在不明カードのみ一定値)
+                    Turn(N): 手番 one-hot
+
+                        合計次元:
+                                                        = Self 55
+                                                            + OppSummary 5(N-1)
+                                                            + Field 22
+                                                            + FieldCards 53
+                                                            + PlayHistory 53
+                                                            + Belief 53(N-1)
+                                                            + Turn N
+                                                        = (55 + 22 + 53 + 53) + 5(N-1) + 53(N-1) + N
+                                                        = 183 + 58(N-1) + N
+                                                        = 183 + 58N - 58 + N
+                                                        = 59N + 125
+                                                したがって expected_full_dim = 59 * num_players + 125
+                                (v3 との差異: FieldCards + PlayHistory の 106 次元追加)
+                """
         try:
             g = env.game
             pid = g.turn
             rule_checker = getattr(g, "rule_checker", None)
             revo = bool(getattr(rule_checker, "revolution", False)) if rule_checker else False
             use_full = bool(getattr(self, 'config', {}).get('use_full_features', False))
-            base = {
-                "turn": pid,
-            }
+            base = {"turn": pid}
             me = g.players[pid]
             base.update({
-                "hand_size": len(me.hand),
+                "hand_size": len(getattr(me,'hand',[])),
                 "field_size": len(g.current_field),
                 "revolution": revo,
             })
             if not use_full:
                 return base
-            # --- フル特徴生成 ---
             num_players = len(g.players)
-            # 統一フォーマット次元: per_player(53bits + pass + remain =55) * N + field(22) + turn_onehot(N) = 56N + 22
-            expected_full_dim = 56 * num_players + 22
-            # カードインデックス: suit*13 + (rank-1) => 0..51, Joker => 52
+            expected_full_dim = 59 * num_players + 125
+
             def card_index(card):
-                if card.is_joker:
+                try:
+                    if getattr(card,'is_joker',False):
+                        return 52
+                    suit_order = {'\u2660':0,'\u2665':1,'\u2666':2,'\u2663':3, 'S':0,'H':1,'D':2,'C':3}
+                    return suit_order.get(getattr(card,'suit','S'),0)*13 + (int(getattr(card,'rank',1))-1)
+                except Exception:
                     return 52
-                suit_order = {'♠':0,'♥':1,'♦':2,'♣':3}
-                return suit_order.get(card.suit,0)*13 + (card.rank-1)
-            per_player_dim = 53 + 1 + 1
-            players_block = []
-            for i, pl in enumerate(g.players):
-                bits = [0.0]*53
-                for c in pl.hand:
-                    try:
-                        idx = card_index(c)
-                        if 0 <= idx < 53:
-                            bits[idx] = 1.0
-                    except Exception:
-                        pass
-                pass_bit = 1.0 if (i < len(g.passed) and g.passed[i]) else 0.0
-                remain_norm = len(pl.hand)/53.0
-                players_block.extend(bits + [pass_bit, remain_norm])
-            # Field combo type
+
+            # Self block
+            self_bits = [0.0]*53
+            for c in getattr(me,'hand',[]):
+                try:
+                    idx = card_index(c)
+                    if 0 <= idx < 53:
+                        self_bits[idx] = 1.0
+                except Exception:
+                    pass
+            self_pass = 1.0 if (pid < len(getattr(g,'passed',[])) and getattr(g,'passed')[pid]) else 0.0
+            self_remain = len(getattr(me,'hand',[]))/53.0
+            feat = self_bits + [self_pass, self_remain]
+
+            # Opponent summaries
+            # 階級ラベル: 4 クラス (平民を除外) → one-hot 長さ 4
+            rank_labels = ['daifugo','fugo','hinmin','daihinmin']
+            def encode_rank(pl):
+                one = [0.0]*4
+                try:
+                    rc = getattr(pl,'rank_class',None)
+                    if rc is None and hasattr(pl,'rank'):
+                        rc = getattr(pl,'rank')
+                    if isinstance(rc,str) and rc.lower() in rank_labels:
+                        one[rank_labels.index(rc.lower())] = 1.0
+                    elif isinstance(rc,int) and 0 <= rc < 4:
+                        one[rc] = 1.0
+                except Exception:
+                    pass
+                return one
+            opponents = [i for i in range(num_players) if i != pid]
+            opp_remains = {i: len(g.players[i].hand) for i in opponents}
+            for i in opponents:
+                feat.append(opp_remains[i]/53.0)
+                feat.extend(encode_rank(g.players[i]))
+
+            # Field block
             field = g.current_field
-            combo_type_onehot = [0.0]*7  # empty,single,pair,triple,four,straight,joker_single
+            combo_type_onehot = [0.0]*7
             rank_onehot = [0.0]*13
             field_size = len(field)
             if field_size == 0:
@@ -591,14 +988,7 @@ class AlphaZeroAgent:
             else:
                 combo = rule_checker.classify_combo(field) if rule_checker else None
                 ctype = combo['type'] if combo else None
-                mapping = {
-                    'single':1,
-                    'pair':2,
-                    'triple':3,
-                    'four':4,
-                    'straight':5,
-                    'joker_single':6,
-                }
+                mapping = {'single':1,'pair':2,'triple':3,'four':4,'straight':5,'joker_single':6}
                 if ctype in mapping:
                     combo_type_onehot[mapping[ctype]] = 1.0
                 base_rank = None
@@ -609,39 +999,99 @@ class AlphaZeroAgent:
                         ranks = combo.get('ranks', [])
                         base_rank = ranks[0] if ranks else None
                 if base_rank is not None and 1 <= base_rank <= 13:
-                    # rank 1..13 -> index 0..12 (A=1 -> 0)
                     rank_onehot[base_rank-1] = 1.0
             revolution_bit = 1.0 if revo else 0.0
             field_size_norm = field_size/13.0
-            field_block = [revolution_bit] + combo_type_onehot + rank_onehot + [field_size_norm]
-            # turn one-hot
+            feat.extend([revolution_bit] + combo_type_onehot + rank_onehot + [field_size_norm])
+            # FieldCards (53)
+            field_bits = [0.0]*53
+            for c in field:
+                try:
+                    idx = card_index(c)
+                    if 0 <= idx < 53:
+                        field_bits[idx] = 1.0
+                except Exception:
+                    pass
+            feat.extend(field_bits)
+            # PlayHistory (53)
+            history_bits = [0.0]*53
+            try:
+                hist_cards = list(getattr(g, 'play_history', []))
+            except Exception:
+                hist_cards = []
+            merged = set()
+            for seq in (getattr(me,'hand',[]), hist_cards, field):
+                for c in seq:
+                    try:
+                        idx = card_index(c)
+                        if 0 <= idx < 53:
+                            merged.add(idx)
+                    except Exception:
+                        pass
+            for idx in merged:
+                history_bits[idx] = 1.0
+            feat.extend(history_bits)
+
+            # Belief distributions
+            # 目的: "所在不明" の各カードが 各 opponent の手札にある確率 P(card=k ∈ hand_i) を推定し 53*(N-1) 次元に展開。
+            # 仮定: 位置不明カードは独立かつ opponent の残枚数比に比例した多項分布でランダム配分されている。
+            # ステップ1: 所在不明カード集合 U を構成 (自分の手札 / 現在フィールド除外)
+            self_idx = set()
+            for c in getattr(me,'hand',[]):
+                try:
+                    idx = card_index(c)
+                    if 0 <= idx < 53:
+                        self_idx.add(idx)
+                except Exception:
+                    pass
+            field_idx = set()
+            for c in field:
+                try:
+                    idx = card_index(c)
+                    if 0 <= idx < 53:
+                        field_idx.add(idx)
+                except Exception:
+                    pass
+            unknown = [i for i in range(53) if i not in self_idx and i not in field_idx]
+            unknown_count = len(unknown)
+            # ステップ2: 各 opponent の手札残数 H_i を取得し合計 H_total を計算
+            total_rem_opp = sum(opp_remains.values())
+            # ゲーム進行により unknown_count と total_rem_opp が乖離するケース (過去に場へ出て除去済みカード等) を許容。
+            # 理想的には unknown_count == total_rem_opp。乖離時は確率を hand_count 比率で計算しカードごとに同値を設定。
+            denom = total_rem_opp if total_rem_opp > 0 else 1
+            opp_card_presence_prob = {i: (opp_remains[i] / denom) for i in opponents}  # P(card k ∈ i) (k 未確定カード) = H_i / Σ_j H_j
+            # ステップ3: 53 長ベクトル生成 (非所在 or 自手札/場カードは 0)。
+            for i in opponents:
+                probs = [0.0] * 53
+                p_i = opp_card_presence_prob[i]
+                for idx in unknown:
+                    probs[idx] = p_i
+                # （オプション）正規化を行い opponents ごとに Σ_k probs[k] = 1 としたい場合は以下コメントアウト解除:
+                # if unknown_count > 0:
+                #     scale = opp_remains[i] / unknown_count if unknown_count else 0.0  # (現在方式では Σ_k probs = H_i )
+                # 現在は Σ_k probs = H_i を保持し、各カード所有確率を直接与える設計。
+                feat.extend(probs)
+            # 以前は unknown_count と opponent remains の不一致を一度だけ通知していたが
+            # 運用で冗長になったためログ出力を廃止 (計算ロジックはそのまま)。
+
+            # Turn one-hot
             turn_onehot = [0.0]*num_players
             if 0 <= pid < num_players:
                 turn_onehot[pid] = 1.0
-            full_vec = players_block + field_block + turn_onehot
-            # 次元検証 & 補正 (不足はゼロ埋め / 超過は切り詰め) 常に expected_full_dim に揃える
-            cur_len = len(full_vec)
+            feat.extend(turn_onehot)
+
+            cur_len = len(feat)
             if cur_len != expected_full_dim:
                 if cur_len < expected_full_dim:
-                    full_vec = full_vec + [0.0] * (expected_full_dim - cur_len)
+                    feat.extend([0.0]*(expected_full_dim - cur_len))
                 else:
-                    full_vec = full_vec[:expected_full_dim]
-                if not hasattr(self, '_warned_full_dim_autofix'):
+                    del feat[expected_full_dim:]
+                if not hasattr(self,'_warned_full_dim_autofix'):
                     print(f"[WARN] adjusted full_input length from {cur_len} to expected {expected_full_dim}")
-                    self._warned_full_dim_autofix = True  # type: ignore[attr-defined]
-            base['full_input'] = full_vec
+                    self._warned_full_dim_autofix = True
+            base['full_input'] = feat
             base['full_input_dim'] = expected_full_dim
-            # フル特徴量次元一貫性チェック
-            try:
-                if self.config.get('use_full_features'):
-                    cur_dim = expected_full_dim
-                    ref = getattr(self, '_full_input_dim_ref', None)
-                    if ref is None:
-                        self._full_input_dim_ref = cur_dim
-                    elif ref != cur_dim:
-                        print(f"[WARN] full_input_dim mismatch expected={ref} got={cur_dim}")
-            except Exception:
-                pass
+            base['full_input_version'] = 4
             return base
         except Exception:
             return {"turn": 0}
@@ -664,7 +1114,7 @@ class AlphaZeroAgent:
                 "value": value,
                 "value_pred": value_pred,
                 "model_version": getattr(self, 'model_version', 0),
-                "feature_version": 1 if (isinstance(state, dict) and ('full_input' in state)) else 0,
+                "feature_version": state.get('full_input_version', 1) if (isinstance(state, dict) and ('full_input' in state or 'full_compact' in state)) else 0,
                 "lossless": True,
             }
             # フル特徴量モード時に legacy を格納しないポリシーは維持
@@ -688,58 +1138,91 @@ class AlphaZeroAgent:
         # ==============================================================
         # --- メモリ削減: full_input をコンパクト表現へ圧縮 (packbits + float16) ---
         try:
+            # store_full_input=False の場合は featureベクトル自体を保持しない
+            if isinstance(state, dict) and not self.config.get('store_full_input', True):
+                # full_input / compact の両方削除 (既に圧縮済みでも除去)
+                if 'full_input' in state:
+                    try: del state['full_input']
+                    except Exception: pass
+                if 'full_compact' in state:
+                    try: del state['full_compact']
+                    except Exception: pass
             if (self.config.get('use_full_features') and
                 self.config.get('enable_compact_full_input', True) and
+                self.config.get('store_full_input', True) and
                 isinstance(state, dict) and 'full_input' in state and 'full_compact' not in state):
                 fi = state.get('full_input')
                 import numpy as _np
                 fi_arr = _np.asarray(fi, dtype=_np.float32)
-                # num_players 推定 (len = 56N + 22)
                 total_len = fi_arr.shape[0]
-                # 56N + 22 = total_len -> N = (total_len - 22)/56
-                N = int((total_len - 22) // 56) if total_len >= 22 else self.config.get('num_players', 4)
-                if N > 0 and 56 * N + 22 == total_len:
-                    # binary_len = 55N + 21, float count = N + 1
+                # Only support v4 (59N + 125). Older layouts (v1-v3) are no longer compressed.
+                layout_version = None
+                N = None
+                if total_len >= 125:
+                    cand = (total_len - 125) / 59
+                    if abs(cand - int(cand)) < 1e-6 and 2 <= int(cand) <= 10 and 59 * int(cand) + 125 == total_len:
+                        layout_version = 4
+                        N = int(cand)
+                if layout_version is None:
+                    # 不一致なら圧縮スキップ
+                    pass
+                else:
                     binary_indices = []
                     float_indices = []
-                    # players block
-                    for p in range(N):
-                        base = p * 55
-                        # 53 card bits
-                        binary_indices.extend(range(base, base + 53))
-                        # pass bit
-                        binary_indices.append(base + 53)
-                        # remain_norm
-                        float_indices.append(base + 54)
-                    field_base = 55 * N
-                    # revolution
-                    binary_indices.append(field_base)
-                    # combo 7 bits
-                    binary_indices.extend(range(field_base + 1, field_base + 8))
-                    # rank 13 bits
-                    binary_indices.extend(range(field_base + 8, field_base + 21))
-                    # field_size_norm
-                    float_indices.append(field_base + 21)
-                    # turn one-hot N bits
-                    turn_start = field_base + 22
-                    binary_indices.extend(range(turn_start, turn_start + N))
-                    bin_vals = fi_arr[binary_indices]
-                    bin_bits = (bin_vals > 0.5).astype(_np.uint8)
-                    packed = _np.packbits(bin_bits).tobytes()
-                    float_vals = fi_arr[float_indices].astype(_np.float16)
-                    state['full_compact'] = {
-                        'packed_bits': packed,
-                        'floats': float_vals,
-                        'binary_len': int(bin_bits.shape[0]),
-                        'num_players': int(N),
-                        'format': 'cfv1',
-                        'full_input_dim': int(total_len),
-                    }
-                    # 元のベクトルは削除して常駐メモリ削減
-                    try:
-                        del state['full_input']
-                    except Exception:
-                        pass
+                    cursor = 0
+                    # Self block (共通) 53 bits + pass(bit) + remain(float)
+                    binary_indices.extend(range(cursor, cursor + 53))
+                    binary_indices.append(cursor + 53)
+                    float_indices.append(cursor + 54)
+                    cursor += 55
+                    # OppSummary (v4 rank4)
+                    opp_cnt = N - 1
+                    per_opp = 1 + 4
+                    for _ in range(opp_cnt):
+                        float_indices.append(cursor)
+                        binary_indices.extend(range(cursor + 1, cursor + 1 + 4))
+                        cursor += per_opp
+                    # Field block (22)
+                    if cursor + 22 <= total_len:
+                        # revolution + combo7 + rank13 + field_size_norm
+                        binary_indices.append(cursor); cursor += 1
+                        binary_indices.extend(range(cursor, cursor + 7)); cursor += 7
+                        binary_indices.extend(range(cursor, cursor + 13)); cursor += 13
+                        float_indices.append(cursor); cursor += 1
+                        # FieldCards 53 + PlayHistory 53
+                        if cursor + 53 <= total_len:
+                            binary_indices.extend(range(cursor, cursor + 53))
+                            cursor += 53
+                        if cursor + 53 <= total_len:
+                            binary_indices.extend(range(cursor, cursor + 53))
+                            cursor += 53
+                        # Belief block (floats) 53*(N-1)
+                        belief_len = 53 * (N - 1)
+                        if cursor + belief_len <= total_len:
+                            float_indices.extend(range(cursor, cursor + belief_len))
+                            cursor += belief_len
+                        # Turn one-hot N
+                        if cursor + N <= total_len:
+                            binary_indices.extend(range(cursor, cursor + N))
+                            cursor += N
+                    if cursor == total_len and binary_indices and float_indices:
+                        bin_vals = fi_arr[binary_indices]
+                        bin_bits = (bin_vals > 0.5).astype(_np.uint8)
+                        packed = _np.packbits(bin_bits).tobytes()
+                        float_vals = fi_arr[float_indices].astype(_np.float16)
+                        state['full_compact'] = {
+                            'packed_bits': packed,
+                            'floats': float_vals,
+                            'binary_len': int(bin_bits.shape[0]),
+                            'num_players': int(N),
+                            'format': 'cfv1',
+                            'full_input_dim': int(total_len),
+                            'layout_version': int(layout_version),
+                        }
+                        try:
+                            del state['full_input']
+                        except Exception:
+                            pass
         except Exception:
             pass
         # --- 追加メモリ削減: pi 量子化(uint16), value/value_pred を uint8、legal_actions を ID 化 ---
@@ -812,7 +1295,7 @@ class AlphaZeroAgent:
             "value_pred_u8": value_pred_u8,
             "value": value,  # assign_values 更新対象
             "model_version": getattr(self, 'model_version', 0),
-            "feature_version": 1 if (isinstance(state, dict) and ('full_input' in state or 'full_compact' in state)) else 0,
+            "feature_version": state.get('full_input_version', 1) if (isinstance(state, dict) and ('full_input' in state or 'full_compact' in state)) else 0,
         }
         # ------------------ 重複サンプルフィルタ ------------------
         if self._dup_enabled:
@@ -961,7 +1444,20 @@ class AlphaZeroAgent:
 
     def finalize_game(self, *_args, **_kwargs):  # 互換維持用 no-op
         """ゲーム終端フック (最終順位報酬を使わないので何もしない)。"""
+        # フェーズ一時サンプル破棄
         self._phase_samples = []
+        # ゲーム単位データをクリア
+        try:
+            if hasattr(self, '_action_history'):
+                self._action_history.clear()
+        except Exception:
+            pass
+        # determinization プールをゲーム境界でリセット (設定で無効化可能)
+        try:
+            if self.config.get('reset_det_pool_each_game', True):
+                self.shutdown_det_pool()
+        except Exception:
+            pass
 
     # ---------------- Persistence ----------------
     def save_replay(self, path: Optional[str] = None):
@@ -986,7 +1482,7 @@ class AlphaZeroAgent:
         # 共有 ReplayBuffer
         if rb is not None and rb.__class__.__name__ == 'ReplayBuffer':
             try:
-                # 新しい save API (purge 対応)
+                # 新しい save API (purge 対応)BCEWithLogitsLoss 化
                 rb.save(path, purge=purge)
             except TypeError:
                 # 互換: 古いバージョン (purgeパラメータ無し)
@@ -1012,10 +1508,22 @@ class AlphaZeroAgent:
                         pass
             return
         # ローカル deque/list 格納形式
+        # 非同期 I/O 経由
+        async_used = False
         try:
-            joblib.dump(rb, path, compress=3)
+            if self.config.get('enable_async_io', False):
+                from utils.async_io import get_async_io
+                aio = get_async_io(self.config)
+                if aio:
+                    aio.enqueue_joblib_dump(rb, path, compress=3)
+                    async_used = True
         except Exception:
-            joblib.dump(rb, path)
+            async_used = False
+        if not async_used:
+            try:
+                joblib.dump(rb, path, compress=3)
+            except Exception:
+                joblib.dump(rb, path)
         if purge and hasattr(rb, 'clear'):
             try:
                 rb.clear()
@@ -1077,7 +1585,7 @@ class AlphaZeroAgent:
         batch = batch_pool if len(batch_pool) <= batch_size else random.sample(batch_pool, batch_size)
         # フル特徴量モード時に旧フォーマット(feature_version=0)サンプルを除外
         if self.config.get('use_full_features'):
-            filtered = [s for s in batch if s.get('feature_version', 0) == 1]
+            filtered = [s for s in batch if s.get('feature_version', 0) >= 1]
             if not filtered:
                 return {"loss": None, "reason": "no_full_feature_samples"}
             batch = filtered
@@ -1092,125 +1600,235 @@ class AlphaZeroAgent:
         collected_v_t = []
         variable = getattr(self.model, 'supports_variable_actions', False) and hasattr(self.model, 'evaluate')
 
-        for sample in batch:
-            # --- 復元: legal_actions / pi ---
-            legal_actions = sample.get("legal_actions")
-            if legal_actions is None and sample.get('actions_format') == 'id_v1' and 'legal_ids' in sample:
-                # ID から元アクションへ (必要時のみ)。学習上は長さ一致だけで良いならダミー化も可能。
-                try:
-                    global _ACTION_ID_LIST
-                    ids = sample['legal_ids']
-                    if hasattr(ids, 'tolist'):
-                        ids_list = ids.tolist()
-                    else:
-                        ids_list = list(ids)
-                    legal_actions = []
-                    for i in ids_list:
+        vectorized_ok = False
+        if not variable and hasattr(self.model, 'forward_batch'):
+            try:
+                import numpy as _np
+                states = []
+                pi_arrays = []  # list[np.ndarray]
+                v_targets_list = []
+                lengths = []
+                # 事前検証 / 復元フェーズ (最小限の Python ループ)
+                for sample in batch:
+                    # legal 長さを pi ベースで判断 (legal_actions 復元コスト削減)
+                    # legal_actions が必要なのは variable モデルのみなので省略
+                    # π 復元
+                    if 'pi_q' in sample and sample.get('pi_format') == 'u16_norm65535':
+                        pi_q = sample.get('pi_q')
                         try:
-                            legal_actions.append(_ACTION_ID_LIST[i])  # type: ignore
+                            if hasattr(pi_q, 'astype'):
+                                arr = pi_q.astype(_np.float32, copy=False)
+                            else:
+                                arr = _np.asarray(list(pi_q), dtype=_np.float32)
+                            s_q = float(arr.sum())
+                            if s_q > 0:
+                                pi_arr = arr / s_q
+                            else:
+                                if arr.size == 0:
+                                    continue
+                                pi_arr = _np.ones_like(arr, dtype=_np.float32) / arr.size
                         except Exception:
-                            legal_actions.append('pass')
-                except Exception:
-                    legal_actions = None
-            # π 復元 (量子化優先)
-            if 'pi_q' in sample and sample.get('pi_format') == 'u16_norm65535':
-                try:
-                    import numpy as _np
-                    pi_q = sample['pi_q']
-                    if hasattr(pi_q, 'astype'):
-                        pi_arr = pi_q.astype(_np.float32)
+                            raw = sample.get('pi')
+                            if not raw:
+                                continue
+                            pi_arr = _np.asarray(list(raw), dtype=_np.float32)
                     else:
-                        pi_arr = _np.asarray(list(pi_q), dtype=_np.float32)
-                    s_q = float(pi_arr.sum())
-                    if s_q <= 0:
-                        pi_target = [1.0 / len(pi_arr)] * int(len(pi_arr)) if len(pi_arr) > 0 else []
-                    else:
-                        pi_target = (pi_arr / s_q).tolist()
-                except Exception:
-                    pi_target = sample.get('pi')
-            else:
-                pi_target = sample.get("pi")
-            v_target = sample.get("value")
-            if v_target is None and 'value_u8' in sample:
-                vu = sample.get('value_u8')
-                try:
-                    if isinstance(vu, int) and vu != 255:
-                        v_target = vu / 255.0
-                except Exception:
-                    pass
-            if not legal_actions or not pi_target or v_target is None:
-                continue  # 無効サンプルスキップ
-            # フル特徴量モデルで zero padded サンプルを除外 (config 制御)
-            if self.config.get('use_full_features') and self.config.get('skip_zero_padded_full_samples', True):
-                try:
-                    st = sample.get('state') or {}
-                    # compact / full_input が一切無い場合 (models.PolicyValueNet で警告したケース)
-                    if ('full_compact' not in st) and ('full_input' not in st):
+                        raw = sample.get('pi')
+                        if not raw:
+                            continue
+                        pi_arr = _np.asarray(list(raw), dtype=_np.float32)
+                    v_target = sample.get('value')
+                    if v_target is None and 'value_u8' in sample:
+                        vu = sample.get('value_u8')
+                        if isinstance(vu, int) and vu != 255:
+                            v_target = vu / 255.0
+                    if v_target is None:
                         continue
-                except Exception:
-                    pass
-            n = len(legal_actions)
-            # Forward
-            if variable:
-                logits_raw, v_pred_raw = self.model.evaluate(sample["state"], legal_actions)
-            else:
-                logits_raw, v_out = self.model.forward(sample["state"])  # policy_logits, value_vec
-                if hasattr(v_out, 'shape'):
+                    # full feature zero padding skip check
+                    if self.config.get('use_full_features') and self.config.get('skip_zero_padded_full_samples', True):
+                        st = sample.get('state') or {}
+                        if ('full_compact' not in st) and ('full_input' not in st):
+                            continue
+                    if pi_arr.size == 0:
+                        continue
+                    states.append(sample['state'])
+                    pi_arrays.append(pi_arr)
+                    v_targets_list.append(float(v_target))
+                    lengths.append(int(pi_arr.shape[0]))
+                if states:
+                    # モデル一括 forward
+                    policy_logits_batch, value_logits_batch = self.model.forward_batch(states)
+                    import torch
+                    device = policy_logits_batch.device
+                    max_len = max(lengths)
+                    B = len(states)
+                    # Pad π ターゲット
+                    pi_pad = _np.zeros((B, max_len), dtype=_np.float32)
+                    for i, arr in enumerate(pi_arrays):
+                        pi_pad[i, :arr.shape[0]] = arr
+                    pi_pad_t = torch.from_numpy(pi_pad).to(device)
+                    lengths_t = torch.tensor(lengths, device=device)
+                    # logits のパディング処理: 余剰部を -inf 相当でマスク
+                    logits_slice = policy_logits_batch[:, :max_len]
+                    # 長さ未満部分だけ使用するためマスクを構築
+                    arange = torch.arange(max_len, device=device).unsqueeze(0).expand(B, -1)
+                    mask = (arange < lengths_t.unsqueeze(1)).float()
+                    LARGE_NEG = -1e9
+                    masked_logits = logits_slice * mask + (1 - mask) * LARGE_NEG
+                    log_probs = torch.log_softmax(masked_logits, dim=1)
+                    probs = torch.exp(log_probs) * mask  # パディング部ほぼ0
+                    # policy loss (各行で sum)
+                    policy_loss_all = - (pi_pad_t * log_probs).sum(dim=1)
+                    # value ロジット選択 (自プレイヤー視点)
                     pid = getattr(self, 'player_id', 0)
-                    if 0 <= pid < v_out.shape[0]:
-                        v_pred_raw = v_out[pid]
+                    if value_logits_batch.ndim == 2 and pid < value_logits_batch.shape[1]:
+                        v_logits = value_logits_batch[:, pid]
                     else:
-                        v_pred_raw = v_out[0]
+                        v_logits = value_logits_batch[:, 0]
+                    v_targets_t = torch.tensor(v_targets_list, dtype=torch.float32, device=device)
+                    if 'bce_logits_loss_fn' not in self.__dict__:
+                        import torch.nn as _nn
+                        try:
+                            pw = float(self.pos_weight)
+                        except Exception:
+                            pw = 1.0
+                        pos_w_tensor = None
+                        if pw != 1.0:
+                            pos_w_tensor = torch.tensor([pw], dtype=torch.float32, device=device)
+                        self.bce_logits_loss_fn = _nn.BCEWithLogitsLoss(pos_weight=pos_w_tensor) if pos_w_tensor is not None else _nn.BCEWithLogitsLoss()
+                    value_loss_all = self.bce_logits_loss_fn(v_logits.unsqueeze(1), v_targets_t.unsqueeze(1))  # mean over batch
+                    # Entropy
+                    entropy_all = - (probs * log_probs).sum(dim=1)
+                    # 集約
+                    policy_losses.append(policy_loss_all.mean())
+                    value_losses.append(value_loss_all)  # already mean
+                    entropies.append(entropy_all.mean())
+                    valid = len(states)
+                    # メトリクス用個別保存
+                    for i in range(len(states)):
+                        n = lengths[i]
+                        collected_pi.append(pi_pad_t[i, :n].detach())
+                        collected_model.append(probs[i, :n].detach())
+                        v_prob = torch.sigmoid(v_logits[i])
+                        collected_v_pred.append(v_prob.detach())
+                        collected_v_t.append(v_targets_t[i].detach())
+                    vectorized_ok = True
+            except Exception as _vec_e:
+                # 一度だけ警告してフォールバック
+                if not hasattr(self, '_vec_warned'):
+                    print(f"[WARN] vectorized train_step fallback: {_vec_e}")
+                    self._vec_warned = True  # type: ignore[attr-defined]
+                vectorized_ok = False
+
+        if not vectorized_ok:
+            # 従来 per-sample ループ (variable モデル含む)
+            for sample in batch:
+                legal_actions = sample.get("legal_actions")
+                if legal_actions is None and sample.get('actions_format') == 'id_v1' and 'legal_ids' in sample:
+                    try:
+                        global _ACTION_ID_LIST
+                        ids = sample['legal_ids']
+                        ids_list = ids.tolist() if hasattr(ids, 'tolist') else list(ids)
+                        legal_actions = []
+                        for i in ids_list:
+                            try:
+                                legal_actions.append(_ACTION_ID_LIST[i])  # type: ignore
+                            except Exception:
+                                legal_actions.append('pass')
+                    except Exception:
+                        legal_actions = None
+                if 'pi_q' in sample and sample.get('pi_format') == 'u16_norm65535':
+                    try:
+                        import numpy as _np
+                        pi_q = sample['pi_q']
+                        pi_arr = pi_q.astype(_np.float32) if hasattr(pi_q, 'astype') else _np.asarray(list(pi_q), dtype=_np.float32)
+                        s_q = float(pi_arr.sum())
+                        if s_q <= 0:
+                            pi_target = [1.0 / len(pi_arr)] * int(len(pi_arr)) if len(pi_arr) > 0 else []
+                        else:
+                            pi_target = (pi_arr / s_q).tolist()
+                    except Exception:
+                        pi_target = sample.get('pi')
                 else:
-                    v_pred_raw = v_out
-
-            # Logits -> tensor & サイズ調整
-            if hasattr(logits_raw, 'shape'):
-                logits_t = logits_raw
-                if logits_t.shape[0] < n:  # 念のためパディング
-                    pad = torch.zeros(n - logits_t.shape[0], device=logits_t.device)
-                    logits_t = torch.cat([logits_t, pad], dim=0)
+                    pi_target = sample.get('pi')
+                v_target = sample.get('value')
+                if v_target is None and 'value_u8' in sample:
+                    vu = sample.get('value_u8')
+                    try:
+                        if isinstance(vu, int) and vu != 255:
+                            v_target = vu / 255.0
+                    except Exception:
+                        pass
+                if not legal_actions or not pi_target or v_target is None:
+                    continue
+                if self.config.get('use_full_features') and self.config.get('skip_zero_padded_full_samples', True):
+                    try:
+                        st = sample.get('state') or {}
+                        if ('full_compact' not in st) and ('full_input' not in st):
+                            continue
+                    except Exception:
+                        pass
+                n = len(legal_actions)
+                if variable:
+                    logits_raw, v_pred_raw = self.model.evaluate(sample['state'], legal_actions)
                 else:
-                    logits_t = logits_t[:n]
-            else:
-                logits_list = list(logits_raw)
-                if len(logits_list) < n:
-                    logits_list += [0.0] * (n - len(logits_list))
-                logits_t = torch.tensor(logits_list[:n], dtype=torch.float32)
-
-            log_probs = logits_t.log_softmax(dim=0)
-            probs = log_probs.exp()
-            pi_t = torch.tensor(pi_target, dtype=torch.float32, device=log_probs.device)
-            if pi_t.shape[0] != log_probs.shape[0]:  # 念のため揃える
-                m = min(pi_t.shape[0], log_probs.shape[0])
-                pi_t = pi_t[:m]
-                log_probs = log_probs[:m]
-                probs = probs[:m]
-            policy_loss = -(pi_t * log_probs).sum()
-
-            # Value loss (BCE) 手動展開 (安定化のため clamp)
-            if isinstance(v_pred_raw, float):
-                v_pred_t = torch.tensor(v_pred_raw, dtype=torch.float32)
-            else:
-                v_pred_t = v_pred_raw.float()
-            v_t = torch.tensor(float(v_target), dtype=torch.float32, device=v_pred_t.device)
-            eps = 1e-7
-            v_clamped = v_pred_t.clamp(eps, 1 - eps)
-            # クラス不均衡対策 (pos_weight) 適用
-            pos_w = self.pos_weight if v_t.item() > 0.5 else 1.0
-            value_loss = - (pos_w * v_t * v_clamped.log() + (1 - v_t) * (1 - v_clamped).log())
-            entropy = -(probs * log_probs).sum()
-
-            policy_losses.append(policy_loss)
-            value_losses.append(value_loss)
-            entropies.append(entropy)
-            valid += 1
-
-            # 解析用に各分布と value を保存
-            collected_pi.append(pi_t.detach())
-            collected_model.append(probs.detach())
-            collected_v_pred.append(v_clamped.detach())
-            collected_v_t.append(v_t.detach())
+                    logits_raw, v_out_logits = self.model.forward(sample['state'])
+                    if hasattr(v_out_logits, 'shape'):
+                        pid = getattr(self, 'player_id', 0)
+                        if 0 <= pid < v_out_logits.shape[0]:
+                            v_pred_raw = v_out_logits[pid]
+                        else:
+                            v_pred_raw = v_out_logits[0]
+                    else:
+                        v_pred_raw = v_out_logits
+                if hasattr(logits_raw, 'shape'):
+                    logits_t = logits_raw
+                    if logits_t.shape[0] < n:
+                        pad = torch.zeros(n - logits_t.shape[0], device=logits_t.device)
+                        logits_t = torch.cat([logits_t, pad], dim=0)
+                    else:
+                        logits_t = logits_t[:n]
+                else:
+                    logits_list = list(logits_raw)
+                    if len(logits_list) < n:
+                        logits_list += [0.0] * (n - len(logits_list))
+                    logits_t = torch.tensor(logits_list[:n], dtype=torch.float32)
+                log_probs = logits_t.log_softmax(dim=0)
+                probs = log_probs.exp()
+                pi_t = torch.tensor(pi_target, dtype=torch.float32, device=log_probs.device)
+                if pi_t.shape[0] != log_probs.shape[0]:
+                    m = min(pi_t.shape[0], log_probs.shape[0])
+                    pi_t = pi_t[:m]
+                    log_probs = log_probs[:m]
+                    probs = probs[:m]
+                policy_loss = -(pi_t * log_probs).sum()
+                if isinstance(v_pred_raw, float):
+                    v_logit = torch.tensor(v_pred_raw, dtype=torch.float32)
+                else:
+                    v_logit = v_pred_raw.float()
+                v_t = torch.tensor(float(v_target), dtype=torch.float32, device=v_logit.device)
+                if 'bce_logits_loss_fn' not in self.__dict__:
+                    import torch.nn as _nn
+                    try:
+                        pw = float(self.pos_weight)
+                    except Exception:
+                        pw = 1.0
+                    pos_w_tensor = None
+                    if pw != 1.0:
+                        import torch as _t
+                        pos_w_tensor = _t.tensor([pw], dtype=_t.float32, device=v_logit.device)
+                    self.bce_logits_loss_fn = _nn.BCEWithLogitsLoss(pos_weight=pos_w_tensor) if pos_w_tensor is not None else _nn.BCEWithLogitsLoss()
+                value_loss = self.bce_logits_loss_fn(v_logit.unsqueeze(0), v_t.unsqueeze(0))
+                v_prob = torch.sigmoid(v_logit)
+                entropy = -(probs * log_probs).sum()
+                policy_losses.append(policy_loss)
+                value_losses.append(value_loss)
+                entropies.append(entropy)
+                valid += 1
+                collected_pi.append(pi_t.detach())
+                collected_model.append(probs.detach())
+                collected_v_pred.append(v_prob.detach())
+                collected_v_t.append(v_t.detach())
 
         if valid == 0:
             return {"loss": None, "reason": "no_valid_samples"}
@@ -1341,6 +1959,38 @@ class AlphaZeroAgent:
             self.episodes_played = int(getattr(self, "episodes_played", 0)) + 1
         self.episode_phase_total = 0
         self.episode_phase_correct = 0
+        # 前ゲームの履歴を確実に破棄して肥大化を防ぐ
+        try:
+            if hasattr(self, '_action_history'):
+                self._action_history.clear()
+        except Exception:
+            pass
+        # determinization プールはゲームを跨ぐと署名ミスマッチが増えるためデフォルトで再初期化
+        try:
+            if self.config.get('reset_det_pool_each_game', True):
+                self.shutdown_det_pool()
+        except Exception:
+            pass
+
+    # ------------ Determinization pool teardown ------------
+    def shutdown_det_pool(self):
+        """テスト/終了時に determinization ワーカーを安全に停止する補助メソッド."""
+        try:
+            if getattr(self, '_det_stop_event', None) is not None:
+                self._det_stop_event.set()
+            th = getattr(self, '_det_pool_thread', None)
+            if th and th.is_alive():
+                th.join(timeout=1.0)
+        except Exception:
+            pass
+        # リソース参照を解放
+        try:
+            self._det_pool = None
+            self._det_pool_thread = None
+            self._det_pool_lock = None
+            self._det_stop_event = None
+        except Exception:
+            pass
 
 
 DRLAgent = AlphaZeroAgent

@@ -18,7 +18,7 @@ ALPHA_ZERO_CONFIG = {
     # MCTS / 探索
     # ---------------------------
     # MCTS シミュレーション回数 (初期は重いので軽量値。性能向上後に再調整) 
-    "num_simulations": 96,           # 1手あたりのシミュレーション回数 (以前:128)
+    "num_simulations": 96,         # 1手あたりのシミュレーション回数 (以前:128)
     "puct_c": 1.4,                   # PUCT 探索定数
     "dirichlet_alpha": 0.3,          # Dirichlet ノイズ α (ルート)
     "dirichlet_epsilon": 0.25,       # ノイズ混合率 ε
@@ -34,7 +34,42 @@ ALPHA_ZERO_CONFIG = {
     # 追加: MCTS 高速化オプション（デフォルト有効化）
     "mcts_batch_eval_size": 64,      # 葉ノードのバッチ評価サイズ（1で無効同等）
     "enable_mcts_tt": True,          # トランスポジションテーブル（NN結果キャッシュ）
-    "mcts_tt_capacity": 100000,       # キャッシュ上限（簡易LRUでエビクション）
+    "mcts_tt_capacity": 50000,       # キャッシュ上限（簡易LRUでエビクション）
+    # --- 不完全情報処理 / デターミニゼーション関連 ---
+    # 不完全情報 (相手手札非公開) 前提で opponent hand をサンプリングするか
+    "enable_determinization": False, #本来はTrue（不完全情報）だが、学習安定化のためFalse
+    # 並列 determinization プールを有効化 (True でバックグラウンドスレッドが割当候補を生成)
+    "enable_parallel_determinization": True,
+    # プール容量 (生成済み割当の最大保持数)
+    "det_pool_capacity": 128,
+    # 再生成のための補充閾値 (容量 * ratio を下回ると生成ループが活発化)
+    "det_pool_refill_threshold": 0.30,
+    # プールからのサンプリング方式: fifo | random
+    "det_pool_sampling": "fifo",
+    # インライン/プール生成時の最大リトライ回数 (パス制約矛盾解消目的)
+    "det_retry_max": 8,
+    # ゲーム終了毎に determinization プールを停止しメモリ/署名ミスマッチを抑制するか
+    # True: 各ゲーム開始時に必要なら再起動 (安定性/メモリ優先) / False: ゲーム間で継続 (微小性能最適化)
+    "reset_det_pool_each_game": True,
+    # per-move パフォーマンスログを抑制したい場合 False に (デバッグ用途 True 推奨)
+    "enable_perf_log": False,
+    # Early Stop (MCTS 収束早期打ち切り)
+    # 有効化するとシミュレーション途中で十分収束した場合に打ち切り計算量を節約
+    "mcts_early_stop_enable": True,          # False で完全無効化
+    "mcts_early_stop_min_sims": 16,          # この回数までは必ず実行 (探索初期安定化)
+    "mcts_early_stop_visit_ratio": 0.65,     # ルート最大訪問子 / 総訪問 >= ratio で候補
+    "mcts_early_stop_gap_ratio": 0.08,       # (top - second)/総訪問 >= gap なら確定 (2位が僅差なら継続)
+    "mcts_early_stop_log_sample_rate": 0.005,# 早期停止ログのサンプリング率 (ノイズ抑制)
+    # min_sims 到達後に早期停止判定の粒度を細かくするためのバッチ縮小サイズ。
+    # 例: 通常 batch_eval_size=64 だと判定が64刻みになり早期停止タイミングを逃す可能性がある。
+    # min_sims を超えて以降は batch をこのサイズ以下に縮め、より細かく収束判定する。
+    # 0 / 1 以下や未設定で無効化 (既存挙動)。
+    "mcts_early_stop_post_min_batch": 8,
+    # 早期停止デバッグ: 判定チェック毎に top_ratio / gap_ratio を低頻度で events.log 出力
+    # True で有効化。高頻度になり過ぎないよう内部でサンプリング。
+    "mcts_early_stop_debug": False,
+    # Early Stop 計測ログ出力間隔 (何手ごとに平均シミュレーション数を events.log へ書くか)
+    "mcts_sims_log_interval": 50,
 
     # ---------------------------
     # モデル
@@ -46,7 +81,7 @@ ALPHA_ZERO_CONFIG = {
     # ---------------------------
     # 学習 / 最適化
     # ---------------------------
-    "buffer_size": 50000,           # リプレイバッファ最大サイズ
+    "buffer_size": 200000,           # リプレイバッファ最大サイズ
     "batch_size": 256,               # 学習バッチサイズ (train_step 実装時に利用)
     "lr": 1e-4,                      # 学習率
     "weight_decay": 1e-4,            # L2 正則化
@@ -69,6 +104,8 @@ ALPHA_ZERO_CONFIG = {
     "opponent_mix_interval_episodes": 500, # 500エピソードごとに再割当
     "replay_path": "replay_buffer.joblib",     # リプレイバッファ保存先
     "strict_lossless": False,        # True なら 圧縮しない
+    # full_input をリプレイサンプルに保持するか (False で state.full_input / full_compact を破棄しメモリ節約)
+    "store_full_input": True,
 
     # ---------------------------
     # ログ / デバッグ
@@ -85,7 +122,7 @@ ALPHA_ZERO_CONFIG = {
     # ログ / 可視化
     # ---------------------------
     "log_dir": "logs",              # ログ出力ディレクトリ (CSV / TensorBoard)
-    "enable_tensorboard": False,      # TensorBoard 出力を有効化
+    "enable_tensorboard": True,      # TensorBoard 出力を有効化
     "mcts_log_sample_rate": 0.15,    # MCTS ルート統計のサンプリング率
     "disable_mcts_log": True,        # True で mcts_samples.jsonl へ出力しない
     "clear_logs_on_start": True,     # 起動時に既存ログを消去 (Falseで残す)
@@ -114,7 +151,7 @@ ALPHA_ZERO_CONFIG = {
     "selfplay_worker_device": "cpu",
     # 並行学習トリガ: 新規サンプルがこの数だけ取り込まれたら学習を1バースト起動
     # 小さすぎると学習バーストが細切れになり効率低下。大きすぎると応答が遅れる
-    "concurrent_min_new_samples_before_train": 4000,
+    "concurrent_min_new_samples_before_train": 3000,
     # 学習後の最新チェックポイント保存の最短間隔(秒)。0以下で毎回保存（高I/O）
     "concurrent_latest_save_every_sec": 1200.0,
     # ワーカー配布用モデル(pt)保存の最短間隔(秒)。0以下で毎回保存
@@ -132,11 +169,11 @@ ALPHA_ZERO_CONFIG = {
     # TensorBoard 及び CSV への書き込み頻度を制御し I/O/ディスク負荷を軽減
     # 例: train 100 ステップに 1 回 / episode 10 回に 1 回
     "tensorboard_train_log_every": 200,      # 1 なら毎ステップ
-    "tensorboard_episode_log_every": 100,
-    "tensorboard_flush_seconds": 120,        # 最低この秒数ごとに flush (0/None なら都度 flush)
+    "tensorboard_episode_log_every": 200,
+    "tensorboard_flush_seconds": 300,        # 最低この秒数ごとに flush (0/None なら都度 flush)
     # CSV 出力間引き (1=毎回)。間引いた行は欠番になる
-    "csv_train_log_every": 1,
-    "csv_episode_log_every": 1,
+    "csv_train_log_every": 100,
+    "csv_episode_log_every": 100,
     # MCTS ルート統計 JSONL を更に抑制したい場合 (disable_mcts_log と組み合わせ)
     "mcts_jsonl_max_bytes": 50_000_000,     # 上限超過で以降追記停止 (約50MB)。0/None で無効
 
@@ -147,7 +184,7 @@ ALPHA_ZERO_CONFIG = {
     "disable_csv_logging": False,
     # True なら逐次書き込みをせず、最後に 1 行だけ (最終エピソード指標 / 最終学習指標) を保存
     # disable_csv_logging が True の場合は無視される
-    "csv_summary_only":True,
+    "csv_summary_only": False,
     # ---------------------------
     # 拡張特徴量 (フル状態入力) 設定
     # ---------------------------
@@ -201,6 +238,99 @@ ALPHA_ZERO_CONFIG = {
     # フィルタのシグネチャ構成: 'top_value_len' で (policy_top_idx, value_u8, legal_count)
     # 将来拡張ポイント (例: 'hash_pi')。
     "duplicate_signature_type": "top_value_len",
+
+    # ---------------------------
+    # 追加: チェックポイント保存時にリプレイを purge するオプション
+    # ---------------------------
+    # True: _save_checkpoint 内で replay を save(purge=True) しメモリ解放。
+    # False: 保存後もメモリに残す (従来挙動)。
+    "purge_replay_after_checkpoint": False,
+    # True: train_concurrent / train_updates の各 train_step 後に即座に checkpoint 保存を行い
+    #       (purge_replay_after_checkpoint が True なら) リプレイを空にする超省メモリ運用。
+    # False: まとまったバースト後に保存 (推奨)。
+    "purge_replay_after_each_update": False,
+    # ---------------------------
+    # 自動メモリベース High/Low Water リプレイ制御 
+    # ---------------------------------------------------------------------
+    # True で有効化: プロセス RSS が high 基準を超過したら low 目標付近になるまで
+    # 古いサンプルを間引く (FIFO)。purge_replay_after_each_update が True の場合は
+    # そもそも巨大化しないため自動制御は実質発火しない想定。
+    "auto_replay_water_enabled": True,
+    # 物理メモリ(RAM)に対する RSS 高水位比率。0<high<1。
+    "replay_memory_high_ratio": 0.65,
+    # 低水位ターゲット比率。削減後はおおむねこの比率以下になるまで削る。
+    "replay_memory_low_ratio": 0.50,
+    
+    # 親+子RSS合計が15GBを超えたら必ず purge したい要求に合わせ、デフォルトを 15360 MB に設定。
+    # 0 のままにしたい場合はユーザ側で override してください。
+    # ※ 既存キーを上書きしないため、新たに high_abs_mb_override を用意し trainer 側で優先する実装でも可。
+    # ここではシンプルに既存値を直接 15360 に変更する。
+    "replay_memory_high_abs_mb": 14360,  # 15GB で発火 (override 可能)
+    # 低水位を絶対MBで指定したい場合のオプション (0/None で無効)。
+    # high_abs_mb 発火時、low_abs_mb > 0 なら ratio計算の代わりに low_abs_mb へ近づくよう target_size を計算。
+    "replay_memory_low_abs_mb": 5000,
+    # 再発火クールダウン(秒)。直近 purge からこの秒数は再度メモリ水位判定をスキップ。
+    "replay_memory_cooldown_sec": 120,
+        # 親+子プロセスRSS合算で判定するか (並列 self-play 時に必須)
+        "replay_memory_include_children": True,
+        # 子RSS再計算の最短間隔(秒) (頻繁すぎる psutil 呼び出しを抑制)
+        "replay_memory_children_recalc_sec": 15,
+        # purge 後に gc.collect() を実行して RSS 解放を促すか
+        "replay_memory_force_gc": True,
+        # purge 詳細ログ (判定毎の mem_check / before/after) を出すか
+    "replay_memory_debug_log": False,  # 一時的に mem_check デバッグ出力を無効化
+        # purge ログで after_delete と GC 後の2段階を出すか
+        "replay_memory_log_before_after": True,
+        # コンパクト化モード: none|rebuild (rebuild で残存要素を新しい deque に詰め替え断片化軽減)
+        "replay_memory_compact_mode": "rebuild",
+        # 緊急高水位 (通常 high_ratio を更に越えた場合) 0/None で無効
+        "replay_memory_emergency_ratio": 0.0,
+        # 緊急時 target_size を さらに * factor で深く削る (0<factor<1)
+        "replay_memory_aggressive_factor": 0.8,
+        # 発火時最低削除件数 (微小削減ノイズ抑制)。0/None で無効
+        "replay_memory_min_purge_rows": 0,
+
+    # ---------------------------
+    # Worker RSS 再起動 (最小安全版)
+    # ---------------------------
+    # 有効化スイッチ
+    "worker_restart_enable": True,
+    # 1ワーカーRSS(MB)がこの高水位閾値を連続観測回数分超えたら graceful 再起動要求
+    "worker_restart_rss_high_mb": 2000,
+    # 再起動判定用ヒステリシス下限 (未使用: 今回は単純連続超過のみ、将来拡張用)
+    "worker_restart_rss_low_mb": 1800,
+    # 閾値超過を何回連続観測したら発火するか
+    "worker_restart_consecutive_required": 4,
+    # 同一ワーカーの再起動間隔(秒) 下回る場合は保留 (スラッシング防止)
+    "worker_restart_min_interval_sec": 900,
+    # 再起動要求時に付与するジッター最大秒数 (0 で無効)。worker_id を元に安定ジッター。
+    "worker_restart_jitter_sec": 15,
+    # 緊急全体RSS閾値 (MB)。0/None で無効。超過時は最大RSSワーカー即 graceful 要求 (将来kill拡張余地)。
+    "worker_restart_emergency_total_mb": 0,
+    # graceful 再起動でエピソード終了待ちする最大秒数
+    "worker_restart_grace_timeout_sec": 120,
+    # grace timeout 超過後の強制 kill までの猶予秒数
+    "worker_restart_force_kill_sec": 150,
+    # flush (サンプル送信) 完了待ちタイムアウト
+    "worker_restart_flush_timeout_sec": 20,
+    # 終了直前に最終 objtypes ログを送るか
+    "worker_restart_log_object_types_on_exit": True,
+    # シード戦略 (base+wid+gen を文字列管理。実装側で解釈) 今回は informational
+    "worker_restart_seed_strategy": "base+wid+gen",
+
+    # ---------------------------
+    # 非同期 I/O (torch.save / joblib.dump を専用プロセスへオフロード)
+    # ---------------------------
+    # True で有効化。モデル / リプレイ保存のディスク書込みをメイン計算ループから分離し I/O 待ちでの停滞を軽減。
+    "enable_async_io": True,
+    # I/O ワーカーのキュー最大長 (溢れた場合は同期フォールバックし警告)
+    "async_io_queue_maxsize": 32,
+    # 終了時に全ジョブ完了を待つ最大秒数 (0/None で待たない)
+    "async_io_flush_timeout_sec": 30,
+    # True で queue full 時に 1 度だけ WARN ログ
+    "async_io_warn_queue_full": True,
+    # True で I/O ジョブ完了時に簡易イベントログ ([async-io] ...) を events.log へ (低頻度デバッグ用)
+    "async_io_log_events": False,
 }
 
 __all__ = ["ALPHA_ZERO_CONFIG"]
