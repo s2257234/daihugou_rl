@@ -4,6 +4,7 @@ from game.game import Game
 from agents.straight_agent import StraightAgent
 from game.card import Card
 from agents.mcts import MCTSAgent
+from agents.drl_agent import AlphaZeroAgent
 
 
 
@@ -308,7 +309,7 @@ class DaifugoSimpleEnv:
             else:
                 filtered_actions = legal_actions
 
-            if simulate and isinstance(self.agents[current_player_id], MCTSAgent):
+            if simulate and isinstance(self.agents[current_player_id], (MCTSAgent, AlphaZeroAgent)):
                 legal_actions_filtered = [a for a in legal_actions if a is not None]
                 action_cards = np.random.choice(legal_actions_filtered + [None])
             else:

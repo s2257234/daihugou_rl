@@ -58,6 +58,7 @@ class TrainingLogger:
         self.log_mcts_samples = log_mcts_samples
         # files
         self.train_csv = os.path.join(log_dir, "train_updates.csv")
+        self.validation_csv = os.path.join(log_dir, "validation.csv")
         self.episode_csv = os.path.join(log_dir, "episodes.csv")
         self.mcts_jsonl = os.path.join(log_dir, "mcts_samples.jsonl")
         # コンフィグ由来: ログ頻度制御 (存在しなければデフォルト)
@@ -97,8 +98,15 @@ class TrainingLogger:
                 with open(self.train_csv, "w", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
                     writer.writerow([
-                        "update_step","policy_loss","value_loss","entropy","total_loss",
+                        "update_step","policy_loss","value_loss","entropy","train_count",
                         "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","samples"
+                    ])
+            if not os.path.exists(self.validation_csv):
+                with open(self.validation_csv, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        "update_step","policy_loss","value_loss","entropy","samples",
+                        "value_acc","value_brier","policy_kl","policy_top1_match"
                     ])
             if not os.path.exists(self.episode_csv):
                 with open(self.episode_csv, "w", newline="", encoding="utf-8") as f:
@@ -178,7 +186,8 @@ class TrainingLogger:
             if os.path.exists(self.train_csv):
                 with open(self.train_csv, 'r', encoding='utf-8') as rf:
                     header_line = rf.readline().strip()
-                if 'cum_pos_rate' not in header_line:
+                # 新仕様: total_loss を廃止し、train_count 列を追加
+                if ('cum_pos_rate' not in header_line) or ('total_loss' in header_line) or ('train_count' not in header_line):
                     # バックアップして新ヘッダで再生成
                     bak = self.train_csv + '.bak'
                     if not os.path.exists(bak):
@@ -186,7 +195,7 @@ class TrainingLogger:
                         with open(self.train_csv, 'w', newline='', encoding='utf-8') as wf:
                             writer = csv.writer(wf)
                             writer.writerow([
-                                "update_step","policy_loss","value_loss","entropy","total_loss",
+                                "update_step","policy_loss","value_loss","entropy","train_count",
                                 "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","samples"
                             ])
         except Exception:
@@ -208,7 +217,7 @@ class TrainingLogger:
                 metrics.get("policy_loss"),
                 metrics.get("value_loss"),
                 metrics.get("entropy"),
-                metrics.get("loss"),
+                metrics.get("train_count", self.update_step),
                 metrics.get("value_acc"),
                 metrics.get("value_brier"),
                 metrics.get("policy_kl"),
@@ -245,6 +254,50 @@ class TrainingLogger:
                 self._disable_tensorboard(f"OSError:{e}")
             except Exception as e:  # その他は一度警告し続行
                 print(f"[TrainingLogger] TensorBoard書き込み失敗 (train): {e}")
+
+    # ---------------- Validation metrics ----------------
+    def log_validation(self, metrics: Dict[str, Any]):
+        """検証損失などをCSV/TensorBoardへ記録する。スカラー値は 'val/*' ネームスペースに出力。"""
+        if self._disk_full:
+            return
+        step = self.update_step  # 学習と同じステップ番号で整列
+        # CSV
+        if (not self.disable_csv) and (not self.csv_summary_only):
+            try:
+                with open(self.validation_csv, 'a', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        step,
+                        metrics.get("policy_loss"),
+                        metrics.get("value_loss"),
+                        metrics.get("entropy"),
+                        metrics.get("samples"),
+                        metrics.get("value_acc"),
+                        metrics.get("value_brier"),
+                        metrics.get("policy_kl"),
+                        metrics.get("policy_top1_match"),
+                    ])
+            except OSError as e:
+                self._mark_disk_full(e, 'validation_csv')
+            except Exception:
+                pass
+        # TensorBoard
+        if self.tb and not self._disk_full:
+            try:
+                for k, v in metrics.items():
+                    if isinstance(v, (int, float)):
+                        self.tb.add_scalar(f"val/{k}", v, step)
+                now = time.time()
+                if self.tb_flush_seconds <= 0 or (now - self._last_tb_flush_time) >= self.tb_flush_seconds:
+                    try:
+                        self.tb.flush()
+                    except Exception:
+                        pass
+                    self._last_tb_flush_time = now
+            except OSError as e:
+                self._disable_tensorboard(f"OSError:{e}")
+            except Exception as e:
+                print(f"[TrainingLogger] TensorBoard書き込み失敗 (validation): {e}")
 
     # ---------------- Episode metrics ----------------
     def log_episode(self, metrics: Dict[str, Any]):
@@ -385,7 +438,7 @@ class TrainingLogger:
                     with open(self.train_csv, 'w', newline='', encoding='utf-8') as f:
                         writer = csv.writer(f)
                         writer.writerow([
-                            "update_step","policy_loss","value_loss","entropy","total_loss",
+                            "update_step","policy_loss","value_loss","entropy","train_count",
                             "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","samples"
                         ])
                 with open(self.train_csv, 'a', newline='', encoding='utf-8') as f:
@@ -393,7 +446,7 @@ class TrainingLogger:
                     writer = csv.writer(f)
                     writer.writerow([
                         self.update_step,
-                        m.get("policy_loss"), m.get("value_loss"), m.get("entropy"), m.get("loss"),
+                        m.get("policy_loss"), m.get("value_loss"), m.get("entropy"), m.get("train_count", self.update_step),
                         m.get("value_acc"), m.get("value_brier"), m.get("policy_kl"), m.get("policy_top1_match"),
                         m.get("pos_rate"), m.get("cum_pos_rate"), m.get("samples")
                     ])

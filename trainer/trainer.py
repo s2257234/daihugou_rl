@@ -83,6 +83,10 @@ def _selfplay_worker_entry(worker_id: int, episodes: int, config: Dict[str, Any]
     # モデル読込（CPU 推奨） + フル特徴量対応
     from agents.models import PolicyValueNet as _PVN
     device = config.get("selfplay_worker_device", "cpu")
+    # 共有CUDAテンソルのIPC警告を避けるため、既定でワーカーはCPUに固定
+    # 明示的に無効化したい場合は config["force_worker_cpu"]=False
+    if bool(config.get("force_worker_cpu", True)):
+        device = "cpu"
     use_full = bool(config.get("use_full_features", False))
     try:
         model = _PVN.load(model_path, map_location=device)
@@ -229,6 +233,8 @@ def _selfplay_daemon_worker(worker_id: int,
     # モデル読込（CPU 推奨） + フル特徴量対応
     from agents.models import PolicyValueNet as _PVN
     device = config.get("selfplay_worker_device", "cpu")
+    if bool(config.get("force_worker_cpu", True)):
+        device = "cpu"
     use_full = bool(config.get("use_full_features", False))
     try:
         model = _PVN.load(model_path, map_location=device)
@@ -323,12 +329,14 @@ def _selfplay_daemon_worker(worker_id: int,
     # エージェントと環境を構築（共有バッファは使用せず、サンプルは Queue へ）
     num_players = int(config.get("num_players", 4))
     agents: List[AlphaZeroAgent] = []
+    worker_zero_buffer = bool(config.get("worker_zero_buffer", False))
     for pid in range(num_players):
         ag = AlphaZeroAgent(player_id=pid, model=model, config=dict(config))
         # ワーカー内では共有リプレイを使わない
         try:
             ag._use_shared = False
-            ag.replay_buffer = []
+            # worker_zero_buffer が True の場合は None、False の場合は空リスト
+            ag.replay_buffer = None if worker_zero_buffer else []
             ag.logger = None
         except Exception:
             pass
@@ -469,7 +477,7 @@ def _selfplay_daemon_worker(worker_id: int,
                 ag.reset_episode()
         step_count = 0
         prev_rankings: List[int] = list(getattr(env.game, "rankings", []))
-        dbg_samples_before = [len(getattr(ag, 'replay_buffer', [])) for ag in agents if hasattr(ag, 'replay_buffer')]
+        dbg_samples_before = [len(buf) for ag in agents if hasattr(ag, 'replay_buffer') and (buf := getattr(ag, 'replay_buffer')) is not None and hasattr(buf, '__len__')]
         while not getattr(env.game, "done", False):
             if step_count >= max_steps:
                 break
@@ -529,10 +537,24 @@ def _selfplay_daemon_worker(worker_id: int,
         # このエピソードで確定したサンプルを Queue へ送信
         for az in agents:
             try:
-                for s in list(az.replay_buffer):
+                buf = getattr(az, 'replay_buffer', None)
+                if buf is None:
+                    # 代替案: エージェントに _confirmed_samples というリストを追加し、
+                    # finalize/flush 時にそこに移動してからクリアする。
+                    # 
+                    # 緊急対応: 各エージェントに _episode_confirmed_samples を追加
+                    episode_samples = getattr(az, '_episode_confirmed_samples', [])
+                    for s in episode_samples:
+                        if isinstance(s, dict) and s.get("value") is not None:
+                            sample_queue.put(s, block=True)
+                    # クリア
+                    if hasattr(az, '_episode_confirmed_samples'):
+                        az._episode_confirmed_samples.clear()
+                    continue
+                for s in list(buf):
                     if isinstance(s, dict) and s.get("value") is not None:
                         sample_queue.put(s, block=True)
-                az.replay_buffer.clear()  # 重複防止
+                buf.clear()  # 重複防止
             except Exception:
                 pass
 
@@ -1201,7 +1223,7 @@ class Trainer:
         *,
         total_episodes: int,
         workers: int | None = None,
-        updates_per_iter: int = 15,
+        updates_per_iter: int = 50,
         queue_maxsize: int = 15000,
         progress_print_every: int = 50,
     ):
@@ -1282,6 +1304,7 @@ class Trainer:
             nonlocal dst_buffer
             consumed = 0
             skipped = 0
+            import random as _r
             while True:
                 if max_items is not None and consumed >= max_items:
                     break
@@ -1298,6 +1321,13 @@ class Trainer:
                     skipped += 1
                     continue
                 # 取り込み
+                # 学習/検証スプリットが未設定ならここで付与（ワーカーで未設定の場合の後方互換）
+                try:
+                    if s.get('split') is None:
+                        ratio = float(self.config.get('val_split_ratio', 0.0) or 0.0)
+                        s['split'] = 'val' if (_r.random() < ratio) else 'train'
+                except Exception:
+                    pass
                 if self.shared_replay is not None:
                     try:
                         self.shared_replay.append(s)
@@ -1638,15 +1668,94 @@ class Trainer:
                         # ロガーへ
                         if self.logger and isinstance(loss_info, dict) and loss_info.get("loss") is not None and not getattr(self.agents[0], '_logged_inside', False):
                             self.logger.log_train(loss_info)
+                        # 検証 (設定に応じて学習更新ごとに評価)
+                        try:
+                            val_every = int(self.config.get("val_eval_every_updates", 0) or 0)
+                        except Exception:
+                            val_every = 0
+                        if self.logger and val_every > 0 and (train_it % val_every == 0):
+                            try:
+                                vinfo = self.agents[0].validate_step(batch_size=self.config.get("val_batch_size") or self.config.get("batch_size", 256))
+                            except Exception:
+                                vinfo = {"policy_loss": None, "value_loss": None, "entropy": None}
+                            if isinstance(vinfo, dict) and (vinfo.get("policy_loss") is not None or vinfo.get("value_loss") is not None):
+                                self.logger.log_validation(vinfo)
                     #  既存動作に合わせた保存は維持しつつ、高頻度I/Oを抑制
+                    #  保存直前に評価ゲート（有効時）を実行し、採用可否でモデルを確定させる
+                    def _resolve_device_str(dev_str: str | None) -> str:
+                        if not dev_str or dev_str == "auto":
+                            try:
+                                import torch as _t
+                                return "cuda" if _t.cuda.is_available() else "cpu"
+                            except Exception:
+                                return "cpu"
+                        return dev_str
+
+                    def _maybe_gate_before_save():
+                        gate_enable = bool(self.config.get("eval_gate_enable", False))
+                        if not gate_enable or self.model is None:
+                            return None
+                        baseline_model = None
+                        try:
+                            from agents.models import PolicyValueNet as _PVN
+                            ckpt_path = self.config.get("checkpoint_path", "checkpoints/policy_value_latest.pt")
+                            if os.path.exists(ckpt_path):
+                                dev_str = _resolve_device_str(self.config.get("device", None))
+                                baseline_model = _PVN.load(ckpt_path, map_location=dev_str)
+                                try:
+                                    dev = _resolve_device_str(self.config.get("device", None))
+                                    if dev:
+                                        baseline_model.to(dev)  # type: ignore[arg-type]
+                                except Exception:
+                                    pass
+                        except Exception as _e:
+                            if self.logger:
+                                try:
+                                    self.logger.log_text(f"[WARN] eval-gate baseline load failed (concurrent): {_e}")
+                                except Exception:
+                                    pass
+                            baseline_model = None
+                        if baseline_model is None:
+                            return None
+                        try:
+                            from evaluation.gating import evaluate_candidate
+                            games = int(self.config.get("eval_gate_games", 20) or 20)
+                            thr = float(self.config.get("eval_gate_threshold", 0.6) or 0.6)
+                            seed = self.config.get("eval_gate_seed", None)
+                            gate_result = evaluate_candidate(self.model, baseline_model, self.config, games=games, seed=seed)
+                            gated_pass = (gate_result.get("win_rate", 0.0) >= thr)
+                            msg = f"[GATE] win_rate={gate_result.get('win_rate'):.2%} threshold={thr:.0%} result={'ACCEPT' if gated_pass else 'REJECT'}"
+                            if self.logger:
+                                self.logger.log_text(msg)
+                            else:
+                                print(msg)
+                            if not gated_pass:
+                                # ロールバック
+                                self.model = baseline_model
+                                learner = self.agents[self.learning_player_id]
+                                if isinstance(learner, AlphaZeroAgent):
+                                    learner.set_model(self.model)
+                                if self.logger:
+                                    self.logger.log_text("[GATE] reverted to baseline model (concurrent)")
+                            return gate_result
+                        except Exception as e:
+                            if self.logger:
+                                try:
+                                    self.logger.log_text(f"[WARN] eval-gate failed in concurrent save: {e}")
+                                except Exception:
+                                    pass
+                            return None
+
                     if latest_ckpt_interval_sec > 0.0:
                         if (now - last_latest_ckpt_ts) >= latest_ckpt_interval_sec:
+                            _ = _maybe_gate_before_save()
                             self._save_checkpoint()
                             if self.keep_prev_model:
                                 self._snapshot_current_model()
                             last_latest_ckpt_ts = now
                     else:
                         # 0 以下なら常に保存（従来挙動）
+                        _ = _maybe_gate_before_save()
                         self._save_checkpoint()
                         if self.keep_prev_model:
                             self._snapshot_current_model()
@@ -1733,6 +1842,18 @@ class Trainer:
             if new_samples_since_train > 0:
                 for _ in range(max(1, int(updates_per_iter))):
                     _ = self.agents[0].train_step(batch_size=self.config.get("batch_size", 256))
+                    # オプション: 最後の検証を1回実行（有効化時）
+                    try:
+                        val_every = int(self.config.get("val_eval_every_updates", 0) or 0)
+                    except Exception:
+                        val_every = 0
+                    if self.logger and val_every > 0:
+                        try:
+                            vinfo = self.agents[0].validate_step(batch_size=self.config.get("val_batch_size") or self.config.get("batch_size", 256))
+                        except Exception:
+                            vinfo = {"policy_loss": None, "value_loss": None, "entropy": None}
+                        if isinstance(vinfo, dict) and (vinfo.get("policy_loss") is not None or vinfo.get("value_loss") is not None):
+                            self.logger.log_validation(vinfo)
                     if self.config.get("purge_replay_after_each_update"):
                         try:
                             self._save_checkpoint()
@@ -1741,6 +1862,57 @@ class Trainer:
                         except Exception as _e:
                             print(f"[WARN] immediate save after update (final) failed: {_e}")
             # 仕上げの保存（スロットリングに関わらず1回実施）
+            # 最終保存前にも評価ゲート（有効時）を適用して確定モデルを選別
+            try:
+                gate_enable = bool(self.config.get("eval_gate_enable", False))
+            except Exception:
+                gate_enable = False
+            if gate_enable and self.model is not None:
+                baseline_model = None
+                try:
+                    from agents.models import PolicyValueNet as _PVN
+                    ckpt_path = self.config.get("checkpoint_path", "checkpoints/policy_value_latest.pt")
+                    if os.path.exists(ckpt_path):
+                        def _resolve_device_str(dev_str: str | None) -> str:
+                            if not dev_str or dev_str == "auto":
+                                try:
+                                    import torch as _t
+                                    return "cuda" if _t.cuda.is_available() else "cpu"
+                                except Exception:
+                                    return "cpu"
+                            return dev_str
+                        dev_str = _resolve_device_str(self.config.get("device", None))
+                        baseline_model = _PVN.load(ckpt_path, map_location=dev_str)
+                        try:
+                            dev = dev_str
+                            if dev:
+                                baseline_model.to(dev)  # type: ignore[arg-type]
+                        except Exception:
+                            pass
+                except Exception as _e:
+                    baseline_model = None
+                if baseline_model is not None:
+                    try:
+                        from evaluation.gating import evaluate_candidate
+                        games = int(self.config.get("eval_gate_games", 20) or 20)
+                        thr = float(self.config.get("eval_gate_threshold", 0.6) or 0.6)
+                        seed = self.config.get("eval_gate_seed", None)
+                        gate_result = evaluate_candidate(self.model, baseline_model, self.config, games=games, seed=seed)
+                        gated_pass = (gate_result.get("win_rate", 0.0) >= thr)
+                        msg = f"[GATE] (final) win_rate={gate_result.get('win_rate'):.2%} threshold={thr:.0%} result={'ACCEPT' if gated_pass else 'REJECT'}"
+                        if self.logger:
+                            self.logger.log_text(msg)
+                        else:
+                            print(msg)
+                        if not gated_pass:
+                            self.model = baseline_model
+                            learner = self.agents[self.learning_player_id]
+                            if isinstance(learner, AlphaZeroAgent):
+                                learner.set_model(self.model)
+                            if self.logger:
+                                self.logger.log_text("[GATE] (final) reverted to baseline model")
+                    except Exception:
+                        pass
             self._save_checkpoint()
             if self.keep_prev_model and self.model is not None:
                 self._snapshot_current_model()
@@ -1770,6 +1942,15 @@ class Trainer:
                     self.logger.write_csv_summaries()
             except Exception as e:
                 print(f"[WARN] write_csv_summaries(train_concurrent) failed: {e}")
+        # 終了サマリを events.log に出力
+        try:
+            if self.logger:
+                self.logger.log_text(f"[summary] total_episodes={ep_done} total_train_updates={train_it}")
+                # バッファをフラッシュして確実にディスクへ書き込む
+                if hasattr(self.logger, 'flush_buffers'):
+                    self.logger.flush_buffers(force=True)
+        except Exception:
+            pass
         # サマリーを返す（合計エピソード数と総学習ステップ数）
         return {"episodes": ep_done, "train_updates": train_it}
 
@@ -2084,6 +2265,39 @@ class Trainer:
     def train_updates(self, num_updates: int = 1):
         start_time = time.time()
         last_print = 0
+        successful_updates = 0  # 実際に損失が計算できた学習回数
+        # --- 評価ゲート用: 学習前のベースラインモデルを保持（存在すれば ckpt、なければ現モデルのコピー） ---
+        gate_enable = bool(self.config.get("eval_gate_enable", False))
+        baseline_model = None
+        if gate_enable:
+            try:
+                from agents.models import PolicyValueNet as _PVN
+                ckpt = self.config.get("checkpoint_path", "checkpoints/policy_value_latest.pt")
+                if os.path.exists(ckpt):
+                    # resolve device 'auto' -> actual
+                    def _resolve_device_str(dev_str: str | None) -> str:
+                        if not dev_str or dev_str == "auto":
+                            try:
+                                import torch as _t
+                                return "cuda" if _t.cuda.is_available() else "cpu"
+                            except Exception:
+                                return "cpu"
+                        return dev_str
+                    dev_str = _resolve_device_str(self.config.get("device", None))
+                    baseline_model = _PVN.load(ckpt, map_location=dev_str)
+                    # align device if needed
+                    try:
+                        if dev_str:
+                            baseline_model.to(dev_str)  # type: ignore[arg-type]
+                    except Exception:
+                        pass
+                else:
+                    # フォールバック: 現在モデルの shallow コピー（同一参照回避）
+                    import copy as _copy
+                    baseline_model = _copy.deepcopy(self.model)
+            except Exception as _e:
+                print(f"[WARN] eval-gate baseline load failed: {_e}")
+                baseline_model = None
         for i in range(num_updates):
             loss_info = self.agents[0].train_step(batch_size=self.config.get("batch_size", 256))
             # ログ用にエポック情報を付与（存在する辞書に無害に追加）
@@ -2093,6 +2307,8 @@ class Trainer:
             if loss_info.get("reason") == "no_data":
                 print("[WARN] train_step skipped: no_data (consider increasing episodes or buffer)")
             else:
+                if isinstance(loss_info, dict) and loss_info.get("loss") is not None:
+                    successful_updates += 1
                 # 共有バッファ存在時に学習プレイヤーサンプルの割合を軽くチェック
                 if self.config.get("use_shared_replay", False) and self.shared_replay is not None:
                     total = len(self.shared_replay)
@@ -2126,7 +2342,27 @@ class Trainer:
                     print(f"[TRAIN] epoch={i+1}/{num_updates} loss={loss_info}")
             # ロガーへ (train_step 内で既に push されている場合は二重記録を避ける)
             if self.logger and loss_info.get("loss") is not None and not getattr(self.agents[0], '_logged_inside', False):
-                self.logger.log_train(loss_info)
+                # 新列: 非並行モードではローカルカウンタで代用（logger 側で update_step をフォールバックに使用）
+                try:
+                    payload = dict(loss_info)
+                    payload["train_count"] = i + 1
+                except Exception:
+                    payload = loss_info
+                self.logger.log_train(payload)
+
+            # 検証: 指定間隔で検証バッチの損失を測定しログへ
+            try:
+                val_every = int(self.config.get("val_eval_every_updates", 0) or 0)
+            except Exception:
+                val_every = 0
+            if self.logger and val_every > 0 and ((i + 1) % val_every == 0):
+                try:
+                    vinfo = self.agents[0].validate_step(batch_size=self.config.get("val_batch_size") or self.config.get("batch_size", 256))
+                except Exception:
+                    vinfo = {"policy_loss": None, "value_loss": None, "entropy": None}
+                # 可能ならロギング
+                if isinstance(vinfo, dict) and (vinfo.get("policy_loss") is not None or vinfo.get("value_loss") is not None):
+                    self.logger.log_validation(vinfo)
 
             # 即時 checkpoint + purge オプション (単独 train_updates 用 / concurrent とは別経路)
             if self.config.get('purge_replay_after_each_update'):
@@ -2149,6 +2385,41 @@ class Trainer:
                         self.logger.log_text(f"[replay] immediate_purge_after_update(train_updates) prev_size={old_size}")
                 except Exception as e:
                     print(f"[WARN] immediate checkpoint after update failed: {e}")
+        # --- 学習後: ゲート評価（有効時） ---
+        gated_pass = True
+        gate_result = None
+        if gate_enable and (self.model is not None) and (baseline_model is not None):
+            try:
+                from evaluation.gating import evaluate_candidate
+                games = int(self.config.get("eval_gate_games", 20) or 20)
+                thr = float(self.config.get("eval_gate_threshold", 0.6) or 0.6)
+                seed = self.config.get("eval_gate_seed", None)
+                gate_result = evaluate_candidate(self.model, baseline_model, self.config, games=games, seed=seed)
+                gated_pass = (gate_result.get("win_rate", 0.0) >= thr)
+                msg = f"[GATE] win_rate={gate_result.get('win_rate'):.2%} threshold={thr:.0%} result={'ACCEPT' if gated_pass else 'REJECT'}"
+                if self.logger:
+                    self.logger.log_text(msg)
+                else:
+                    print(msg)
+            except Exception as e:
+                print(f"[WARN] eval-gate failed to run: {e}")
+                gated_pass = True  # フォールバックで通す
+
+        # 許可された場合のみ保存。拒否ならロールバックして旧モデルを維持
+        if not gated_pass and baseline_model is not None:
+            try:
+                # ロールバック
+                self.model = baseline_model
+                # 学習プレイヤーへも反映
+                learner = self.agents[self.learning_player_id]
+                if isinstance(learner, AlphaZeroAgent):
+                    learner.set_model(self.model)
+                if self.logger:
+                    self.logger.log_text("[GATE] reverted to baseline model")
+            except Exception as e:
+                print(f"[WARN] revert to baseline failed: {e}")
+
+        # 保存実行（gated_pass に応じて self.model は適切な方がセットされている）
         self._save_checkpoint()
         # 学習直後の最新モデルもスナップショット (自己対局前に世代差が明確になる)
         if self.keep_prev_model:
@@ -2159,6 +2430,21 @@ class Trainer:
                 self.logger.write_csv_summaries()
             except Exception as e:
                 print(f"[WARN] write_csv_summaries failed: {e}")
+        # 終了サマリを events.log に出力
+        try:
+            if self.logger:
+                extra = ''
+                try:
+                    if gate_result is not None:
+                        extra = f" gate_win_rate={gate_result.get('win_rate'):.4f} gate_games={gate_result.get('games')}"
+                except Exception:
+                    extra = ''
+                self.logger.log_text(f"[summary] train_updates_requested={num_updates} train_updates_successful={successful_updates}{extra}")
+                # バッファをフラッシュして確実にディスクへ書き込む
+                if hasattr(self.logger, 'flush_buffers'):
+                    self.logger.flush_buffers(force=True)
+        except Exception:
+            pass
 
     # -----------------------------------------------------
     # 進捗バー生成ヘルパー
@@ -2200,12 +2486,12 @@ class Trainer:
         # 最新モデル保存 (atomic)
         latest_path = self.config["checkpoint_path"]
         if self.model is not None:
-            _atomic_save(latest_path, lambda p: self.model.save(p))
+            _atomic_save(latest_path, lambda p: self.model.save(p, force_sync=True))
         # バージョン付き保存
         if version_tag:
             ver_path = os.path.join(self.config["checkpoint_dir"], f"policy_value_{version_tag}.pt")
             if self.model is not None:
-                _atomic_save(ver_path, lambda p: self.model.save(p))
+                _atomic_save(ver_path, lambda p: self.model.save(p, force_sync=True))
         # リプレイ保存: 共有モードなら共有バッファを保存、そうでなければ従来通り代表エージェント
         replay_path = self.config.get("replay_path", "replay_buffer.joblib")
         purge_after_ckpt = bool(self.config.get("purge_replay_after_checkpoint", False))
@@ -2375,24 +2661,18 @@ if __name__ == "__main__":
     #print("[CLI] Config overrides:", {k: cfg[k] for k in ["num_simulations","batch_size","log_dir","enable_tensorboard","device"] if k in cfg})
     trainer = Trainer(config=cfg)
     trainer.setup()
-    # 並行モードが指定された場合
-    if args.concurrent:
-        total_eps = args.total_episodes if args.total_episodes is not None else args.episodes
-        summary = trainer.train_concurrent(
-            total_episodes=int(total_eps),
-            workers=args.workers if args.workers is not None else None,
-            updates_per_iter=int(args.concurrent_updates_per_iter),
-            queue_maxsize=int(args.concurrent_queue_size),
-        )
-        # 並行モードの終了メッセージ（実績値）
-        try:
-            print(f"[INFO] concurrent run finished total_episodes={summary.get('episodes')} train_updates={summary.get('train_updates')}")
-        except Exception:
-            pass
-    else:
-        # 従来の単発実行
-        trainer.self_play(num_episodes=args.episodes)
-        trainer.train_updates(num_updates=args.updates)
-        print(f"[INFO] run finished episodes={args.episodes} updates={args.updates}")
+    # 非並行モードは廃止し、常に並行モードで実行
+    total_eps = args.total_episodes if args.total_episodes is not None else args.episodes
+    summary = trainer.train_concurrent(
+        total_episodes=int(total_eps),
+        workers=args.workers if args.workers is not None else None,
+        updates_per_iter=int(args.concurrent_updates_per_iter),
+        queue_maxsize=int(args.concurrent_queue_size),
+    )
+    # 並行モードの終了メッセージ（実績値）
+    try:
+        print(f"[INFO] concurrent run finished total_episodes={summary.get('episodes')} train_updates={summary.get('train_updates')}")
+    except Exception:
+        pass
     #print("[INFO] checkpoints ->", cfg.get("checkpoint_path"))
     #print("[INFO] replay ->", cfg.get("replay_path"))

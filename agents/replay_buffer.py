@@ -122,7 +122,8 @@ class ReplayBuffer:
         # これにより再帰的な複雑構造の混入 (特に raw pi / backup legal_actions による巨大ネスト) リスクを下げる。
         allow_keys = {
             "player_id", "state", "value", "model_version", "feature_version", "value_pred",
-            "uid", "pi_q", "pi_format", "legal_ids", "actions_format", "value_u8", "value_pred_u8"
+            "uid", "pi_q", "pi_format", "legal_ids", "actions_format", "value_u8", "value_pred_u8",
+            "split"
         }
 
         # 簡易ネスト深さ推定 (dict/list/tuple のみ辿る)。深すぎる場合は後でログに残す。

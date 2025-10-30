@@ -237,24 +237,32 @@ def run_puct_mcts(root_env_copy,
         g_new.passed = list(g.passed)
         g_new.rankings = list(getattr(g, 'rankings', []))
         # 行動履歴コピー (存在すれば)
+        # 行動履歴は MCTS シミュレーションでは参照しないため複製しない（大幅なメモリ削減）
+        # 重要: RuleChecker/Deck の deepcopy は非常に重いので回避し、最小限の状態のみを複製する
+        from game.rules import RuleChecker
+        rc_src = getattr(g, 'rule_checker', None)
+        rc = RuleChecker()
+        if rc_src is not None:
+            # 革命フラグなど必要な最低限の状態のみコピー（イベントや履歴はコピーしない）
+            try:
+                rc.revolution = bool(getattr(rc_src, 'revolution', False))
+            except Exception:
+                rc.revolution = False
+            for name in (
+                'strict_straight_progression',
+                'rev_enable_four_kind','rev_four_kind_allow_joker','rev_four_kind_exact',
+                'rev_enable_straight','rev_straight_min_len','rev_straight_allow_joker',
+            ):
+                try:
+                    setattr(rc, name, getattr(rc_src, name))
+                except Exception:
+                    pass
+        g_new.rule_checker = rc
+        # Deck は配り直し時にしか使用しないため、共有参照で十分（リセットは行わない経路）
         try:
-            if hasattr(g, '_action_history'):
-                g_new._action_history = list(getattr(g, '_action_history'))
+            g_new.deck = getattr(g, 'deck', None)
         except Exception:
-            pass
-        # 重要: rule_checker, deck は共有すると副作用が本番へ伝播するので deepcopy
-        try:
-            g_new.rule_checker = copy.deepcopy(g.rule_checker)
-        except Exception:
-            # 最低限、新しいインスタンスへイベントはコピーしない形でフォールバック
-            from game.rules import RuleChecker
-            rc = RuleChecker()
-            rc.revolution = getattr(g.rule_checker, 'revolution', False)
-            g_new.rule_checker = rc
-        try:
-            g_new.deck = copy.deepcopy(g.deck)
-        except Exception:
-            pass
+            g_new.deck = None
         env_new = copy.copy(env)
         env_new.game = g_new
         return env_new
@@ -278,7 +286,8 @@ def run_puct_mcts(root_env_copy,
                 return None
         state_key_fn = state_key_fn_default
 
-    TT = transposition_table if transposition_table is not None else {}
+    # トランスポジションテーブル（None の場合はキャッシュ無効）
+    TT = transposition_table if transposition_table is not None else None
 
     # --------------------------------------
     # 反復: バッチ評価付き MCTS
@@ -294,6 +303,25 @@ def run_puct_mcts(root_env_copy,
                 post_min_batch = pm
         except Exception:
             post_min_batch = None
+
+    # 内部ヘルパ: どの環境実装でも「外部から与えた行動」で前進させる
+    def _step_env_safe(e, act):
+        # 1) 新しい環境: external_action + simulate
+        try:
+            return e.step(return_info=False, external_action=act, simulate=True)
+        except TypeError:
+            pass
+        # 2) 互換: force_action
+        try:
+            return e.step(force_action=act)
+        except TypeError:
+            pass
+        # 3) 最後のフォールバック: 単一引数（古い step(action) 互換）
+        try:
+            return e.step(act)
+        except Exception:
+            # どうしても適用できない場合は no-op とする
+            return None
 
     while sims_done < num_simulations:
         # 1バッチ分の葉を収集
@@ -320,10 +348,7 @@ def run_puct_mcts(root_env_copy,
                 node = _puct_select(node, c_puct, virtual_counts)
                 # 同一バッチ中に同じ経路が過剰に選ばれないよう仮想訪問を加算
                 virtual_counts[id(node)] = virtual_counts.get(id(node), 0) + 1
-                try:
-                    env_copy.step(external_action=node.action, simulate=True)
-                except TypeError:
-                    env_copy.step(node.action)
+                _step_env_safe(env_copy, node.action)
             leaf_nodes.append(node)
             leaf_envs.append(env_copy)
             k = state_key_fn(env_copy)
@@ -336,7 +361,7 @@ def run_puct_mcts(root_env_copy,
         cached_results = {}
         for i, (k, leg) in enumerate(zip(leaf_keys, leaf_legal)):
             # TT ヒット時は保存済みの合法手を使えるよう (policy, value, legal) の形式を許容
-            if k is not None and k in TT:
+            if TT is not None and k is not None and k in TT:
                 cached = TT[k]
                 if isinstance(cached, tuple) and len(cached) == 3:
                     cached_results[i] = cached  # (policy, value, legal)
@@ -384,7 +409,7 @@ def run_puct_mcts(root_env_copy,
             elif i in evaluated:
                 policy_leaf, leaf_value = evaluated[i]
                 k = leaf_keys[i]
-                if k is not None:
+                if TT is not None and k is not None:
                     # 合法手も併せて保存し、次回ヒット時の法生成を省略
                     TT[k] = (policy_leaf, leaf_value, leg)
             else:

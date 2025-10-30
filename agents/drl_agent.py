@@ -116,6 +116,8 @@ class AlphaZeroAgent:
 
         # フェーズ中サンプル保持 (フェーズ確定時にラベル付与)
         self._phase_samples: List[Any] = []
+        # worker_zero_buffer モード用: エピソード内で確定したサンプルを一時保持
+        self._episode_confirmed_samples: List[Dict[str, Any]] = []
         self.env_ref = None  # 直近参照環境
         self.logger = None   # 外部ロガー (TensorBoard 等)
         self._logged_inside = False  # 二重記録防止
@@ -134,7 +136,7 @@ class AlphaZeroAgent:
         self.tt_hits = 0
         self.tt_misses = 0
         # pos weight (クラス不均衡対策) optional
-        self.pos_weight = float(self.config.get("value_pos_weight", 1.0))
+        self.pos_weight = float(self.config.get("value_pos_weight", 1.5))
 
         # --- 重複サンプルフィルタ構造 (シグネチャ頻度カウント) ---
         self._dup_enabled = bool(self.config.get('enable_duplicate_filter', False))
@@ -216,7 +218,8 @@ class AlphaZeroAgent:
         # ---- MCTS 実行 & 性能計測 ----
         import time as _perf_t
         _t0 = _perf_t.time()
-        root = self._run_mcts(env)
+        # training フラグを MCTS 実行へ伝播
+        root = self._run_mcts(env, training=training)
         _mcts_ms = (_perf_t.time() - _t0) * 1000.0
         # 実際のシミュレーション数 (Early Stop 計測)
         # mcts-sims ログはユーザ要望により無効化（以前は平均/直近シミュレーション数を一定間隔で記録）
@@ -230,8 +233,13 @@ class AlphaZeroAgent:
         visits = [child.visit_count for child in root.children.values()]
 
         # 温度決定 (手数/進行に応じたスケジュール)
-        cur_temp = self._select_temperature(training=training)
-        pi = softmax_temperature_policy(visits, cur_temp)
+        # 行動サンプリング用: 現在のスケジュールに従う（高温→低温）
+        tau_action = self._select_temperature(training=training)
+        pi_action = self._apply_temperature_to_visits(visits, tau_action)
+        
+        # 学習ターゲット用: policy_target_tau で固定（訪問数の素直な正規化）
+        tau_target = float(self.config.get("policy_target_tau", 1.0))
+        pi_target = self._apply_temperature_to_visits(visits, tau_target)
 
         # MCTS 統計のサンプリングログ (低確率で記録)
         if actions:
@@ -258,20 +266,39 @@ class AlphaZeroAgent:
                         "visit_entropy": visit_ent,
                         "kl_prior_visit": kl,
                         "top1_same": top1_same,
-                        "temperature": cur_temp,
+                        "temperature": tau_action,  # 行動用温度を記録
                     })
             except Exception:
                 pass
         # per-move [perf] ログは削除済 (必要なら Git 履歴から復元可能)
 
-        # π に従い行動サンプリング (行動なしなら pass)
-        chosen = random.choices(actions, weights=pi, k=1)[0] if actions else "pass"
+        # 序盤完全ランダムオプション (config.opening_random_enable)
+        opening_random_enable = bool(self.config.get("opening_random_enable", False))
+        opening_random_moves = int(self.config.get("opening_random_moves", 0))
+        opening_include_pass = bool(self.config.get("opening_random_include_pass", False))
+        use_opening_random = (
+            training
+            and opening_random_enable
+            and opening_random_moves > 0
+            and self.move_count < opening_random_moves
+        )
+        random_pool = actions
+        if use_opening_random and actions:
+            if not opening_include_pass:
+                filtered = [a for a in actions if a != "pass"]
+                if filtered:
+                    random_pool = filtered
+            chosen = random.choice(random_pool) if random_pool else "pass"
+        else:
+            # π_action に従い行動サンプリング (行動なしなら pass)
+            chosen = random.choices(actions, weights=pi_action, k=1)[0] if actions else "pass"
         action_env = None if chosen == "pass" else chosen
         if isinstance(action_env, tuple):  # tuple を list 化
             action_env = list(action_env)
         action_env = self._validate_action(env, action_env)
 
         # リプレイサンプル保存 (value=None : 未確定)
+        # 重要: 保存するのは pi_target（学習用、エントロピーの低い分布）
         state_repr = self._extract_state(env)
         serialized_legal = [None if a == "pass" else (list(a) if isinstance(a, tuple) else a) for a in actions]
         try:
@@ -279,7 +306,7 @@ class AlphaZeroAgent:
             _, value_scalar_for_store = self._policy_value(env)
         except Exception:
             value_scalar_for_store = 0.5
-        stored = self._store_sample(state_repr, serialized_legal, pi, None, value_pred=value_scalar_for_store)
+        stored = self._store_sample(state_repr, serialized_legal, pi_target, None, value_pred=value_scalar_for_store)
         self._phase_samples.append(stored)
         self.move_count += 1
 
@@ -343,8 +370,34 @@ class AlphaZeroAgent:
         high_window = self._compute_high_temp_window()
         return high_temp if self.move_count < high_window else low_temp
 
+    def _apply_temperature_to_visits(self, visits, tau: float):
+        """訪問数に温度τを適用して確率分布を生成する。
+
+        Args:
+            visits: ルート子ノードの訪問回数リスト
+            tau: 温度パラメータ（0に近いほどシャープ、大きいほど平坦）
+
+        Returns:
+            温度適用後の確率分布（合計=1.0）
+        """
+        import numpy as np
+        v = np.asarray(visits, dtype=np.float64)
+        if tau <= 1e-6:
+            # 低温極限: argmax にほぼ1.0
+            pi = np.zeros_like(v, dtype=np.float64)
+            pi[int(v.argmax())] = 1.0
+            return pi.tolist()
+        # v^(1/τ) で温度適用
+        v_pow = np.power(v + 1e-10, 1.0 / tau)
+        z = v_pow.sum()
+        if z <= 0:
+            # フォールバック: 一様分布
+            return [1.0 / len(v)] * len(v)
+        pi = v_pow / z
+        return pi.tolist()
+
     # ---------------- Core (MCTS) ----------------
-    def _run_mcts(self, env) -> PUCTNode:
+    def _run_mcts(self, env, training: bool = True) -> PUCTNode:
         """環境を軽量コピーし PUCT MCTS を実行してルートノードを返す."""
         env_copy = self._copy_env(env)
 
@@ -443,17 +496,51 @@ class AlphaZeroAgent:
 
         # Determinization (imperfect information + pass 制約)
         det_enable = bool(self.config.get('enable_determinization', True))
-        def _determinize(e_clone, original_env, root_pid):
-            if not det_enable:
+        root_pid = getattr(env.game, "turn", 0)
+        # 学習/推論でモード切替
+        det_mode = (self.config.get('determinization_mode_train', 'fixed_once') if training
+                    else self.config.get('determinization_mode_eval', 'stochastic'))
+
+        # fixed_once 用テンプレート（1回サンプルした割当を全シミュレーションに固定適用）
+        template_assignment = None
+        if det_enable and det_mode == 'fixed_once':
+            try:
+                ok, assign = self._build_single_determinization(env_copy, env, root_pid, apply_direct=False)
+                if ok:
+                    template_assignment = assign
+            except Exception:
+                template_assignment = None
+
+        def _apply_assignment_fixed(e_clone, assignment, root_pid_):
+            try:
+                g_new = e_clone.game
+                from game.card import Card
+                for pid, cards_str in assignment.get('hands', {}).items():
+                    if pid == root_pid_:
+                        continue
+                    try:
+                        g_new.players[pid].hand = [Card.from_string(s) if hasattr(Card,'from_string') else Card(s) for s in cards_str]
+                    except Exception:
+                        g_new.players[pid].hand = list(cards_str)
+            except Exception:
+                pass
+
+        def _determinize(e_clone, original_env, root_pid_):
+            if not det_enable or det_mode == 'none':
                 return
-            # 並列 pool 有効なら取得を試みる
+            if det_mode == 'fixed_once' and template_assignment is not None:
+                _apply_assignment_fixed(e_clone, template_assignment, root_pid_)
+                return
+            # stochastic: プール→フォールバックの順で適用
             if self.config.get('enable_parallel_determinization', True):
-                used = self._apply_from_det_pool(e_clone, original_env, root_pid)
+                used = self._apply_from_det_pool(e_clone, original_env, root_pid_)
                 if used:
                     return
-            # フォールバック: インライン生成
             self._det_stats['pool_fallback_inline'] = self._det_stats.get('pool_fallback_inline',0) + 1
-            self._inline_determinize(e_clone, original_env, root_pid)
+            self._inline_determinize(e_clone, original_env, root_pid_)
+
+        # 推論時は Dirichlet を既定で無効化
+        add_dirichlet_flag = True if training else bool(self.config.get('inference_dirichlet', False))
 
         return run_puct_mcts(
             root_env_copy=env_copy,
@@ -462,10 +549,10 @@ class AlphaZeroAgent:
             policy_value_batch_fn=policy_value_batch_fn,
             get_legal_actions_fn=legal_fn,
             c_puct=self.puct_c,
-            add_dirichlet=True,
+            add_dirichlet=add_dirichlet_flag,
             dirichlet_alpha=self.dirichlet_alpha,
             dirichlet_epsilon=self.dirichlet_epsilon,
-            root_player_id=getattr(env.game, "turn", 0),
+            root_player_id=root_pid,
             batch_eval_size=self.mcts_batch_eval_size,
             transposition_table=TT,
             determinize_fn=_determinize if det_enable else None,
@@ -1362,6 +1449,9 @@ class AlphaZeroAgent:
         # フル特徴量モード時に legacy サンプル(=0) を破棄して無駄容量を防ぐ
         if self.config.get('use_full_features') and sample['feature_version'] == 0:
             return sample  # 破棄 (格納しない)。戻り値だけ返す。
+        # worker_zero_buffer モード: replay_buffer が None の場合はサンプルを返すのみ
+        if self.replay_buffer is None:
+            return sample  # Queue 送信は finalize_phase で行う
         if self._use_shared and hasattr(self.replay_buffer, 'append'):
             # 共有リプレイ (ReplayBuffer.append 内でエビクション処理)
             self.replay_buffer.append(sample)
@@ -1397,6 +1487,14 @@ class AlphaZeroAgent:
                 rec["value_u8"] = int(255 if value is None else max(0, min(255, round(float(value) * 255))))
             except Exception:
                 pass
+            # 学習/検証スプリットを一度だけ付与
+            try:
+                if rec.get('split') is None:
+                    ratio = float(self.config.get('val_split_ratio', 0.0) or 0.0)
+                    import random as _r
+                    rec['split'] = 'val' if (_r.random() < ratio) else 'train'
+            except Exception:
+                pass
 
     def finalize_phase(self, winner_player_id: int, was_active: bool):
         """フェーズ終端処理: 勝者IDに基づき 0/1 ラベル付与 + 予測精度集計."""
@@ -1420,6 +1518,11 @@ class AlphaZeroAgent:
         except Exception:
             pass
         self.assign_values(self._phase_samples, val)
+        # worker_zero_buffer モード: 確定サンプルを一時リストに保存
+        if self.replay_buffer is None:
+            for s in self._phase_samples:
+                if isinstance(s, dict) and s.get("value") is not None:
+                    self._episode_confirmed_samples.append(s)
         self._phase_samples = []
 
     def flush_unfinished_phase(self):
@@ -1440,6 +1543,11 @@ class AlphaZeroAgent:
             except Exception:
                 pass
             self.assign_values(self._phase_samples, 0.0)
+            # worker_zero_buffer モード: 確定サンプルを一時リストに保存
+            if self.replay_buffer is None:
+                for s in self._phase_samples:
+                    if isinstance(s, dict) and s.get("value") is not None:
+                        self._episode_confirmed_samples.append(s)
             self._phase_samples = []
 
     def finalize_game(self, *_args, **_kwargs):  # 互換維持用 no-op
@@ -1566,16 +1674,20 @@ class AlphaZeroAgent:
             return {"loss": None, "reason": "torch_not_installed"}
         if self.model is None:
             return {"loss": None, "reason": "no_model"}
-        # 共有バッファ: 自プレイヤーの確定サンプルのみ抽出
+        # 共有バッファ: 自プレイヤーの確定サンプルのみ抽出 (学習splitのみ)
         if self._use_shared and hasattr(self.replay_buffer, 'iter_all'):
-            my_samples = [s for s in self.replay_buffer.iter_all(owner_pid=self.player_id) if s.get("value") is not None]
+            my_samples = [s for s in self.replay_buffer.iter_all(owner_pid=self.player_id)
+                          if s.get("value") is not None and (s.get('split') != 'val')]
             if not my_samples:
                 return {"loss": None, "reason": "no_data"}
             batch_pool = my_samples
         else:  # ローカル
             if not self.replay_buffer:
                 return {"loss": None, "reason": "no_data"}
-            batch_pool = self.replay_buffer
+            try:
+                batch_pool = [s for s in self.replay_buffer if isinstance(s, dict) and (s.get('value') is not None) and (s.get('split') != 'val')]
+            except Exception:
+                batch_pool = self.replay_buffer
 
         # Optimizer 遅延初期化
         if self._optimizer is None:
@@ -1846,7 +1958,7 @@ class AlphaZeroAgent:
             _t.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
         self._optimizer.step()
 
-        # 追加メトリクス計算
+        # 追加メトリクス計算（共通ユーティリティに委譲, pos_rate はローカルで算出）
         policy_kl = None
         policy_top1 = None
         value_acc = None
@@ -1854,30 +1966,16 @@ class AlphaZeroAgent:
         pos_rate = None
         if collected_pi:
             try:
-                import torch as _t
-                kl_list = []
-                top1_list = []
-                v_hit_list = []
-                brier_list = []
-                v_label_list = []
-                for pi_t, model_p, v_pred_c, v_lab in zip(collected_pi, collected_model, collected_v_pred, collected_v_t):
-                    kl = (pi_t * (pi_t.add(1e-12).log() - model_p.add(1e-12).log())).sum().item()
-                    kl_list.append(kl)
-                    if pi_t.numel() > 0 and model_p.numel() > 0:
-                        top1_list.append(1.0 if int(pi_t.argmax()) == int(model_p.argmax()) else 0.0)
-                    v_hit_list.append(1.0 if (float(v_pred_c) > 0.5) == (float(v_lab) > 0.5) else 0.0)
-                    brier_list.append(float((v_pred_c - v_lab).pow(2).item()))
-                    v_label_list.append(float(v_lab.item()))
-                if kl_list:
-                    policy_kl = float(sum(kl_list) / len(kl_list))
-                if top1_list:
-                    policy_top1 = float(sum(top1_list) / len(top1_list))
-                if v_hit_list:
-                    value_acc = float(sum(v_hit_list) / len(v_hit_list))
-                if brier_list:
-                    value_brier = float(sum(brier_list) / len(brier_list))
+                from utils.metrics import compute_policy_value_metrics
+                extra = compute_policy_value_metrics(collected_pi, collected_model, collected_v_pred, collected_v_t)
+                policy_kl = extra.get('policy_kl')
+                policy_top1 = extra.get('policy_top1_match')
+                value_acc = extra.get('value_acc')
+                value_brier = extra.get('value_brier')
+                # pos_rate は学習時のみ必要なためここで算出
+                v_label_list = [float(v_lab.item()) for v_lab in collected_v_t]
                 if v_label_list:
-                    pos_rate = float(sum(1.0 if v>0.5 else 0.0 for v in v_label_list) / len(v_label_list))
+                    pos_rate = float(sum(1.0 if v > 0.5 else 0.0 for v in v_label_list) / len(v_label_list))
             except Exception as e:
                 if not hasattr(self, '_metric_warned'):
                     print(f"[WARN] metric calc failed: {e}")
@@ -1914,7 +2012,9 @@ class AlphaZeroAgent:
                     # 共有リプレイ形式かローカルかでサンプル数を取得
                     sample_count = None
                     try:
-                        if self._use_shared and hasattr(self.replay_buffer, '__len__'):
+                        if self.replay_buffer is None:
+                            sample_count = 0  # worker_zero_buffer モードではサンプル数は0
+                        elif self._use_shared and hasattr(self.replay_buffer, '__len__'):
                             sample_count = len(self.replay_buffer)
                         elif isinstance(self.replay_buffer, list):
                             sample_count = len(self.replay_buffer)
@@ -1949,6 +2049,18 @@ class AlphaZeroAgent:
                 pass
         return metrics
 
+    def validate_step(self, batch_size: Optional[int] = None):
+        """検証用: 検証splitのサンプルで損失を計算して返す（勾配・更新なし）。
+
+        実装は agents.validation.validate_on_agent に委譲しており、
+        API は従来通り維持します。
+        """
+        try:
+            from agents.validation import validate_on_agent
+            return validate_on_agent(self, batch_size=batch_size)
+        except Exception as e:
+            return {"policy_loss": None, "value_loss": None, "entropy": None, "reason": f"validate_error: {type(e).__name__}: {e}"}
+
     def reset_episode(self):
         """エピソード開始時にカウンタ類を初期化."""
         self.move_count = 0
@@ -1959,12 +2071,24 @@ class AlphaZeroAgent:
             self.episodes_played = int(getattr(self, "episodes_played", 0)) + 1
         self.episode_phase_total = 0
         self.episode_phase_correct = 0
-        # 前ゲームの履歴を確実に破棄して肥大化を防ぐ
-        try:
-            if hasattr(self, '_action_history'):
-                self._action_history.clear()
-        except Exception:
-            pass
+        # worker_zero_buffer モード用の確定サンプルリストをクリア
+        # (エピソード開始前にクリアすることで、前エピソードの送信済みサンプルを保持しない)
+        if hasattr(self, '_episode_confirmed_samples'):
+            self._episode_confirmed_samples.clear()
+        # 行動履歴のクリア（メモリ削減オプション）
+        if self.config.get('clear_action_history_per_episode', True):
+            try:
+                if hasattr(self, '_action_history'):
+                    self._action_history.clear()
+            except Exception:
+                pass
+        # Phase サンプルの積極的クリア（メモリ削減オプション）
+        if self.config.get('aggressive_phase_clear', False):
+            try:
+                if hasattr(self, '_phase_samples'):
+                    self._phase_samples.clear()
+            except Exception:
+                pass
         # determinization プールはゲームを跨ぐと署名ミスマッチが増えるためデフォルトで再初期化
         try:
             if self.config.get('reset_det_pool_each_game', True):
@@ -2009,33 +2133,60 @@ class _AlphaZeroTTView(dict):
         return (getattr(self._agent, 'model_version', 0), k)
 
     def __contains__(self, k):
-        store = self._agent._mcts_tt
-        found = self._mk(k) in store
         try:
-            if found:
-                self._agent.tt_hits += 1
-            else:
-                self._agent.tt_misses += 1
-        except Exception:
-            pass
-        return found
+            store = self._agent._mcts_tt
+            found = self._mk(k) in store
+            try:
+                if found:
+                    self._agent.tt_hits += 1
+                else:
+                    self._agent.tt_misses += 1
+            except Exception:
+                pass
+            return found
+        except RecursionError:
+            # 予期せぬ再帰増殖を検知したらTTを無効化して以降は未使用にする
+            try:
+                self._agent.enable_mcts_tt = False
+                self._agent._mcts_tt = {}
+            except Exception:
+                pass
+            return False
 
     def __getitem__(self, k):
-        store = self._agent._mcts_tt
-        key = self._mk(k)
-        res, _tick = store[key]
-        self._agent._mcts_tt_tick += 1
-        store[key] = (res, self._agent._mcts_tt_tick)
-        return res
+        try:
+            store = self._agent._mcts_tt
+            key = self._mk(k)
+            res, _tick = store[key]
+            self._agent._mcts_tt_tick += 1
+            store[key] = (res, self._agent._mcts_tt_tick)
+            return res
+        except RecursionError:
+            try:
+                self._agent.enable_mcts_tt = False
+                self._agent._mcts_tt = {}
+            except Exception:
+                pass
+            raise KeyError(k)
 
     def __setitem__(self, k, v):
-        agent = self._agent
-        store = agent._mcts_tt
-        agent._mcts_tt_tick += 1
-        store[self._mk(k)] = (v, agent._mcts_tt_tick)
-        # 簡易エビクション
-        cap = max(1, int(agent.mcts_tt_capacity or 1))
-        if len(store) > cap:
-            # 最小 tick を 1 件落とす
-            oldest_k = min(store.items(), key=lambda kv: kv[1][1])[0]
-            store.pop(oldest_k, None)
+        try:
+            agent = self._agent
+            store = agent._mcts_tt
+            agent._mcts_tt_tick += 1
+            store[self._mk(k)] = (v, agent._mcts_tt_tick)
+            # 簡易エビクション
+            cap = max(1, int(agent.mcts_tt_capacity or 1))
+            if len(store) > cap:
+                # 最小 tick を 1 件落とす
+                oldest_k = min(store.items(), key=lambda kv: kv[1][1])[0]
+                store.pop(oldest_k, None)
+        except RecursionError:
+            try:
+                agent = self._agent
+                agent.enable_mcts_tt = False
+                agent._mcts_tt = {}
+            except Exception:
+                pass
+            # TT を無効化して以降の呼び出しは黙って破棄
+            return

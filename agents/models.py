@@ -72,6 +72,7 @@
 from __future__ import annotations
 
 from typing import Dict, Any, Optional, List
+import warnings
 
 import torch
 import torch.nn as nn
@@ -100,11 +101,43 @@ class PolicyValueNet(nn.Module):
         self.num_players = num_players
         self.device = torch.device(device) if device else torch.device("cpu")
         self.use_full_features = True
-        input_dim = full_feature_dim
 
+        # ---- Feature partition (v4 layout) ----
+        # Self: 55
+        self.self_dim = 55
+        # Belief: 53 * (N-1)
+        self.belief_dim = 53 * (num_players - 1)
+        # Context: OppSummary 5*(N-1) + Field 22 + FieldCards 53 + PlayHistory 53 + Turn N
+        self.context_dim = 5 * (num_players - 1) + 22 + 53 + 53 + num_players
+        # Expected full feature dimension (v4): 59N + 125
+        self.full_feature_dim = self.self_dim + self.belief_dim + self.context_dim
+
+        # 互換: 引数の full_feature_dim が与えられ、計算値と異なる場合は警告の上で採用
+        if full_feature_dim is not None and int(full_feature_dim) != int(self.full_feature_dim):
+            # 最終防衛線として、明示指定を優先して各セクションの配分は既定値のままにし、パディング/切り詰めで吸収する
+            # ここでは metadata 用に保持のみ行う
+            self.full_feature_dim = int(full_feature_dim)
+
+        # ---- Small encoders for each component ----
+        # 出力次元は例に倣って Self=32, Belief=64, Context=32
+        self.self_encoder = nn.Sequential(
+            nn.Linear(self.self_dim, 32),
+            nn.ReLU(),
+        )
+        self.belief_encoder = nn.Sequential(
+            nn.Linear(self.belief_dim, 64),
+            nn.ReLU(),
+        )
+        self.context_encoder = nn.Sequential(
+            nn.Linear(self.context_dim, 32),
+            nn.ReLU(),
+        )
+
+        # ---- Backbone & Heads ----
         h = hidden_size
+        backbone_input_dim = 32 + 64 + 32  # encoders' output dims
         self.backbone = nn.Sequential(
-            nn.Linear(input_dim, h),
+            nn.Linear(backbone_input_dim, h),
             nn.ReLU(),
             nn.Linear(h, h),
             nn.ReLU(),
@@ -146,11 +179,8 @@ class PolicyValueNet(nn.Module):
             arr = state.get('full_input')
             if arr is None:
                 arr = []
-            expected_dim: Optional[int] = None
-            try:
-                expected_dim = self.backbone[0].in_features  # type: ignore[index]
-            except Exception:
-                expected_dim = None
+            # 期待次元は raw full_input 長（バックボーン入力ではない）
+            expected_dim: Optional[int] = int(getattr(self, 'full_feature_dim', 0)) or None
 
             def _finalize_vec(seq_like):
                 # seq_like -> torch tensor with optional pad/truncate
@@ -192,36 +222,92 @@ class PolicyValueNet(nn.Module):
 
         raise ValueError("state に full_input / full_compact が存在しません (簡易入力廃止)。")
 
-    def forward(self, state: Dict[str, Any]):
-        x = self._encode_state(state)
-        h = self.backbone(x)
+    def _ensure_2d(self, x: torch.Tensor) -> torch.Tensor:
+        """1D ベクトルを (1, D) に整形し、デバイス/型を合わせる補助。"""
+        x = x.to(self.device).float()
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        return x
+
+    def _pad_or_truncate(self, x: torch.Tensor, dim: int) -> torch.Tensor:
+        """x の最終次元を dim に合わせて pad/truncate する。"""
+        cur = x.size(-1)
+        if cur == dim:
+            return x
+        if cur < dim:
+            pad = torch.zeros(x.size(0), dim - cur, device=self.device, dtype=x.dtype)
+            return torch.cat([x, pad], dim=1)
+        # truncate
+        return x[:, :dim]
+
+    def _forward_from_tensor(self, x: torch.Tensor):
+        """full_input テンソルからエンコーダ/バックボーン/ヘッドを通す共通経路。
+
+        入力: x shape = [B, full_feature_dim] or [full_feature_dim]
+        出力: policy_logits [B, max_policy_size], value_vec [B, num_players]
+        """
+        x = self._ensure_2d(x)
+        # safety: pad/truncate to expected dimension
+        x = self._pad_or_truncate(x, self.full_feature_dim)
+
+        # Split into components
+        parts = torch.split(x, [self.self_dim, self.belief_dim, self.context_dim], dim=1)
+        if len(parts) != 3:
+            # 極端な不一致時はフォールバックで全体を backbone へ（安全側）
+            h = self.backbone(x.new_zeros(x.size(0), 32 + 64 + 32))
+            return self.policy_head(h), self.value_head(h)
+        self_feat, belief_feat, context_feat = parts
+
+        # Encode each component
+        self_emb = self.self_encoder(self_feat)
+        belief_emb = self.belief_encoder(belief_feat)
+        context_emb = self.context_encoder(context_feat)
+        combined = torch.cat([self_emb, belief_emb, context_emb], dim=1)
+
+        # Backbone + Heads
+        h = self.backbone(combined)
         policy_logits = self.policy_head(h)
         value_vec = self.value_head(h)
         return policy_logits, value_vec
+
+    def forward(self, state_or_x: Any):
+        """互換維持のため、辞書(state) か 1D/2D テンソルの両方を受け付ける。
+
+        - 辞書: _encode_state で full_input ベクトルへ変換
+        - テンソル: そのまま full_input として扱う
+        単一サンプル入力時は旧APIと同様、1D を返す。
+        """
+        if isinstance(state_or_x, dict):
+            x = self._encode_state(state_or_x)
+        else:
+            x = state_or_x  # assume tensor-like
+        pol, val = self._forward_from_tensor(x)
+        # 旧 forward は単一サンプルで 1D を返していたため互換のため squeeze
+        if pol.dim() == 2 and pol.size(0) == 1:
+            pol = pol.squeeze(0)
+        if val.dim() == 2 and val.size(0) == 1:
+            val = val.squeeze(0)
+        return pol, val
 
     def forward_batch(self, states: List[Dict[str, Any]]):
         if not states:
-            x = self._encode_state({})
-            _ = self.backbone(x)
-            return torch.empty(0, self.max_policy_size, device=self.device), torch.empty(0, self.num_players, device=self.device)
+            # 空バッチ互換
+            return (
+                torch.empty(0, self.max_policy_size, device=self.device),
+                torch.empty(0, self.num_players, device=self.device),
+            )
         xs = torch.stack([self._encode_state(s) for s in states], dim=0)
-        h = self.backbone(xs)
-        policy_logits = self.policy_head(h)
-        value_vec = self.value_head(h)
-        return policy_logits, value_vec
+        return self._forward_from_tensor(xs)
 
-    def save(self, path: str):
-        try:
-            input_dim = self.backbone[0].in_features  # type: ignore[index]
-        except Exception:
-            input_dim = None
+    def save(self, path: str, *, force_sync: bool = False):
         ckpt = {
             "state_dict": self.state_dict(),
             "max_policy_size": self.max_policy_size,
             "hidden_size": self.policy_head.in_features,
             "num_players": self.num_players,
             "use_full_features": True,
-            "full_feature_dim": int(input_dim) if input_dim else None,
+            # 重要: full_feature_dim はバックボーン入力ではなく raw 特徴の全長
+            "full_feature_dim": int(self.full_feature_dim),
             "model_format_version": 3,
         }
         # 非同期 I/O 設定が利用可能ならオフロード
@@ -230,7 +316,9 @@ class PolicyValueNet(nn.Module):
         except Exception:
             _CFG = {}
         enable_async = bool(_CFG.get("enable_async_io", False))
-        if enable_async:
+        # 原子的保存 (tmp -> replace) の際は同期保存が必要。
+        # path が .tmp で終わる場合や force_sync=True の場合は async を無効化。
+        if enable_async and (not force_sync) and (not str(path).endswith('.tmp')):
             try:
                 from utils.async_io import get_async_io
                 aio = get_async_io(_CFG)
@@ -246,9 +334,18 @@ class PolicyValueNet(nn.Module):
         try:
             ckpt = torch.load(path, map_location=map_location or "cpu", weights_only=True)
         except TypeError:
+            # 古い PyTorch では weights_only 引数が存在しないため、従来ロードにフォールバック
             ckpt = torch.load(path, map_location=map_location or "cpu")
         except Exception:
-            ckpt = torch.load(path, map_location=map_location or "cpu")
+            # weights_only=True で失敗するレガシー ckpt 用フォールバック。
+            # weights_only=False による FutureWarning を一時的に抑制する。
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r".*weights_only=False.*",
+                    category=FutureWarning,
+                )
+                ckpt = torch.load(path, map_location=map_location or "cpu", weights_only=False)
 
         if isinstance(ckpt, dict) and "state_dict" in ckpt:
             state_dict = ckpt["state_dict"]
