@@ -1,6 +1,17 @@
 import copy
 import math
 import random
+try:
+    # Optional fast helpers (Cython acceleration). Safe fallback if missing.
+    from agents.mcts_fast import (
+        puct_select_index_fast as _puct_select_index_fast,
+        puct_backup_generic as _puct_backup_generic,
+        puct_backup_scalar as _puct_backup_scalar,
+    )
+except Exception:
+    _puct_select_index_fast = None
+    _puct_backup_generic = None
+    _puct_backup_scalar = None
 
 """MCTS 実装共通化モジュール
 
@@ -98,7 +109,7 @@ class MCTSNode:
 class PUCTNode:
     """PUCT (AlphaZero) 用ノード。
 
-    value_sum: 累積価値 (root 視点で加算)。平均値 = value_sum / visit_count。
+    value_sum: 累積価値（各ノードの現在手番プレイヤー視点で加算）。平均値 = value_sum / visit_count。
     prior: policy_value_fn が返した事前確率。
     children: {action: PUCTNode}
     to_play: 手番プレイヤーID (必要なら視点変換で利用)。
@@ -128,12 +139,42 @@ class PUCTNode:
             if act not in self.children:
                 self.children[act] = PUCTNode(prior=p, parent=self, action=act, to_play=to_play)
 
-    # ---- バックアップ (4人ゲーム想定: 符号反転しない) ----
-    def backup(self, leaf_value: float):
+    # ---- バックアップ (各ノードの現在手番視点で加算、符号反転なし) ----
+    def backup(self, leaf_value):
+        """
+        leaf_value:
+          - float: 単一スカラー（互換）
+          - list/tuple: 各プレイヤーの値（インデックス=player_id）
+          - dict: {player_id: value}
+        いずれの場合も、このノードの to_play に対応する成分を加算する。
+        値域は [0,1] を想定（BCE確率）。
+        可能ならCython高速版でバックアップを行う。
+        """
+        # Fast path: prefer Cython implementations when available
+        try:
+            if _puct_backup_scalar is not None and isinstance(leaf_value, (int, float)):
+                _puct_backup_scalar(self, float(leaf_value))
+                return
+            if _puct_backup_generic is not None:
+                _puct_backup_generic(self, leaf_value)
+                return
+        except Exception:
+            pass
+        # Fallback: pure Python backup
+        def _value_for_pid(v, pid: int) -> float:
+            try:
+                if isinstance(v, dict):
+                    return float(v.get(pid, 0.0))
+                if isinstance(v, (list, tuple)):
+                    return float(v[pid]) if 0 <= pid < len(v) else 0.0
+                return float(v)
+            except Exception:
+                return 0.0
+
         node = self
         while node is not None:
             node.visit_count += 1
-            node.value_sum += leaf_value
+            node.value_sum += _value_for_pid(leaf_value, getattr(node, 'to_play', 0))
             node = node.parent
 
 
@@ -141,6 +182,19 @@ def _puct_select(node: PUCTNode, c_puct: float, virtual_counts=None) -> PUCTNode
     """子ノードの中から PUCT スコア最大のものを返す"""
     if virtual_counts is None:
         virtual_counts = {}
+    # Fast path: use vectorized selection if extension available
+    if _puct_select_index_fast is not None and node.children:
+        children = list(node.children.values())
+        # Build aligned arrays
+        priors = [ch.prior for ch in children]
+        values = [ (0.0 if ch.visit_count == 0 else ch.value_sum / ch.visit_count) for ch in children ]
+        visits = [ch.visit_count for ch in children]
+        vcounts = [virtual_counts.get(id(ch), 0) for ch in children]
+        # Pass -1 to compute total_visits inside Cython to avoid Python-side sum overhead
+        idx = _puct_select_index_fast(priors, values, visits, vcounts, float(c_puct), -1)
+        if 0 <= idx < len(children):
+            return children[idx]
+    # Fallback: original Python loop
     def vc(ch):
         return virtual_counts.get(id(ch), 0)
     total_visits = max(1, sum(child.visit_count + vc(child) for child in node.children.values()))
@@ -211,7 +265,17 @@ def run_puct_mcts(root_env_copy,
     root = PUCTNode(prior=1.0, to_play=root_player_id)
     root.expand(root_player_id, {a: policy_root[a] for a in legal_root if a in policy_root})
     root.visit_count = 1
-    root.value_sum = root_value
+    # ルート初期値は「ルート手番プレイヤー視点」の成分を使用
+    try:
+        if isinstance(root_value, dict):
+            root.value_sum = float(root_value.get(root_player_id, 0.0))
+        elif isinstance(root_value, (list, tuple)):
+            rv = root_value[root_player_id] if 0 <= root_player_id < len(root_value) else 0.0
+            root.value_sum = float(rv)
+        else:
+            root.value_sum = float(root_value)
+    except Exception:
+        root.value_sum = 0.0
 
     # Dirichlet ノイズ
     if add_dirichlet and root.children:
@@ -274,10 +338,24 @@ def run_puct_mcts(root_env_copy,
         def state_key_fn_default(e):
             try:
                 g = e.game
-                # 安全なキー（手番 / 場 / 各手札のカードID / パス状況 / ランキング / 革命）
+                # 軽量キー（手番 / 場 / 各手札の整数カードID / パス状況 / ランキング / 革命）
                 turn = getattr(g, 'turn', 0)
-                field = tuple(str(c) for c in getattr(g, 'current_field', []))
-                hands = tuple(tuple(sorted(str(c) for c in p.hand)) for p in getattr(g, 'players', []))
+                def _cid(c):
+                    try:
+                        # Joker を 52 とする。通常カードは suit*13 + (rank-1)
+                        if getattr(c, 'is_joker', False):
+                            return 52
+                        suit = getattr(c, 'suit', 'S')
+                        suit_map = {'S':0, 'H':1, 'D':2, 'C':3, '\u2660':0, '\u2665':1, '\u2666':2, '\u2663':3}
+                        sid = suit_map.get(suit, 0)
+                        r = int(getattr(c, 'rank', 1)) - 1
+                        if r < 0: r = 0
+                        if r > 12: r = 12
+                        return sid * 13 + r
+                    except Exception:
+                        return 52
+                field = tuple(_cid(c) for c in getattr(g, 'current_field', []))
+                hands = tuple(tuple(sorted(_cid(c) for c in p.hand)) for p in getattr(g, 'players', []))
                 passed = tuple(bool(x) for x in getattr(g, 'passed', []))
                 rankings = tuple(getattr(g, 'rankings', []))
                 revo = bool(getattr(getattr(g, 'rule_checker', None), 'revolution', False))
@@ -323,6 +401,8 @@ def run_puct_mcts(root_env_copy,
             # どうしても適用できない場合は no-op とする
             return None
 
+    # ラン中の合法手キャッシュ（TTに無い近傍を節約）
+    _legal_cache = {}
     while sims_done < num_simulations:
         # 1バッチ分の葉を収集
         leaf_nodes = []
@@ -353,7 +433,18 @@ def run_puct_mcts(root_env_copy,
             leaf_envs.append(env_copy)
             k = state_key_fn(env_copy)
             leaf_keys.append(k)
-            leg = get_legal_actions_fn(env_copy)
+            # 可能なら TT またはラン内キャッシュから取得
+            leg = None
+            if TT is not None and k is not None and (k in TT):
+                cached = TT.get(k)
+                if isinstance(cached, tuple) and len(cached) == 3:
+                    leg = cached[2]
+            if leg is None:
+                if k in _legal_cache:
+                    leg = _legal_cache[k]
+                else:
+                    leg = get_legal_actions_fn(env_copy)
+                    _legal_cache[k] = leg
             leaf_legal.append(leg)
         # まずキャッシュヒットを適用
         eval_indices = []
@@ -385,7 +476,9 @@ def run_puct_mcts(root_env_copy,
             used_batch = False
             if policy_value_batch_fn is not None and len(eval_envs) > 1:
                 try:
-                    outs = policy_value_batch_fn(eval_envs)
+                    # 事前計算済みの合法手を同じ順序で渡す（再計算を回避）
+                    eval_legals = [leaf_legal[idx] for idx in eval_indices]
+                    outs = policy_value_batch_fn(eval_envs, eval_legals)
                     if isinstance(outs, list) and len(outs) == len(eval_envs):
                         for j, idx in enumerate(eval_indices):
                             evaluated[idx] = outs[j]

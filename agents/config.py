@@ -14,34 +14,60 @@
 from __future__ import annotations
 
 ALPHA_ZERO_CONFIG = {
+
+    # ---------------------------
+    # 学習 / 最適化
+    # ---------------------------
+    "buffer_size": 250000,            # リプレイバッファ最大サイズ 
+    "batch_size": 256,               # 学習バッチサイズ (train_step 実装時に利用)
+    "lr": 7e-5,                      # 学習率　初期値0.0001
+    "weight_decay": 7e-5,          # L2 正則化　初期値1e-4
+    "value_loss_coef": 1.0,          # 価値損失係数
+    "policy_loss_coef": 1.2,         # 方策損失係数
+    "entropy_coef": 1e-3,             # エントロピー正則化
+    "epochs_per_update": 1,          # 1回の train 呼び出しで何エポック回すか
+
+    # --- 学習率スケジューラ ---
+    # デフォルト: Warmup + Cosine (再開なし)
+    # none | warmup_cosine
+    "lr_scheduler": "warmup_cosine",
+    "lr_warmup_steps": 3000,
+    "lr_min": 3e-6,
+    # ウォームアップ後、ここまでの更新ステップで lr_min へ到達
+    "lr_cosine_T_max_updates": 21000, #目標ステップ数に応じて変更する
+    # 再開直後に一度だけウォームアップをやり直す（プロセス内一回限り）
+    # True にすると、optimizer/scheduler 復元後にスケジューラを last_epoch=-1 で再初期化し、
+    # param_group['lr'] を基準学習率に戻します。その後このフラグは False に戻されます。
+    "resume_reset_warmup_once": False,
+
     # ---------------------------
     # MCTS / 探索
     # ---------------------------
     # MCTS シミュレーション回数 (96で速度重視、tau=0.3の強力シャープ化でカバー) 
-    "num_simulations": 128,       # 1手あたりのシミュレーション回数 (速度とバランス)
-    "puct_c": 1.5,                  # PUCT 探索定数 (1.4→1.2で探索を抑制、訪問集中を促進)
-    "dirichlet_alpha": 0.3,          # Dirichlet ノイズ α (ルート)
-    "dirichlet_epsilon": 0.15,       # ノイズ混合率 ε (0.15→0.10でノイズを削減、評価に基づく集中)
-    "temperature": 1.0,              # 方策サンプリング温度 (序盤高く終盤低くする調整可)
+    "num_simulations": 384,       # 1手あたりのシミュレーション回数 (速度とバランス)　初期値96
+    "puct_c": 1.1,                  # PUCT 探索定数 (1.4→1.2で探索を抑制、訪問集中を促進) 初期値1.0
+    "dirichlet_alpha": 0.3,          # Dirichlet ノイズ α (ルート) 初期値0.3
+    "dirichlet_epsilon": 0.05,       # ノイズ混合率 ε (0.15→0.10でノイズを削減、評価に基づく集中) 
+    "temperature": 0.8,              # 方策サンプリング温度 (序盤高く終盤低くする調整可) 初期値1.0
     "temperature_decay_moves": 20,   # この手数以降は温度を 0 (argmax) にする等のスケジューリング用目安
     # 温度スケジュール（序盤高温→後半低温、自己対戦エピソード進行で高温手数を短縮）
     # デフォルト: 最初の10手は τ=0.6、それ以降は τ=0.1。エピソードが進むと高温手数を段階的に短縮（最低2手を維持）
-    "temp_high_value": 1.2,            # 高温 τ (0.8→0.6に下げて過度なランダム性を抑制)
+    "temp_high_value": 0.8,            # 高温 τ (0.8→0.6に下げて過度なランダム性を抑制)
     "temp_low_value": 0.1,              # 低温 τ
-    "temp_high_moves_initial": 6,      # 高温適用の初期手数
-    "temp_high_moves_min": 3,           # 高温適用の最低手数
+    "temp_high_moves_initial": 4,      # 高温適用の初期手数
+    "temp_high_moves_min": 2,           # 高温適用の最低手数
     "temp_high_moves_decay_every": 500, # 何エピソードごとに高温手数を1手短縮するか
     # 序盤ランダム化: 指定手数までは完全ランダムに行動 (探索温度の代替オプション)
     "opening_random_enable": True,    # True で有効化
-    "opening_random_moves": 5,          # >0 で有効。例: 3 なら最初の3手をランダム行動
+    "opening_random_moves": 3,          # >0 で有効。例: 3 なら最初の3手をランダム行動
     "opening_random_include_pass": False,  # True なら pass もランダム候補に含める
     # 学習ターゲットπの温度（行動サンプリングとは分離）
     # 行動選択は高温（多様性確保）でも、学習用πは強力にシャープ化してエントロピーを劇的に下げる
     # 0.3でv^(1/0.3)=v^3.33正規化 → 訪問数格差を大幅に強調、低エントロピー教師信号を生成
-    "policy_target_tau": 1.0,           # 学習ターゲット用温度 (1.0→0.3で強力シャープ化、高entropy問題に対処)
+    "policy_target_tau": 0.25,           # 学習ターゲット用温度 (1.0→0.3で強力シャープ化、高entropy問題に対処)
     # 追加: MCTS 高速化オプション（デフォルト有効化）
     "mcts_batch_eval_size": 64,      # 葉ノードのバッチ評価サイズ（1で無効同等）
-    "enable_mcts_tt": False,         # トランスポジションテーブル無効化（メモリ削減優先）
+    "enable_mcts_tt": True,          # トランスポジションテーブル有効化（品質不変で再計算を削減）
     "mcts_tt_capacity": 10000,       # キャッシュ上限を削減（簡易LRUでエビクション）
 
     # --- 不完全情報処理 / デターミニゼーション関連 ---
@@ -51,8 +77,9 @@ ALPHA_ZERO_CONFIG = {
     # 学習時/推論時のデターミニゼーションモード
     #   - "fixed_once": ルートで一度だけ割当をサンプリングし、MCTS全シミュレーションへ固定適用
     #   - "stochastic": 各シミュレーション毎に割当を再サンプル
-    #   - "none": 何もしない（完全情報として真の手札を使用するのと同等の挙動になる環境もある）
-    "determinization_mode_train": "fixed_once",
+    #   - "none": デターミニゼーションを行わず、環境の完全情報（真の手札）をそのまま使用
+    # 自己対戦では「完全情報で1度だけ（= 各手番ごとに固定の完全情報でMCTS）」にするため、train は none を既定にする
+    "determinization_mode_train": "none",
     "determinization_mode_eval": "stochastic",
     # 推論時は Dirichlet ノイズを無効化（安定した選択のため）
     "inference_dirichlet": False,
@@ -67,7 +94,7 @@ ALPHA_ZERO_CONFIG = {
     # インライン/プール生成時の最大リトライ回数 (パス制約矛盾解消目的)
     "det_retry_max": 8,
     # 生成ワーカー数（0で無効＝インラインのみ）。Windows環境ではまず0で安全運用。
-    "det_workers": 0,
+    "det_workers": 1,
     # ゲーム終了毎に determinization プールを停止しメモリ/署名ミスマッチを抑制するか
     # True: 各ゲーム開始時に必要なら再起動 (安定性/メモリ優先) / False: ゲーム間で継続 (微小性能最適化)
     "reset_det_pool_each_game": True,
@@ -76,9 +103,9 @@ ALPHA_ZERO_CONFIG = {
     # Early Stop (MCTS 収束早期打ち切り)
     # 有効化するとシミュレーション途中で十分収束した場合に打ち切り計算量を節約
     "mcts_early_stop_enable": True,          # False で完全無効化
-    "mcts_early_stop_min_sims": 32,          # この回数までは必ず実行 (速度重視で32に戻す)
-    "mcts_early_stop_visit_ratio": 0.80,     # ルート最大訪問子 / 総訪問 >= ratio で候補 (0.70→0.80で厳格化)
-    "mcts_early_stop_gap_ratio": 0.15,       # (top - second)/総訪問 >= gap なら確定 (0.12→0.15で厳格化)
+    "mcts_early_stop_min_sims": 64,          # この回数までは必ず実行 (速度重視で32に戻す)
+    "mcts_early_stop_visit_ratio": 0.65,     # ルート最大訪問子 / 総訪問 >= ratio で候補 (0.70→0.80で厳格化)
+    "mcts_early_stop_gap_ratio": 0.10,       # (top - second)/総訪問 >= gap なら確定 (0.12→0.15で厳格化)
     "mcts_early_stop_log_sample_rate": 0.005,# 早期停止ログのサンプリング率 (ノイズ抑制)
     # min_sims 到達後に早期停止判定の粒度を細かくするためのバッチ縮小サイズ。
     # 例: 通常 batch_eval_size=64 だと判定が64刻みになり早期停止タイミングを逃す可能性がある。
@@ -87,7 +114,7 @@ ALPHA_ZERO_CONFIG = {
     "mcts_early_stop_post_min_batch": 8,
     # 早期停止デバッグ: 判定チェック毎に top_ratio / gap_ratio を低頻度で events.log 出力
     # True で有効化。高頻度になり過ぎないよう内部でサンプリング。
-    "mcts_early_stop_debug": False,
+    "mcts_early_stop_debug": True,
     # Early Stop 計測ログ出力間隔 (何手ごとに平均シミュレーション数を events.log へ書くか)
     "mcts_sims_log_interval": 50,
 
@@ -98,17 +125,7 @@ ALPHA_ZERO_CONFIG = {
     "hidden_size": 128,              # MLP 隠れ層次元
     "num_players": 4,                # 大富豪 4人
 
-    # ---------------------------
-    # 学習 / 最適化
-    # ---------------------------
-    "buffer_size": 100000,            # リプレイバッファ最大サイズ (メモリ削減: 200k→100k)
-    "batch_size": 256,               # 学習バッチサイズ (train_step 実装時に利用)
-    "lr": 3e-4,                      # 学習率　0.0001
-    "weight_decay": 1e-4,          # L2 正則化　初期値1e-4
-    "value_loss_coef": 1.2,          # 価値損失係数
-    "policy_loss_coef": 1.0,         # 方策損失係数
-    "entropy_coef": 2e-3,             # エントロピー正則化を完全無効化 (高entropy teacher問題に対処)
-    "epochs_per_update": 1,          # 1回の train 呼び出しで何エポック回すか
+    
 
     # ---------------------------
     # 検証用バッファ / 検証評価
@@ -119,7 +136,7 @@ ALPHA_ZERO_CONFIG = {
     # 学習更新に対して何回に1回、検証損失を計算するか (0/None で検証無効)
     "val_eval_every_updates": 100,
     # 検証時に使用する最大サンプル数 (過大計算防止)。0/None で全件。
-    "val_max_samples": 2048,
+    "val_max_samples": 4096,
     # 検証時のバッチサイズ (未指定で学習バッチと同一)
     "val_batch_size": None,
 
@@ -128,15 +145,23 @@ ALPHA_ZERO_CONFIG = {
     # ---------------------------
     # 学習で得た候補モデルを採用する前に、直前モデルに対して同一配牌・先後交代で
     # 厳しめの勝率しきい値で判定する仕組み。
-    # True で有効化。しきい値は 0.6 (60%)、対局数は20（= 同一配牌のペア×10）。
+    # True で有効化。しきい値は 0.6 (60%)、対局数は100（= 同一配牌のペア×10）。
     "eval_gate_enable": True,
-    "eval_gate_games": 20,
+    "eval_gate_games": 40,
     "eval_gate_threshold": 0.60,
+    # 非同期ゲート: 学習/自己対局を止めずにバックグラウンドで評価し、合格時のみ昇格
+    "eval_gate_async": True,
+    "eval_gate_workers": 4,
     # ゲート評価の乱数シード（Noneでランダム）。同一配牌実現のため random / numpy を固定。
     "eval_gate_seed": 20251031,
     # 評価中は探索ノイズ/序盤ランダムをOFFにして純粋実力を比較
     "eval_gate_disable_dirichlet": True,
     "eval_gate_disable_opening_random": True,
+    # 評価ゲートの起動制御（学習更新回数ベース）
+    # train_it がこの回数に到達するまで評価を開始しない（0/未設定で無効）
+    "eval_gate_start_after_updates": 1000,
+    # 直近の評価開始からこの更新数に達するまで次の評価を起動しない（0/未設定で無効）
+    "eval_gate_every_updates": 1000,
 
     # ---------------------------
     # データ / 保存パス
@@ -145,8 +170,8 @@ ALPHA_ZERO_CONFIG = {
     "checkpoint_path": "checkpoints/policy_value_latest.pt",  # 直近モデル
     # 周期保存: 大量エピソード実行時にエピソード間隔で世代チェックポイントを残す
     # 例) 100000 エピソードで 2000 間隔 -> 50 個保存
-    "checkpoint_interval_episodes": 1000,       # 0 / None なら無効
-    "updates_per_iter": 100,                 # ステップだけ学習
+    "checkpoint_interval_episodes": 200,       # 0 / None なら無効
+    "updates_per_iter": 50,                 # ステップだけ学習
     "keep_previous_model_opponent": True,       # 直前世代モデルを一部プレイヤーに割当てて多様性確保
     "previous_model_mix_players": 2,            # 学習プレイヤー以外から2人を過去モデル化
     "past_model_pool_size": 1,             # メモリ削減: 過去1世代のみ保持
@@ -176,7 +201,7 @@ ALPHA_ZERO_CONFIG = {
     "disable_mcts_log": True,        # True で mcts_samples.jsonl へ出力しない
     "clear_logs_on_start": True,     # 起動時に既存ログを消去 (Falseで残す)
     # ログバッファリング制御 (False で即時書き込み、True でバッファ経由)
-    "log_buffer_enabled": False,     # events.log が即座に表示されるよう無効化
+    "log_buffer_enabled": True,     # events.log が即座に表示されるよう無効化
     # メモリスナップショット (events.log へ 1h 毎など)
     "memory_log_interval_sec": 3600,
     # ETA 表示調整
@@ -196,7 +221,7 @@ ALPHA_ZERO_CONFIG = {
     # 自己対局 並列実行
     # ---------------------------
     # 並列ワーカー数 (0/1 で無効 = 単一プロセス)。Windows の spawn に対応。
-    "selfplay_workers": 6,             # メモリ削減: 8→6 ワーカー
+    "selfplay_workers": 6,            # CPU 28 論理スレッドに合わせ並列度を拡大（様子を見て 12 まで）
     # ワーカープロセスでの推論デバイス。通常は CPU を推奨 (GPU 共有は非推奨)。
 
     "selfplay_worker_device": "cpu",
@@ -204,15 +229,27 @@ ALPHA_ZERO_CONFIG = {
     # 小さすぎると学習バーストが細切れになり効率低下。大きすぎると応答が遅れる
     "concurrent_min_new_samples_before_train": 1000,  # メモリ削減: 学習頻度を下げて蓄積抑制
     # 学習後の最新チェックポイント保存の最短間隔(秒)。0以下で毎回保存（高I/O）
-    "concurrent_latest_save_every_sec": 1800.0,
+    "concurrent_latest_save_every_sec": 300.0,
     # ワーカー配布用モデル(pt)保存の最短間隔(秒)。0以下で毎回保存
     "concurrent_blob_save_every_sec": 900.0,
+
     # ---------------------------
     # ハードウェア / デバイス
     # ---------------------------
     # 'auto' -> torch.cuda.is_available() なら 'cuda'、それ以外は 'cpu'
     # 明示的に 'cpu' / 'cuda' / 'cuda:0' などを指定することも可能
     "device": "auto",
+    # CPU 利用効率の最適化（並列ワーカーのスレッド数制御）
+    # 既定では各ワーカー内の PyTorch が CPU スレッドを多く占有し、
+    # 複数プロセス間で過剰スレッド競合が起こり総合スループットが伸びないことがあります。
+    # torch_num_threads_workers を 1〜2 程度に下げると、ワーカー数×スレッドで
+    # 物理コアに収まりやすく、CPU 使用率の頭打ちを改善できる場合があります。
+    "torch_num_threads_workers": 1,   # 0/未設定で既定のまま。1〜2 を推奨値として用意
+    "torch_num_threads_main": 3,      # メインプロセス（学習側）の CPU スレッド数（0で既定）
+    # PyTorch inter-op 並列スレッド（オペレータ間並列）。未指定/0 で既定。
+    # CPU 環境では 1 に下げるとオーバーヘッドが減ることがあります。
+    "torch_num_interop_threads_workers": 1,
+    "torch_num_interop_threads_main": 1,
 
     # ---------------------------
     # ログ最適化 (大量学習向け)
@@ -223,8 +260,8 @@ ALPHA_ZERO_CONFIG = {
     "tensorboard_episode_log_every": 200,
     "tensorboard_flush_seconds": 300,        # 最低この秒数ごとに flush (0/None なら都度 flush)
     # CSV 出力間引き (1=毎回)。間引いた行は欠番になる
-    "csv_train_log_every": 100,
-    "csv_episode_log_every": 100,
+    "csv_train_log_every": 200,
+    "csv_episode_log_every": 200,
     # MCTS ルート統計 JSONL を更に抑制したい場合 (disable_mcts_log と組み合わせ)
     "mcts_jsonl_max_bytes": 50_000_000,     # 上限超過で以降追記停止 (約50MB)。0/None で無効
 
@@ -281,11 +318,11 @@ ALPHA_ZERO_CONFIG = {
     # 情報量の低い連続同型局面の氾濫を抑制しメモリ圧縮と多様性向上を狙う。
     "enable_duplicate_filter": True,
     # シグネチャの保持ウィンドウサイズ (FIFO)。大きくし過ぎると計数コスト増。
-    "duplicate_window_size": 5000,
+    "duplicate_window_size": 3000,
     # 同一シグネチャを許容する最大回数 (この回数を超えると以降スキップ)。
-    "duplicate_signature_max_count": 50,
+    "duplicate_signature_max_count": 200,
     # スキップ数を一定間隔でログ出力するか (0/None で無効, >0 でその間隔毎に [dup] 行)。
-    "duplicate_log_interval": 2000,
+    "duplicate_log_interval": 0,
     # フィルタのシグネチャ構成: 'top_value_len' で (policy_top_idx, value_u8, legal_count)
     # 将来拡張ポイント (例: 'hash_pi')。
     "duplicate_signature_type": "top_value_len",
@@ -308,22 +345,22 @@ ALPHA_ZERO_CONFIG = {
     # そもそも巨大化しないため自動制御は実質発火しない想定。
     "auto_replay_water_enabled": True,
     # 物理メモリ(RAM)に対する RSS 高水位比率。0<high<1。
-    "replay_memory_high_ratio": 0.75,
+    "replay_memory_high_ratio": 0.85,
     # 低水位ターゲット比率。削減後はおおむねこの比率以下になるまで削る。
-    "replay_memory_low_ratio": 0.40,
+    "replay_memory_low_ratio": 0.35,
     
     # 親+子RSS合計が15GBを超えたら必ず purge したい要求に合わせ、デフォルトを 15360 MB に設定。
     # 0 のままにしたい場合はユーザ側で override してください。
     # ※ 既存キーを上書きしないため、新たに high_abs_mb_override を用意し trainer 側で優先する実装でも可。
     # ここではシンプルに既存値を直接 15360 に変更する。
-    "replay_memory_high_abs_mb": 15000,   # メモリ削減: 14GB→6GB で発火
+    "replay_memory_high_abs_mb": 2000,   # メモリ削減: 14GB→6GB で発火
     # 低水位を絶対MBで指定したい場合のオプション (0/None で無効)。
     # high_abs_mb 発火時、low_abs_mb > 0 なら ratio計算の代わりに low_abs_mb へ近づくよう target_size を計算。
-    "replay_memory_low_abs_mb": 5000,    # メモリ削減: 5GB→3GB
+    "replay_memory_low_abs_mb": 500,    # メモリ削減: 5GB→3GB
     # 再発火クールダウン(秒)。直近 purge からこの秒数は再度メモリ水位判定をスキップ。
-    "replay_memory_cooldown_sec": 120,
+    "replay_memory_cooldown_sec": 300,
         # 親+子プロセスRSS合算で判定するか (並列 self-play 時に必須)
-        "replay_memory_include_children": True,
+        "replay_memory_include_children": False,
         # 子RSS再計算の最短間隔(秒) (頻繁すぎる psutil 呼び出しを抑制)
         "replay_memory_children_recalc_sec": 15,
         # purge 後に gc.collect() を実行して RSS 解放を促すか
@@ -347,21 +384,21 @@ ALPHA_ZERO_CONFIG = {
     # 有効化スイッチ
     "worker_restart_enable": True,
     # 1ワーカーRSS(MB)がこの高水位閾値を連続観測回数分超えたら graceful 再起動要求
-    "worker_restart_rss_high_mb": 2500,
+    "worker_restart_rss_high_mb":1300,
     # 再起動判定用ヒステリシス下限 (未使用: 今回は単純連続超過のみ、将来拡張用)
-    "worker_restart_rss_low_mb": 2000,
+    "worker_restart_rss_low_mb": 1000,
     # 閾値超過を何回連続観測したら発火するか
-    "worker_restart_consecutive_required": 4,
+    "worker_restart_consecutive_required": 3,
     # 同一ワーカーの再起動間隔(秒) 下回る場合は保留 (スラッシング防止)
-    "worker_restart_min_interval_sec": 900,
+    "worker_restart_min_interval_sec": 1200,
     # 再起動要求時に付与するジッター最大秒数 (0 で無効)。worker_id を元に安定ジッター。
-    "worker_restart_jitter_sec": 15,
+    "worker_restart_jitter_sec": 30,
     # 緊急全体RSS閾値 (MB)。0/None で無効。超過時は最大RSSワーカー即 graceful 要求 (将来kill拡張余地)。
-    "worker_restart_emergency_total_mb": 0,
+    "worker_restart_emergency_total_mb": 20000,
     # graceful 再起動でエピソード終了待ちする最大秒数
-    "worker_restart_grace_timeout_sec": 120,
+    "worker_restart_grace_timeout_sec": 180,
     # grace timeout 超過後の強制 kill までの猶予秒数
-    "worker_restart_force_kill_sec": 150,
+    "worker_restart_force_kill_sec": 240,
     # flush (サンプル送信) 完了待ちタイムアウト
     "worker_restart_flush_timeout_sec": 20,
     # 終了直前に最終 objtypes ログを送るか

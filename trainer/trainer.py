@@ -38,10 +38,12 @@ import os
 import random
 import time
 from typing import Dict, Any, List
+import concurrent.futures
 from dataclasses import dataclass
 import multiprocessing as mp
 import argparse
 import threading
+import queue as _queue
 
 import sys
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -68,6 +70,19 @@ def _selfplay_worker_entry(worker_id: int, episodes: int, config: Dict[str, Any]
 
     戻り値: {"samples": List[Dict], "episodes": int, "worker": int}
     """
+    # まず CPU スレッド関連の環境変数を設定（numpy/MKL などの初期化前に行う）
+    try:
+        tn = int(config.get("torch_num_threads_workers", 0) or 0)
+        if tn > 0:
+            os.environ["OMP_NUM_THREADS"] = str(tn)
+            os.environ["MKL_NUM_THREADS"] = str(tn)
+            os.environ["OPENBLAS_NUM_THREADS"] = str(tn)
+            os.environ["NUMEXPR_NUM_THREADS"] = str(tn)
+        itn = int(config.get("torch_num_interop_threads_workers", 0) or 0)
+        # interop は環境変数なし（PyTorch API で設定）
+    except Exception:
+        pass
+
     # 乱数初期化（プロセス毎にズラす）
     try:
         seed = int(config.get("seed", 42)) + 10000 * int(worker_id)
@@ -77,6 +92,28 @@ def _selfplay_worker_entry(worker_id: int, episodes: int, config: Dict[str, Any]
     try:
         import numpy as _np
         _np.random.seed(seed % (2**32 - 1))
+    except Exception:
+        pass
+
+    # CPU スレッド数の制御（過剰スレッド競合の回避）
+    try:
+        tn = int(config.get("torch_num_threads_workers", 0) or 0)
+        itn = int(config.get("torch_num_interop_threads_workers", 0) or 0)
+        if tn > 0 or itn > 0:
+            import torch as _t
+            if tn > 0:
+                _t.set_num_threads(tn)
+            if itn > 0 and hasattr(_t, "set_num_interop_threads"):
+                try:
+                    _t.set_num_interop_threads(itn)
+                except Exception:
+                    pass
+            try:
+                _intra = _t.get_num_threads()
+                _interop = _t.get_num_interop_threads() if hasattr(_t, "get_num_interop_threads") else -1
+                print(f"[threads][worker {worker_id}] intra={_intra} interop={_interop} OMP={os.environ.get('OMP_NUM_THREADS')} MKL={os.environ.get('MKL_NUM_THREADS')}")
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -203,6 +240,54 @@ def _selfplay_worker_entry(worker_id: int, episodes: int, config: Dict[str, Any]
 
 
 # ======================================================
+# 非同期評価ゲート: 子プロセス用ワーカー関数
+# ======================================================
+def _gate_worker_eval(candidate_ckpt_path: str, baseline_ckpt_path: str, cfg: Dict[str, Any], games: int, seed: int | None, device: str = "cpu") -> Dict[str, Any]:
+    """サブプロセスで評価を行い結果を返す（設定は呼び出し元の config を尊重）。"""
+    # 遅延 import（サブプロセス側）
+    from agents.models import PolicyValueNet as _PVN
+    from evaluation.gating import evaluate_candidate
+
+    # モデル読み込み（CPU推奨）
+    cand = _PVN.load(candidate_ckpt_path, map_location=device)
+    base = _PVN.load(baseline_ckpt_path, map_location=device)
+    try:
+        if hasattr(cand, 'to'):
+            cand.to(device)
+    except Exception:
+        pass
+    try:
+        if hasattr(base, 'to'):
+            base.to(device)
+    except Exception:
+        pass
+    # 評価実行（gating 側の _override_eval_config のみ適用。ここでは cfg を尊重）
+    res = evaluate_candidate(cand, base, cfg, games=int(games), seed=seed)
+    return res
+
+def _gate_worker_eval_proc(candidate_ckpt_path: str,
+                           baseline_ckpt_path: str,
+                           cfg: Dict[str, Any],
+                           games: int,
+                           seed: int | None,
+                           device: str,
+                           out_q):
+    """mp.Process ターゲット関数: 結果を Queue へ put して終了。"""
+    try:
+        res = _gate_worker_eval(candidate_ckpt_path, baseline_ckpt_path, cfg, games, seed, device)
+    except Exception as e:
+        try:
+            out_q.put({"error": f"{type(e).__name__}: {e}"}, block=False)
+        except Exception:
+            pass
+        return
+    try:
+        out_q.put(res, block=False)
+    except Exception:
+        pass
+
+
+# ======================================================
 # 常駐自己対局: 並行学習用ワーカープロセス (Producer)
 # ======================================================
 def _selfplay_daemon_worker(worker_id: int,
@@ -218,6 +303,18 @@ def _selfplay_daemon_worker(worker_id: int,
     event_queue へはエピソード完了ごとに ("ep_done", 1) を送る。
     モデル更新は model_path の mtime を監視して自動リロードする（数エピソード毎にチェック）。
     """
+    # まず CPU スレッド関連の環境変数を設定（numpy/MKL などの初期化前に行う）
+    try:
+        tn = int(config.get("torch_num_threads_workers", 0) or 0)
+        if tn > 0:
+            os.environ["OMP_NUM_THREADS"] = str(tn)
+            os.environ["MKL_NUM_THREADS"] = str(tn)
+            os.environ["OPENBLAS_NUM_THREADS"] = str(tn)
+            os.environ["NUMEXPR_NUM_THREADS"] = str(tn)
+        itn = int(config.get("torch_num_interop_threads_workers", 0) or 0)
+    except Exception:
+        pass
+
     # 乱数初期化（プロセス毎にズラす）
     try:
         seed = int(config.get("seed", 42)) + 10000 * int(worker_id)
@@ -227,6 +324,28 @@ def _selfplay_daemon_worker(worker_id: int,
     try:
         import numpy as _np
         _np.random.seed(seed % (2**32 - 1))
+    except Exception:
+        pass
+
+    # CPU スレッド数の制御（過剰スレッド競合の回避）
+    try:
+        tn = int(config.get("torch_num_threads_workers", 0) or 0)
+        itn = int(config.get("torch_num_interop_threads_workers", 0) or 0)
+        if tn > 0 or itn > 0:
+            import torch as _t
+            if tn > 0:
+                _t.set_num_threads(tn)
+            if itn > 0 and hasattr(_t, "set_num_interop_threads"):
+                try:
+                    _t.set_num_interop_threads(itn)
+                except Exception:
+                    pass
+            try:
+                _intra = _t.get_num_threads()
+                _interop = _t.get_num_interop_threads() if hasattr(_t, "get_num_interop_threads") else -1
+                print(f"[threads][daemon {worker_id}] intra={_intra} interop={_interop} OMP={os.environ.get('OMP_NUM_THREADS')} MKL={os.environ.get('MKL_NUM_THREADS')}")
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -489,6 +608,12 @@ def _selfplay_daemon_worker(worker_id: int,
             except TypeError:
                 env.step(action)
             step_count += 1
+            # 軽量ハートビート: 長手局面でも親に進行を通知（詰まり診断用）
+            if (step_count % 200) == 0:
+                try:
+                    event_queue.put(("hb", (worker_id, step_count)), block=False)
+                except Exception:
+                    pass
             # フェーズ確定処理
             current_rankings: List[int] = list(getattr(env.game, "rankings", []))
             if len(current_rankings) > len(prev_rankings):
@@ -565,36 +690,76 @@ def _selfplay_daemon_worker(worker_id: int,
             pass
 
         # --------------------------------------------------
-        # Level3: オブジェクト種別トップ計測 (軽量サンプリング)
-        # 目的: ワーカー内部で増殖する型を可視化するため、一定エピソード間隔で
-        #       上位型カウント(名前と件数)を親へイベント送信し events.log に出力させる。
-        # 注意: config キーは追加せずハードコード頻度 (50 ep)。
-        # オーバーヘッド抑制のため top N=8 のみ、Counter生成は例外保護。
+        # 低頻度統計ログ: 平均手数/ep, p95手数, 実効シミュレーション数(平均/分布), early-stop率
+        # 注意: 追加の設定キーは導入せず、固定間隔(50 ep)で送信
         # --------------------------------------------------
         try:
-            # グローバルに蓄積する episodes_done カウンタ (存在しなければ初期化)
-            _epc = getattr(__import__('builtins'), '__worker_ep_done', 0) + 1  # type: ignore[attr-defined]
-            setattr(__import__('builtins'), '__worker_ep_done', _epc)          # type: ignore[attr-defined]
-            if _epc % 50 == 0:  # 固定間隔 (50エピソード)
-                import gc, collections
-                objs = gc.get_objects()
-                # 型名カウント (ただし非 hashable 安全化のため try/except)
-                cnt = collections.Counter()
-                for o in objs:
-                    try:
-                        tn = type(o).__name__
-                        cnt[tn] += 1
-                    except Exception:
-                        continue
-                top_list = cnt.most_common(8)
-                total_objs = sum(c for _t, c in top_list)
-                # 親へイベント送信 (小さな payload のみ)
+            bi = __import__('builtins')
+            _epc = getattr(bi, '__worker_ep_done', 0) + 1  # type: ignore[attr-defined]
+            setattr(bi, '__worker_ep_done', _epc)          # type: ignore[attr-defined]
+            # エピソード手数を集計（各エージェントのmove_count合計 = 総手数）
+            try:
+                ep_moves = 0
+                for az in agents:
+                    ep_moves += int(getattr(az, 'move_count', 0) or 0)
+            except Exception:
+                ep_moves = 0
+            try:
+                mv_list = getattr(bi, '__worker_ep_moves', None)
+                if mv_list is None:
+                    mv_list = []
+                    setattr(bi, '__worker_ep_moves', mv_list)
+                mv_list.append(ep_moves)
+                # サイズ制限（過剰メモリ回避）
+                if len(mv_list) > 5000:
+                    del mv_list[:len(mv_list)-5000]
+            except Exception:
+                pass
+
+            if _epc % 200 == 0:
+                # 分布ユーティリティ
+                def _quantile(sorted_arr, q: float):
+                    if not sorted_arr:
+                        return None
+                    q = max(0.0, min(1.0, float(q)))
+                    idx = int(round((len(sorted_arr)-1) * q))
+                    return float(sorted_arr[idx])
+                # 手数統計
+                mv_copy = list(getattr(bi, '__worker_ep_moves', []) or [])
+                mv_avg = float(sum(mv_copy)/len(mv_copy)) if mv_copy else None
+                mv_p95 = _quantile(sorted(mv_copy), 0.95) if mv_copy else None
+                # 実効シミュレーション数 (直近窓から集計)
+                sims_all = []
+                total_moves = 0
+                early_stops = 0
                 try:
-                    event_queue.put(("obj_types", (worker_id, _epc, top_list, total_objs)), block=False)
+                    for az in agents:
+                        vals = list(getattr(az, '_mcts_sims_recent', []) or [])
+                        sims_all.extend(int(v) for v in vals)
+                        total_moves += int(getattr(az, '_mcts_moves', 0) or 0)
+                        early_stops += int(getattr(az, '_mcts_early_stop', 0) or 0)
+                except Exception:
+                    pass
+                sims_avg = (float(sum(sims_all))/len(sims_all)) if sims_all else None
+                sims_p50 = _quantile(sorted(sims_all), 0.50) if sims_all else None
+                sims_p95 = _quantile(sorted(sims_all), 0.95) if sims_all else None
+                es_rate = (float(early_stops)/float(total_moves)) if total_moves>0 else None
+                payload = {
+                    'wid': int(worker_id),
+                    'ep': int(_epc),
+                    'moves_avg': mv_avg,
+                    'moves_p95': mv_p95,
+                    'sims_avg': sims_avg,
+                    'sims_p50': sims_p50,
+                    'sims_p95': sims_p95,
+                    'early_stop_rate': es_rate,
+                    'sample_size': len(sims_all),
+                }
+                try:
+                    event_queue.put(("play_stats", payload), block=False)
                 except Exception:
                     pass
         except Exception:
-            # 計測失敗は黙殺
             pass
         ep_since_check += 1
         # 過去モデルミックスの周期適用
@@ -657,11 +822,57 @@ class Trainer:
         self.past_model_pool_size = int(self.config.get("past_model_pool_size", 5))  # 保存上限 (古い順に削除)
         # 何エピソードごとに opponent へ再割当するか (0/未指定なら checkpoint タイミングでのみ)
         self.opponent_mix_interval = int(self.config.get("opponent_mix_interval_episodes", 0) or 0)
+        
+        # --- 非同期ゲート評価用 ---
+        self._gate_pool = None  # deprecated: ProcessPoolExecutor (not used)
+        self._gate_future = None  # deprecated: Future (not used)
+        self._gate_proc = None
+        self._gate_queue = None
+        self._gate_candidate_path = None
+        self._gate_baseline_path = None
+        # ゲート最新結果（毎更新ログ用に保持）
+        try:
+            self._last_gate_threshold = float(self.config.get("eval_gate_threshold", 0.6) or 0.6)
+        except Exception:
+            self._last_gate_threshold = 0.6
+        self._last_gate_result = None  # 型: Optional[Dict[str, Any]]
+        # 評価ゲートの起動制御（学習更新回数ベース）
+        self._last_gate_start_it = -1  # 直近の評価開始時点の train_it（未開始は -1）
+
+    def _should_start_gate(self, train_it: int) -> bool:
+        """評価ゲートを開始してよいかを学習更新回数で判定する。
+        - eval_gate_start_after_updates: この回数に到達するまで起動しない
+        - eval_gate_every_updates: 直近の起動からこの回数に満たない間は起動しない
+        """
+        try:
+            start_after = int(self.config.get("eval_gate_start_after_updates", 0) or 0)
+        except Exception:
+            start_after = 0
+        try:
+            every = int(self.config.get("eval_gate_every_updates", 0) or 0)
+        except Exception:
+            every = 0
+        if train_it < start_after:
+            return False
+        if every > 0 and self._last_gate_start_it >= 0 and (train_it - self._last_gate_start_it) < every:
+            return False
+        return True
 
     # -----------------------------------------------------
     # 準備
     # -----------------------------------------------------
     def setup(self):
+        # まずメインプロセスのスレッド環境変数を先に設定（ライブラリ初期化前に反映させる）
+        try:
+            tn_main_env = int(self.config.get("torch_num_threads_main", 0) or 0)
+            if tn_main_env > 0:
+                os.environ["OMP_NUM_THREADS"] = str(tn_main_env)
+                os.environ["MKL_NUM_THREADS"] = str(tn_main_env)
+                os.environ["OPENBLAS_NUM_THREADS"] = str(tn_main_env)
+                os.environ["NUMEXPR_NUM_THREADS"] = str(tn_main_env)
+        except Exception:
+            pass
+
         # デバイス決定とモデル生成
         device_cfg = self.config.get("device", "auto")
         if device_cfg == "auto":
@@ -672,27 +883,59 @@ class Trainer:
                 resolved_device = "cpu"
         else:
             resolved_device = device_cfg
+        # メインプロセスの CPU スレッド数を制御（必要時）
+        try:
+            tn_main = int(self.config.get("torch_num_threads_main", 0) or 0)
+            itn_main = int(self.config.get("torch_num_interop_threads_main", 0) or 0)
+            if tn_main > 0 or itn_main > 0:
+                import torch as _t
+                if tn_main > 0:
+                    _t.set_num_threads(tn_main)
+                if itn_main > 0 and hasattr(_t, "set_num_interop_threads"):
+                    try:
+                        _t.set_num_interop_threads(itn_main)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # 既存チェックポイントからの再開を試みる
+        self._loaded_from_checkpoint = False
+        latest_path = self.config.get("checkpoint_path", os.path.join(self.config.get("checkpoint_dir", "checkpoints"), "policy_value_latest.pt"))
+        try:
+            if latest_path and os.path.isfile(latest_path):
+                # 既存の最新 ckpt があれば、それを優先的にロード
+                try:
+                    self.model = PolicyValueNet.load(latest_path, map_location=resolved_device)
+                    self._loaded_from_checkpoint = True
+                    # 端末へも簡易表示（logger 初期化前のため）
+                    print(f"[resume] loaded model from {latest_path}")
+                except Exception as e:
+                    print(f"[WARN] failed to load checkpoint {latest_path}: {e}")
+        except Exception:
+            pass
+
         # フル特徴量使用時は一旦ダミー生成し、後で初回状態から次元を取得して再構築する方式を避けるため
         use_full = self.config.get("use_full_features", False)
-        if use_full:
-            # 一時インスタンス (full_feature_dim 後で差し替え。仮に base 次元で作る) -> 後続で lazy resize
-            # ただし簡易: 最初の環境 reset 後に full_input_dim を取得して再初期化
-            self.model = PolicyValueNet(
-                max_policy_size=self.config["max_policy_size"],
-                hidden_size=self.config["hidden_size"],
-                num_players=self.config["num_players"],
-                device=resolved_device,
-                use_full_features=True,
-                full_feature_dim= 56 * self.config["num_players"] + 22  # 統一フォーマット (後で再構築可)
-            )
-        else:
-            self.model = PolicyValueNet(
-                max_policy_size=self.config["max_policy_size"],
-                hidden_size=self.config["hidden_size"],
-                num_players=self.config["num_players"],
-                device=resolved_device,
-                use_full_features=False,
-            )
+        if not self._loaded_from_checkpoint:
+            if use_full:
+                # 一時インスタンス (full_feature_dim 後で差し替え。仮に base 次元で作る) -> 後続で lazy resize
+                # ただし簡易: 最初の環境 reset 後に full_input_dim を取得して再初期化
+                self.model = PolicyValueNet(
+                    max_policy_size=self.config["max_policy_size"],
+                    hidden_size=self.config["hidden_size"],
+                    num_players=self.config["num_players"],
+                    device=resolved_device,
+                    use_full_features=True,
+                    full_feature_dim= 56 * self.config["num_players"] + 22  # 統一フォーマット (後で再構築可)
+                )
+            else:
+                self.model = PolicyValueNet(
+                    max_policy_size=self.config["max_policy_size"],
+                    hidden_size=self.config["hidden_size"],
+                    num_players=self.config["num_players"],
+                    device=resolved_device,
+                    use_full_features=False,
+                )
         # ロガー生成
         self.logger = TrainingLogger(
             log_dir=self.config.get("log_dir", "logs"),
@@ -701,6 +944,7 @@ class Trainer:
             log_mcts_samples=not self.config.get("disable_mcts_log", False),
             config=self.config
         )
+        # スレッド設定の実測値ログは削除（簡潔化）
         # 共有リプレイバッファ (use_shared_replay=true の場合)
         self.shared_replay = None
         if self.config.get("use_shared_replay", False):
@@ -724,7 +968,8 @@ class Trainer:
         # 直ちに環境の agents を学習エージェント群で上書き (ウォームアップ0の場合の不整合防止)
         self.env.agents = self.agents
         # フル特徴量モデル再構築 (初回状態から full_input_dim 取得)
-        if use_full:
+        # ただし、既存チェックポイントから再開した場合は重みを保持するためスキップ
+        if use_full and (not getattr(self, "_loaded_from_checkpoint", False)):
             try:
                 _ = self.env.reset()
                 sample_state = self.agents[0]._extract_state(self.env)
@@ -747,6 +992,13 @@ class Trainer:
                         self.logger.log_text(f"[model] Rebuilt full-feature model input_dim={full_dim}")
             except Exception as e:
                 print(f"[WARN] full feature model rebuild failed: {e}")
+        elif use_full and getattr(self, "_loaded_from_checkpoint", False):
+            # 再開時はロードしたモデルの入出力次元を尊重。必要なら _encode_state 側で pad/truncate。
+            try:
+                if self.logger:
+                    self.logger.log_text("[resume] skip full-feature rebuild to keep loaded weights")
+            except Exception:
+                pass
         # フルモード時: 旧フォーマットサンプル浄化 (初期残存している可能性に備える)
         if self.config.get('use_full_features'):
             for ag in self.agents:
@@ -755,7 +1007,7 @@ class Trainer:
                         ag.replay_buffer = [s for s in ag.replay_buffer if s.get('feature_version',1)==1]
                 except Exception:
                     pass
-        # 既存メタデータとの整合性チェック (存在すれば)
+        # 既存メタデータとの整合性チェック (存在すれば) + モデル世代の復元
         try:
             meta_path = os.path.join(self.config['checkpoint_dir'], 'metadata.json')
             if os.path.isfile(meta_path):
@@ -764,6 +1016,68 @@ class Trainer:
                     old_meta = _json.load(f)
                 if old_meta.get('use_full_features') != self.config.get('use_full_features'):
                     print('[WARN] metadata.use_full_features differs from current config')
+                # モデル世代の復元（存在すれば）
+                try:
+                    mv = int(old_meta.get('model_version'))
+                    self.model_version = mv
+                    # 既存エージェントへも反映
+                    for ag in self.agents:
+                        if hasattr(ag, 'model_version'):
+                            ag.model_version = self.model_version
+                        if hasattr(ag, 'set_model_version'):
+                            try:
+                                ag.set_model_version(self.model_version)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Optimizer の再開: 学習エージェントの optimizer 状態を復元（存在すれば）
+        try:
+            opt_path = os.path.join(self.config.get('checkpoint_dir', 'checkpoints'), 'optimizer_latest.pt')
+            if os.path.isfile(opt_path):
+                ag0 = self.agents[self.learning_player_id]
+                # Optimizer を用意してから読み込み
+                try:
+                    if hasattr(ag0, 'ensure_optimizer'):
+                        ag0.ensure_optimizer()
+                    if hasattr(ag0, 'load_optimizer'):
+                        ok = ag0.load_optimizer(opt_path, map_location=resolved_device)
+                        if self.logger:
+                            self.logger.log_text(f"[resume] optimizer load {'ok' if ok else 'failed'} from {opt_path}")
+                except Exception as e:
+                    print(f"[WARN] optimizer load failed: {e}")
+        except Exception:
+            pass
+        # Scheduler の再開: 学習エージェントの学習率スケジューラを復元（存在すれば）
+        try:
+            sch_path = os.path.join(self.config.get('checkpoint_dir', 'checkpoints'), 'scheduler_latest.pt')
+            if os.path.isfile(sch_path):
+                ag0 = self.agents[self.learning_player_id]
+                try:
+                    if hasattr(ag0, 'ensure_optimizer'):
+                        ag0.ensure_optimizer()
+                    if hasattr(ag0, 'ensure_scheduler'):
+                        ag0.ensure_scheduler()
+                    if hasattr(ag0, 'load_scheduler'):
+                        ok = ag0.load_scheduler(sch_path)
+                        if self.logger:
+                            self.logger.log_text(f"[resume] scheduler load {'ok' if ok else 'failed'} from {sch_path}")
+                except Exception as e:
+                    print(f"[WARN] scheduler load failed: {e}")
+        except Exception:
+            pass
+        # オプション: 今回の再開に限り Warmup をやり直す（ワンショット）
+        try:
+            if bool(self.config.get('resume_reset_warmup_once', False)):
+                ag0 = self.agents[self.learning_player_id]
+                if hasattr(ag0, 'reset_scheduler_warmup'):
+                    done = ag0.reset_scheduler_warmup()
+                    if self.logger:
+                        self.logger.log_text(f"[resume] warmup reset {'ok' if done else 'failed'} (one-shot)")
+                # プロセス内で一度だけ実行するためフラグを下ろす
+                self.config['resume_reset_warmup_once'] = False
         except Exception:
             pass
         # 各エージェントへ環境参照を渡す (obs だけ渡される呼び出し互換のため)
@@ -794,7 +1108,8 @@ class Trainer:
                 except Exception as e:
                     print(f"[WARN] replay load failed: {e}")
         # 初期チェックポイント (空のリプレイと初期モデル) を要求された場合に保存
-        if self.config.get("initial_checkpoint_on_setup", False):
+        # ただし、既存 ckpt からの再開時は二重保存を避けるためスキップ
+        if self.config.get("initial_checkpoint_on_setup", False) and (not getattr(self, "_loaded_from_checkpoint", False)):
             try:
                 self._save_checkpoint(version_tag=None)
                 if self.logger:
@@ -1240,11 +1555,15 @@ class Trainer:
         workers = int(workers if workers is not None else (self.config.get("selfplay_workers", 0) or 0))
         workers = max(1, workers)
 
-        # モデル配布ファイル（既存と同じ場所を使用）
+        # モデル配布ファイル: 常に最新チェックポイントを参照させる
         os.makedirs(self.config["checkpoint_dir"], exist_ok=True)
-        model_blob_path = os.path.join(self.config["checkpoint_dir"], "_selfplay_worker_model.pt")
-        if self.model is not None:
-            self.model.save(model_blob_path)
+        model_blob_path = self.config.get("checkpoint_path", os.path.join(self.config["checkpoint_dir"], "policy_value_latest.pt"))
+        # 初回: latest が未作成なら現モデルを保存
+        if (self.model is not None) and (not os.path.exists(model_blob_path)):
+            try:
+                self.model.save(model_blob_path)
+            except Exception:
+                pass
 
         # 共有リプレイの存在に応じて取り込み先を決定
         dst_buffer = self.shared_replay if self.shared_replay is not None else None
@@ -1272,6 +1591,7 @@ class Trainer:
             )
             p.start()
             procs.append(p)
+        # 起動確認ログは簡潔化のため削除
 
         # 進捗表示初期化
         if self.minimal_progress and self.use_progress_bar:
@@ -1379,15 +1699,26 @@ class Trainer:
                 return None
 
         def _check_and_mark_restarts():
-            if not restart_cfg['enable'] or restart_cfg['high_mb'] <= 0:
+            # 緊急しきい値が設定されている場合は、enable/high_mb に関わらずチェックを行う。
+            # 通常の高水位判定は enable 且つ high_mb>0 の場合のみ有効化。
+            has_emergency = int(restart_cfg.get('emergency_total_mb', 0) or 0) > 0
+            has_normal_high = restart_cfg['enable'] and (restart_cfg['high_mb'] > 0)
+            if not has_emergency and not has_normal_high:
+                # どちらのモードも有効でない場合は即 return
                 return []
             marked = []
             try:
                 import psutil  # type: ignore
             except Exception:
                 return []
-            total_rss = 0
-            # 緊急用: total を集計
+            # 親 + 子(ワーカー + 評価ゲート等)の RSS 合算を算出
+            parent_rss = 0
+            try:
+                parent_rss = psutil.Process().memory_info().rss
+            except Exception:
+                parent_rss = 0
+            total_rss_children = 0
+            rss_by_wid = {}
             for p in procs:
                 if not p.is_alive():
                     continue
@@ -1395,38 +1726,122 @@ class Trainer:
                 if proc_obj is None:
                     continue
                 try:
-                    total_rss += proc_obj.memory_info().rss
-                except Exception:
-                    continue
-            emergency = restart_cfg['emergency_total_mb'] > 0 and (total_rss >= restart_cfg['emergency_total_mb'] * 1024 * 1024)
-            high_list = []
-            for wid, p in enumerate(procs):
-                if not p.is_alive():
-                    continue
-                proc_obj = _psutil_process(p.pid)
-                if proc_obj is None:
-                    continue
-                try:
                     rss = proc_obj.memory_info().rss
+                    total_rss_children += rss
+                    rss_by_wid[p.pid] = rss
                 except Exception:
                     continue
-                rss_mb = rss / (1024 * 1024)
-                st = worker_stats.get(wid)
-                if st is None:
-                    continue
-                if rss_mb >= restart_cfg['high_mb']:
-                    st['rss_high_count'] += 1
-                else:
-                    st['rss_high_count'] = 0
-                eligible = (st['rss_high_count'] >= restart_cfg['consecutive'] and
-                            (time.time() - st['last_restart']) >= restart_cfg['min_interval'] and not st['pending'])
-                if eligible:
-                    high_list.append((wid, rss_mb))
-            # 緊急: 最大RSS 1件を優先 (最小実装: graceful 同一ルート)
+            # 評価ゲートなどワーカー以外の子プロセスも合算に含める（現状はゲートのみ明示対応）
+            gate_rss = 0
+            gate_pid = None
+            try:
+                gp = getattr(self, "_gate_proc", None)
+                if gp is not None and gp.is_alive():
+                    proc_gate = _psutil_process(gp.pid)
+                    if proc_gate is not None:
+                        gate_rss = proc_gate.memory_info().rss
+                        gate_pid = gp.pid
+                        total_rss_children += gate_rss
+            except Exception:
+                pass
+            total_rss = parent_rss + total_rss_children
+            emergency_threshold = restart_cfg['emergency_total_mb'] * 1024 * 1024 if restart_cfg['emergency_total_mb'] > 0 else 0
+            emergency = emergency_threshold > 0 and (total_rss >= emergency_threshold)
+
+            high_list = []
+            # 通常の高水位しきい値チェックは、設定が有効なときのみ評価
+            if has_normal_high:
+                for wid, p in enumerate(procs):
+                    if not p.is_alive():
+                        continue
+                    proc_obj = _psutil_process(p.pid)
+                    if proc_obj is None:
+                        continue
+                    try:
+                        rss = proc_obj.memory_info().rss
+                    except Exception:
+                        continue
+                    rss_mb = rss / (1024 * 1024)
+                    st = worker_stats.get(wid)
+                    if st is None:
+                        continue
+                    if rss_mb >= restart_cfg['high_mb']:
+                        st['rss_high_count'] += 1
+                    else:
+                        st['rss_high_count'] = 0
+                    eligible = (st['rss_high_count'] >= restart_cfg['consecutive'] and
+                                (time.time() - st['last_restart']) >= restart_cfg['min_interval'] and not st['pending'])
+                    if eligible:
+                        high_list.append((wid, rss_mb))
+            # 緊急: 全体RSSがしきい値超過なら、個別閾値に関わらず最大RSSのプロセスを1件対象
             target_wids = []
-            if emergency and high_list:
-                target_wids = [max(high_list, key=lambda x: x[1])[0]]
+            if emergency:
+                # 候補: ワーカー（min_interval を緩やかに尊重）とゲートプロセス
+                candidates = []  # (kind, id_or_pid, rss, ok_interval)
+                for wid, p in enumerate(procs):
+                    if not p.is_alive():
+                        continue
+                    st = worker_stats.get(wid)
+                    if st is None or st.get('pending'):
+                        continue
+                    # RSS 取得
+                    proc_obj = _psutil_process(p.pid)
+                    if proc_obj is None:
+                        continue
+                    try:
+                        rss_now = proc_obj.memory_info().rss
+                    except Exception:
+                        continue
+                    # min_interval を緩やかに尊重（緊急時でも直後の連続再起動は避ける）
+                    since = time.time() - st.get('last_restart', 0.0)
+                    ok_interval = since >= restart_cfg['min_interval']
+                    candidates.append(("worker", wid, rss_now, ok_interval))
+                # ゲートプロセスを候補に含める（min_interval の概念はないため常に ok）
+                if gate_pid is not None and gate_rss > 0:
+                    candidates.append(("gate", gate_pid, gate_rss, True))
+                if candidates:
+                    # まず min_interval を満たす中で最大RSS を選択、なければ全体の最大RSS
+                    c_ok = [c for c in candidates if c[3]]
+                    pick_from = c_ok if c_ok else candidates
+                    kind_pick, ident_pick, rss_pick, _ = max(pick_from, key=lambda x: x[2])
+                    if kind_pick == "worker":
+                        target_wids = [int(ident_pick)]
+                        if self.logger:
+                            try:
+                                self.logger.log_text(
+                                    f"[worker-restart] emergency trigger total_rss={total_rss/(1024**3):.2f}GB parent={parent_rss/(1024**3):.2f}GB threshold={restart_cfg['emergency_total_mb']/1024:.2f}GB wid={int(ident_pick)}"
+                                )
+                            except Exception:
+                                pass
+                    elif kind_pick == "gate":
+                        # 評価ゲートプロセスを終了させる（安全側: terminate）
+                        try:
+                            gp = getattr(self, "_gate_proc", None)
+                            if gp is not None and gp.is_alive():
+                                gp.terminate()
+                                try:
+                                    gp.join(timeout=3)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        try:
+                            # ハンドルをクリア
+                            self._gate_proc = None
+                            self._gate_queue = None
+                            self._gate_candidate_path = None
+                            self._gate_baseline_path = None
+                        except Exception:
+                            pass
+                        if self.logger:
+                            try:
+                                self.logger.log_text(
+                                    f"[worker-restart] emergency trigger total_rss={total_rss/(1024**3):.2f}GB parent={parent_rss/(1024**3):.2f}GB threshold={restart_cfg['emergency_total_mb']/1024:.2f}GB gate_pid={int(ident_pick)} terminated"
+                                )
+                            except Exception:
+                                pass
             else:
+                # 通常: 個別高水位のものをすべて対象に
                 target_wids = [wid for wid, _ in high_list]
             for wid in target_wids:
                 st = worker_stats[wid]
@@ -1547,6 +1962,8 @@ class Trainer:
         last_worker_rss_check = 0.0
         worker_rss_check_interval = 15.0  # 秒 (最小安全版固定)
 
+        # ループ開始時の詳細ログは削除（簡潔化）
+
         try:
             while ep_done < total_episodes:
                 # イベント処理（自己対局進捗）
@@ -1582,30 +1999,47 @@ class Trainer:
                                     ag.model_version = self.model_version
                         except Exception:
                             pass
-                elif evt == "obj_types":
-                    # ワーカーからの型カウント: (worker_id, ep, top_list, subtotal_top)
+                elif evt == "play_stats":
+                    # ワーカーからのプレイ統計: payload dict
                     try:
-                        wid, w_ep, top_list, subtotal = val
+                        st = val or {}
+                        wid = st.get('wid')
+                        w_ep = st.get('ep')
+                        def _fmt(x):
+                            return f"{x:.2f}" if isinstance(x, (int, float)) and x is not None else (str(x) if x is not None else 'n/a')
+                        line = (
+                            f"[playstats] wid={wid} ep={w_ep} "
+                            f"moves_avg={_fmt(st.get('moves_avg'))} moves_p95={_fmt(st.get('moves_p95'))} "
+                            f"sims_avg={_fmt(st.get('sims_avg'))} sims_p50={_fmt(st.get('sims_p50'))} sims_p95={_fmt(st.get('sims_p95'))} "
+                            f"early_stop_rate={_fmt(st.get('early_stop_rate'))} n={int(st.get('sample_size') or 0)}"
+                        )
                         if self.logger:
-                            # 形式: type:count をカンマ区切りで (topN のみ)
-                            parts = ",".join(f"{t}:{c}" for t, c in top_list)
-                            self.logger.log_text(f"[objtypes] wid={wid} ep={w_ep} top={parts} (top_sum={subtotal})")
+                            self.logger.log_text(line)
                         else:
-                            print(f"[objtypes] wid={wid} ep={w_ep} top={top_list}")
+                            print(line)
                     except Exception:
                         pass
 
                     # 進捗表示
                     if self.minimal_progress and self.use_progress_bar:
                         bar, _pct = self._make_progress_bar(ep_done, total_episodes)
-                        line = f"[SELFPLAY~] {bar} {ep_done}/{total_episodes} (workers={workers})"
-                        pad = max(0, last_len_sp - len(line))
-                        print(line + ' ' * pad, end='\r' if ep_done < total_episodes else '\n', flush=True)
-                        last_len_sp = len(line)
+                        l2 = f"[SELFPLAY~] {bar} {ep_done}/{total_episodes} (workers={workers})"
+                        pad = max(0, last_len_sp - len(l2))
+                        print(l2 + ' ' * pad, end='\r' if ep_done < total_episodes else '\n', flush=True)
+                        last_len_sp = len(l2)
+                elif evt == "hb":
+                    # ワーカーハートビート: 長いエピソードでも親から可視化
+                    try:
+                        wid, steps = val
+                        if self.logger:
+                            self.logger.log_text(f"[worker-hb] wid={wid} steps={steps}")
+                    except Exception:
+                        pass
 
                 # サンプル取り込み（少しずつ）
                 consumed_now = _drain_samples(max_items=500)
                 new_samples_since_train += int(consumed_now)
+                # 取り込み実績の詳細ログは簡潔化のため削除
                 # High/Low water 自動 purge
                 if consumed_now > 0:
                     try:
@@ -1634,9 +2068,17 @@ class Trainer:
                 # 新規サンプルがしきい値を超えたら学習を回す
                 now = time.time()
                 if new_samples_since_train >= min_new_samples_before_train:
+                    # 学習バースト開始を可視化（長時間無音を避ける）
+                    burst_start_ts = time.time()
+                    last_loss_val = None
                     # updates_per_iter ステップだけ学習
                     for _ in range(max(1, int(updates_per_iter))):
                         loss_info = self.agents[0].train_step(batch_size=self.config.get("batch_size", 256))
+                        try:
+                            if isinstance(loss_info, dict) and loss_info.get("loss") is not None:
+                                last_loss_val = float(loss_info.get("loss"))
+                        except Exception:
+                            pass
                         # 追加: モデル更新直後の即時保存+purge (超低メモリ運用オプション)
                         if self.config.get("purge_replay_after_each_update"):
                             try:
@@ -1680,6 +2122,7 @@ class Trainer:
                                 vinfo = {"policy_loss": None, "value_loss": None, "entropy": None}
                             if isinstance(vinfo, dict) and (vinfo.get("policy_loss") is not None or vinfo.get("value_loss") is not None):
                                 self.logger.log_validation(vinfo)
+                        # ゲート途中経過ログは抑制（モデル更新時のみログ）
                     #  既存動作に合わせた保存は維持しつつ、高頻度I/Oを抑制
                     #  保存直前に評価ゲート（有効時）を実行し、採用可否でモデルを確定させる
                     def _resolve_device_str(dev_str: str | None) -> str:
@@ -1695,13 +2138,31 @@ class Trainer:
                         gate_enable = bool(self.config.get("eval_gate_enable", False))
                         if not gate_enable or self.model is None:
                             return None
+                        # 起動ガード（学習更新回数ベース）
+                        try:
+                            _train_it = int(train_it)
+                        except Exception:
+                            _train_it = 0
+                        try:
+                            start_after = int(self.config.get("eval_gate_start_after_updates", 0) or 0)
+                        except Exception:
+                            start_after = 0
+                        try:
+                            every = int(self.config.get("eval_gate_every_updates", 0) or 0)
+                        except Exception:
+                            every = 0
+                        if _train_it < start_after:
+                            return None
+                        if every > 0 and getattr(self, "_last_gate_start_it", -1) >= 0 and (_train_it - self._last_gate_start_it) < every:
+                            return None
                         baseline_model = None
                         try:
                             from agents.models import PolicyValueNet as _PVN
-                            ckpt_path = self.config.get("checkpoint_path", "checkpoints/policy_value_latest.pt")
-                            if os.path.exists(ckpt_path):
+                            # ベースラインは最新 ckpt を使用
+                            base_path = self.config.get("checkpoint_path", "checkpoints/policy_value_latest.pt")
+                            if os.path.exists(base_path):
                                 dev_str = _resolve_device_str(self.config.get("device", None))
-                                baseline_model = _PVN.load(ckpt_path, map_location=dev_str)
+                                baseline_model = _PVN.load(base_path, map_location=dev_str)
                                 try:
                                     dev = _resolve_device_str(self.config.get("device", None))
                                     if dev:
@@ -1722,21 +2183,53 @@ class Trainer:
                             games = int(self.config.get("eval_gate_games", 20) or 20)
                             thr = float(self.config.get("eval_gate_threshold", 0.6) or 0.6)
                             seed = self.config.get("eval_gate_seed", None)
+                            # 評価ゲート開始ログ（同期）
+                            try:
+                                if self.logger:
+                                    self.logger.log_text(f"[gate] start sync games={games} thr={thr:.0%} seed={seed}")
+                                else:
+                                    print(f"[gate] start sync games={games} thr={thr:.0%} seed={seed}")
+                            except Exception:
+                                pass
+                            # 評価ゲート実行
+                            # 起動時刻（更新番号）を記録
+                            try:
+                                self._last_gate_start_it = int(_train_it)
+                            except Exception:
+                                pass
                             gate_result = evaluate_candidate(self.model, baseline_model, self.config, games=games, seed=seed)
                             gated_pass = (gate_result.get("win_rate", 0.0) >= thr)
-                            msg = f"[GATE] win_rate={gate_result.get('win_rate'):.2%} threshold={thr:.0%} result={'ACCEPT' if gated_pass else 'REJECT'}"
-                            if self.logger:
-                                self.logger.log_text(msg)
-                            else:
-                                print(msg)
+                            # 最新ゲート結果を保持（毎更新ログ用）
+                            try:
+                                self._last_gate_threshold = float(thr)
+                                self._last_gate_result = dict(gate_result)
+                            except Exception:
+                                pass
+                            # 結果ログ（合否と勝率を明示）
+                            try:
+                                wins = gate_result.get('wins')
+                                total = gate_result.get('games')
+                                decision = 'promote' if gated_pass else 'reject'
+                                msg = f"[gate] result win_rate={gate_result.get('win_rate',0.0):.2%}"
+                                if wins is not None and total is not None:
+                                    msg += f" ({int(wins)}/{int(total)})"
+                                msg += f" decision={decision} thr={thr:.0%}"
+                                if self.logger:
+                                    self.logger.log_text(msg)
+                                else:
+                                    print(msg)
+                            except Exception:
+                                pass
                             if not gated_pass:
                                 # ロールバック
                                 self.model = baseline_model
                                 learner = self.agents[self.learning_player_id]
                                 if isinstance(learner, AlphaZeroAgent):
                                     learner.set_model(self.model)
-                                if self.logger:
-                                    self.logger.log_text("[GATE] reverted to baseline model (concurrent)")
+                            else:
+                                # 合格時は以降の _save_checkpoint により latest が更新される
+                                # ここでは昇格ログを出さない（結果ログに統合）
+                                pass
                             return gate_result
                         except Exception as e:
                             if self.logger:
@@ -1746,38 +2239,147 @@ class Trainer:
                                     pass
                             return None
 
+                    async_gate = bool(self.config.get("eval_gate_async", False))
                     if latest_ckpt_interval_sec > 0.0:
                         if (now - last_latest_ckpt_ts) >= latest_ckpt_interval_sec:
+                            if async_gate:
+                                # 学習更新回数に基づき起動をガード
+                                if not self._should_start_gate(train_it):
+                                    if self.logger:
+                                        try:
+                                            self.logger.log_text(f"[gate] skip: train_it={train_it}")
+                                        except Exception:
+                                            pass
+                                else:
+                                    # 候補モデルをステージングに保存し、ゲートを非同期起動（単発spawn）
+                                    try:
+                                        cand_path = os.path.join(self.config.get("checkpoint_dir", "checkpoints"), "_candidate_eval.pt")
+                                        # ベースラインは常に最新のチェックポイント（latest）
+                                        base_path = self.config.get("checkpoint_path", "checkpoints/policy_value_latest.pt")
+                                        if self.model is not None:
+                                            try:
+                                                self.model.save(cand_path, force_sync=True)
+                                            except TypeError:
+                                                self.model.save(cand_path)
+                                        # 既存の評価が動いていないときのみ起動
+                                        if getattr(self, "_gate_proc", None) is None or (self._gate_proc is not None and not self._gate_proc.is_alive()):
+                                            games = int(self.config.get("eval_gate_games", 20) or 20)
+                                            seed = self.config.get("eval_gate_seed", None)
+                                            # 評価プロセスは常に CPU で実行
+                                            dev_str = "cpu"
+                                            self._gate_candidate_path = cand_path
+                                            self._gate_baseline_path = base_path
+                                            try:
+                                                ctx = mp.get_context("spawn")
+                                            except Exception:
+                                                ctx = mp
+                                            self._gate_queue = ctx.Queue()
+                                            self._gate_proc = ctx.Process(target=_gate_worker_eval_proc, args=(cand_path, base_path, dict(self.config), games, seed, dev_str, self._gate_queue), daemon=True)
+                                            self._gate_proc.start()
+                                            # 起動記録
+                                            try:
+                                                self._last_gate_start_it = int(train_it)
+                                            except Exception:
+                                                pass
+                                            # 非同期ゲート開始ログ
+                                            try:
+                                                thr = float(self.config.get("eval_gate_threshold", 0.6) or 0.6)
+                                                if self.logger:
+                                                    import os as _os
+                                                    self.logger.log_text(
+                                                        f"[gate] start async games={games} thr={thr:.0%} seed={seed} cand={_os.path.basename(cand_path)} base={_os.path.basename(base_path)}"
+                                                    )
+                                                else:
+                                                    print(f"[gate] start async games={games} thr={thr:.0%} seed={seed} cand={cand_path} base={base_path}")
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
+                                # モデルはまだ昇格させず、リプレイ/メタのみ保存
+                                self._save_checkpoint(skip_model_save=True)
+                            else:
+                                _ = _maybe_gate_before_save()
+                                self._save_checkpoint()
+                                if self.keep_prev_model:
+                                    self._snapshot_current_model()
+                            last_latest_ckpt_ts = now
+                    else:
+                        # 0 以下なら常に保存（従来挙動）
+                        if async_gate:
+                            # 学習更新回数に基づき起動をガード
+                            if not self._should_start_gate(train_it):
+                                if self.logger:
+                                    try:
+                                        self.logger.log_text(f"[gate] skip: train_it={train_it}")
+                                    except Exception:
+                                        pass
+                            else:
+                                try:
+                                    cand_path = os.path.join(self.config.get("checkpoint_dir", "checkpoints"), "_candidate_eval.pt")
+                                    # ベースラインは常に最新のチェックポイント（latest）
+                                    base_path = self.config.get("checkpoint_path", "checkpoints/policy_value_latest.pt")
+                                    if self.model is not None:
+                                        try:
+                                            self.model.save(cand_path, force_sync=True)
+                                        except TypeError:
+                                            self.model.save(cand_path)
+                                    # 既存の評価が動いていないときのみ起動
+                                    if getattr(self, "_gate_proc", None) is None or (self._gate_proc is not None and not self._gate_proc.is_alive()):
+                                        games = int(self.config.get("eval_gate_games", 20) or 20)
+                                        seed = self.config.get("eval_gate_seed", None)
+                                        # 評価プロセスは常に CPU で実行
+                                        dev_str = "cpu"
+                                        self._gate_candidate_path = cand_path
+                                        self._gate_baseline_path = base_path
+                                        try:
+                                            ctx = mp.get_context("spawn")
+                                        except Exception:
+                                            ctx = mp
+                                        self._gate_queue = ctx.Queue()
+                                        self._gate_proc = ctx.Process(target=_gate_worker_eval_proc, args=(cand_path, base_path, dict(self.config), games, seed, dev_str, self._gate_queue), daemon=True)
+                                        self._gate_proc.start()
+                                        # 起動記録
+                                        try:
+                                            self._last_gate_start_it = int(train_it)
+                                        except Exception:
+                                            pass
+                                        # 非同期ゲート開始ログ
+                                        try:
+                                            thr = float(self.config.get("eval_gate_threshold", 0.6) or 0.6)
+                                            if self.logger:
+                                                import os as _os
+                                                self.logger.log_text(
+                                                    f"[gate] start async games={games} thr={thr:.0%} seed={seed} cand={_os.path.basename(cand_path)} base={_os.path.basename(base_path)}"
+                                                )
+                                            else:
+                                                print(f"[gate] start async games={games} thr={thr:.0%} seed={seed} cand={cand_path} base={base_path}")
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                            self._save_checkpoint(skip_model_save=True)
+                        else:
                             _ = _maybe_gate_before_save()
                             self._save_checkpoint()
                             if self.keep_prev_model:
                                 self._snapshot_current_model()
-                            last_latest_ckpt_ts = now
-                    else:
-                        # 0 以下なら常に保存（従来挙動）
-                        _ = _maybe_gate_before_save()
-                        self._save_checkpoint()
-                        if self.keep_prev_model:
-                            self._snapshot_current_model()
                     # ワーカー配布用モデルもスロットリングして保存
-                    if self.model is not None:
-                        do_blob_save = True
-                        if blob_save_interval_sec > 0.0:
-                            do_blob_save = (now - last_blob_save_ts) >= blob_save_interval_sec
-                        if do_blob_save:
-                            try:
-                                self.model.save(model_blob_path)
-                            except Exception:
-                                pass
-                            else:
-                                last_blob_save_ts = now
+                    # 最新固定運用: ワーカー配布モデルは latest のみ。
+                    # 学習中の候補モデルはワーカーへ配布しない（ゲート合格時のみ別経路で更新）。
                     # 学習トリガをリセット
                     new_samples_since_train = 0
+                    # 学習バースト終了ログ
+                    # 学習バースト終了の詳細ログは簡潔化のため削除
 
                 # 定期ステータスログ
                 now2 = time.time()
                 if status_log_sec > 0 and (now2 - last_status_ts) >= status_log_sec:
                     last_status_ts = now2
+                    # 非同期ゲートの完了をポーリング（あれば昇格/破棄を反映）
+                    try:
+                        self._poll_gate_async()
+                    except Exception:
+                        pass
                     try:
                         replay_size = len(self.shared_replay) if self.shared_replay is not None else (len(dst_buffer) if dst_buffer is not None and hasattr(dst_buffer, '__len__') else None)
                     except Exception:
@@ -1806,7 +2408,19 @@ class Trainer:
                     except Exception:
                         pass
                     io_sizes_str = (" io_sizes=" + ",".join(io_parts)) if io_parts else ""
-                    msg = f"[status] ep_done={ep_done} train_it={train_it} new_since_train={new_samples_since_train} replay_size={replay_size} workers={workers}{io_sizes_str}"
+                    # 追加: ワーカー生死と PID を簡単に添える
+                    try:
+                        procs_state = ",".join([f"{i}:{'A' if p.is_alive() else 'X'}@{p.pid}" for i,p in enumerate(procs)])
+                    except Exception:
+                        procs_state = ""
+                    # 追記: ゲート評価プロセスの状態
+                    try:
+                        gp = getattr(self, "_gate_proc", None)
+                        if gp is not None:
+                            procs_state = (procs_state + ("," if procs_state else "")) + f"gate:{'A' if gp.is_alive() else 'X'}@{gp.pid}"
+                    except Exception:
+                        pass
+                    msg = f"[status] ep_done={ep_done} train_it={train_it} new_since_train={new_samples_since_train} replay_size={replay_size} workers={workers}{io_sizes_str} procs=[{procs_state}]"
                     if self.logger:
                         self.logger.log_text(msg)
                         if status_log_include_mem:
@@ -1871,8 +2485,9 @@ class Trainer:
                 baseline_model = None
                 try:
                     from agents.models import PolicyValueNet as _PVN
-                    ckpt_path = self.config.get("checkpoint_path", "checkpoints/policy_value_latest.pt")
-                    if os.path.exists(ckpt_path):
+                    # ベースラインは常に最新のチェックポイント（latest）
+                    base_path = self.config.get("checkpoint_path", "checkpoints/policy_value_latest.pt")
+                    if os.path.exists(base_path):
                         def _resolve_device_str(dev_str: str | None) -> str:
                             if not dev_str or dev_str == "auto":
                                 try:
@@ -1882,7 +2497,7 @@ class Trainer:
                                     return "cpu"
                             return dev_str
                         dev_str = _resolve_device_str(self.config.get("device", None))
-                        baseline_model = _PVN.load(ckpt_path, map_location=dev_str)
+                        baseline_model = _PVN.load(base_path, map_location=dev_str)
                         try:
                             dev = dev_str
                             if dev:
@@ -1897,9 +2512,16 @@ class Trainer:
                         games = int(self.config.get("eval_gate_games", 20) or 20)
                         thr = float(self.config.get("eval_gate_threshold", 0.6) or 0.6)
                         seed = self.config.get("eval_gate_seed", None)
+                        # 最終ゲートは同期実行（終了直前のため）
                         gate_result = evaluate_candidate(self.model, baseline_model, self.config, games=games, seed=seed)
                         gated_pass = (gate_result.get("win_rate", 0.0) >= thr)
                         msg = f"[GATE] (final) win_rate={gate_result.get('win_rate'):.2%} threshold={thr:.0%} result={'ACCEPT' if gated_pass else 'REJECT'}"
+                        # 最新ゲート結果を保持
+                        try:
+                            self._last_gate_threshold = float(thr)
+                            self._last_gate_result = dict(gate_result)
+                        except Exception:
+                            pass
                         if self.logger:
                             self.logger.log_text(msg)
                         else:
@@ -1916,10 +2538,6 @@ class Trainer:
             self._save_checkpoint()
             if self.keep_prev_model and self.model is not None:
                 self._snapshot_current_model()
-                try:
-                    self.model.save(model_blob_path)
-                except Exception:
-                    pass
             # 残りサンプルを吸い上げ
             _ = _drain_samples(max_items=None)
             # 最後にシャードをマージ (残骸取り込み)
@@ -1968,11 +2586,14 @@ class Trainer:
         total_done = 0
         last_progress_len = 0
 
-        # モデル配布: 最新を一時パスへ保存（各チャンクで共通利用）
+        # モデル配布: 常に最新チェックポイントを使用
         os.makedirs(self.config["checkpoint_dir"], exist_ok=True)
-        model_blob_path = os.path.join(self.config["checkpoint_dir"], "_selfplay_worker_model.pt")
-        if self.model is not None:
-            self.model.save(model_blob_path)
+        model_blob_path = self.config.get("checkpoint_path", os.path.join(self.config["checkpoint_dir"], "policy_value_latest.pt"))
+        if (self.model is not None) and (not os.path.exists(model_blob_path)):
+            try:
+                self.model.save(model_blob_path)
+            except Exception:
+                pass
 
         remaining = int(num_episodes)
         ckpt_interval = int(self.ckpt_interval or 0)
@@ -2272,8 +2893,9 @@ class Trainer:
         if gate_enable:
             try:
                 from agents.models import PolicyValueNet as _PVN
-                ckpt = self.config.get("checkpoint_path", "checkpoints/policy_value_latest.pt")
-                if os.path.exists(ckpt):
+                # ベースラインは最新 ckpt
+                base_ckpt = self.config.get("checkpoint_path", "checkpoints/policy_value_latest.pt")
+                if os.path.exists(base_ckpt):
                     # resolve device 'auto' -> actual
                     def _resolve_device_str(dev_str: str | None) -> str:
                         if not dev_str or dev_str == "auto":
@@ -2284,7 +2906,7 @@ class Trainer:
                                 return "cpu"
                         return dev_str
                     dev_str = _resolve_device_str(self.config.get("device", None))
-                    baseline_model = _PVN.load(ckpt, map_location=dev_str)
+                    baseline_model = _PVN.load(base_ckpt, map_location=dev_str)
                     # align device if needed
                     try:
                         if dev_str:
@@ -2363,6 +2985,19 @@ class Trainer:
                 # 可能ならロギング
                 if isinstance(vinfo, dict) and (vinfo.get("policy_loss") is not None or vinfo.get("value_loss") is not None):
                     self.logger.log_validation(vinfo)
+            # 追加: 各学習更新後に最新のゲート結果を毎回ログ（非並行モード用）
+            try:
+                thr_val = float(self.config.get("eval_gate_threshold", self._last_gate_threshold)) if hasattr(self, "_last_gate_threshold") else 0.6
+            except Exception:
+                thr_val = 0.6
+            try:
+                last_res = getattr(self, "_last_gate_result", None)
+                if self.logger and isinstance(last_res, dict) and (last_res.get("win_rate") is not None):
+                    wr = float(last_res.get("win_rate", 0.0))
+                    msg_gate = f"[GATE] win_rate={wr:.2%} threshold={thr_val:.0%} result={'ACCEPT' if wr >= thr_val else 'REJECT'}"
+                    self.logger.log_text(msg_gate)
+            except Exception:
+                pass
 
             # 即時 checkpoint + purge オプション (単独 train_updates 用 / concurrent とは別経路)
             if self.config.get('purge_replay_after_each_update'):
@@ -2397,6 +3032,12 @@ class Trainer:
                 gate_result = evaluate_candidate(self.model, baseline_model, self.config, games=games, seed=seed)
                 gated_pass = (gate_result.get("win_rate", 0.0) >= thr)
                 msg = f"[GATE] win_rate={gate_result.get('win_rate'):.2%} threshold={thr:.0%} result={'ACCEPT' if gated_pass else 'REJECT'}"
+                # 最新ゲート結果を保持
+                try:
+                    self._last_gate_threshold = float(thr)
+                    self._last_gate_result = dict(gate_result)
+                except Exception:
+                    pass
                 if self.logger:
                     self.logger.log_text(msg)
                 else:
@@ -2463,7 +3104,7 @@ class Trainer:
     def _save_checkpoint(self):  # backward compatibility name
         self._save_checkpoint(version_tag=None)
 
-    def _save_checkpoint(self, version_tag: str | None = None):
+    def _save_checkpoint(self, version_tag: str | None = None, *, model_path_override: str | None = None, skip_model_save: bool = False):
         os.makedirs(self.config["checkpoint_dir"], exist_ok=True)
         # アトミック保存ヘルパ
         def _atomic_save(fn, save_callable):
@@ -2484,13 +3125,13 @@ class Trainer:
                     print(f"[ERROR] save failed {fn}: {ee}")
 
         # 最新モデル保存 (atomic)
-        latest_path = self.config["checkpoint_path"]
-        if self.model is not None:
+        latest_path = self.config["checkpoint_path"] if model_path_override is None else model_path_override
+        if (not skip_model_save) and self.model is not None:
             _atomic_save(latest_path, lambda p: self.model.save(p, force_sync=True))
         # バージョン付き保存
         if version_tag:
             ver_path = os.path.join(self.config["checkpoint_dir"], f"policy_value_{version_tag}.pt")
-            if self.model is not None:
+            if (not skip_model_save) and self.model is not None:
                 _atomic_save(ver_path, lambda p: self.model.save(p, force_sync=True))
         # リプレイ保存: 共有モードなら共有バッファを保存、そうでなければ従来通り代表エージェント
         replay_path = self.config.get("replay_path", "replay_buffer.joblib")
@@ -2541,6 +3182,33 @@ class Trainer:
                         self.logger.log_text(f"[replay] agent_replay_saved_and_purged prev_size={prev_size} path={replay_path}")
             except Exception as e:
                 print(f"[WARN] agent replay save failed: {e}")
+        # Optimizer 保存（学習エージェントの Adam 状態）
+        try:
+            ag0 = self.agents[self.learning_player_id]
+            opt_path = os.path.join(self.config.get('checkpoint_dir', 'checkpoints'), 'optimizer_latest.pt')
+            def _save_opt(pth):
+                if hasattr(ag0, 'save_optimizer'):
+                    ag0.save_optimizer(pth)
+                else:
+                    import torch as _t
+                    opt = getattr(ag0, '_optimizer', None)
+                    if opt is not None:
+                        _t.save(opt.state_dict(), pth)
+            _atomic_save(opt_path, _save_opt)
+        except Exception as e:
+            print(f"[WARN] optimizer save failed: {e}")
+        # Scheduler 保存（学習率スケジューラの状態）
+        try:
+            ag0 = self.agents[self.learning_player_id]
+            # スケジューラが存在する場合のみ保存
+            if hasattr(ag0, '_scheduler') and getattr(ag0, '_scheduler') is not None:
+                sch_path = os.path.join(self.config.get('checkpoint_dir', 'checkpoints'), 'scheduler_latest.pt')
+                def _save_sch(pth):
+                    if hasattr(ag0, 'save_scheduler'):
+                        ag0.save_scheduler(pth)
+                _atomic_save(sch_path, _save_sch)
+        except Exception as e:
+            print(f"[WARN] scheduler save failed: {e}")
         # メタデータ保存
         try:
             # 簡易 config ハッシュ
@@ -2589,6 +3257,120 @@ class Trainer:
                 self.logger.log_text("[force_save] checkpoint+replay saved")
         except Exception as e:
             print(f"[WARN] force_save failed: {e}")
+
+    # -----------------------------------------------------
+    # 非同期ゲート: ポーリングして結果を反映（合格で昇格/不合格で破棄）
+    # -----------------------------------------------------
+    def _poll_gate_async(self):
+        # 単発spawn方式: プロセスとキューから非ブロッキングで回収
+        proc = getattr(self, "_gate_proc", None)
+        q = getattr(self, "_gate_queue", None)
+        if proc is None:
+            return
+        # まだ動作中なら結果は未到着の可能性あり
+        if proc.is_alive():
+            # キューに結果が既にある場合もあるので試す（非ブロッキング）
+            try:
+                res = q.get_nowait() if q is not None else None
+            except _queue.Empty:
+                return
+            except Exception:
+                res = None
+        else:
+            # プロセスが停止しているなら結果取得を試みる
+            try:
+                res = q.get_nowait() if q is not None else None
+            except Exception:
+                res = None
+        # プロセスのクリーンアップ
+        try:
+            if not proc.is_alive():
+                proc.join(timeout=1)
+        except Exception:
+            pass
+        self._gate_proc = None
+        self._gate_queue = None
+        if res is None:
+            # 失敗として扱う（ログのみ）
+            if self.logger:
+                try:
+                    self.logger.log_text("[WARN] eval-gate async finished without result")
+                except Exception:
+                    pass
+            return
+        if isinstance(res, dict) and "error" in res:
+            if self.logger:
+                try:
+                    self.logger.log_text(f"[WARN] eval-gate async failed: {res['error']}")
+                except Exception:
+                    pass
+            return
+        cand = self._gate_candidate_path
+        base = self._gate_baseline_path
+        self._gate_candidate_path = None
+        self._gate_baseline_path = None
+        try:
+            thr = float(self.config.get("eval_gate_threshold", 0.6) or 0.6)
+        except Exception:
+            thr = 0.6
+        win_rate = float(res.get("win_rate", 0.0)) if isinstance(res, dict) else 0.0
+        gated_pass = (win_rate >= thr)
+        # 最新ゲート結果を保持（評価途中の詳細ログは抑制）
+        try:
+            self._last_gate_threshold = float(thr)
+            # res は dict 想定
+            if isinstance(res, dict):
+                self._last_gate_result = dict(res)
+            else:
+                self._last_gate_result = {"win_rate": float(win_rate)}
+        except Exception:
+            pass
+        # 結果ログ（非同期完了時）
+        try:
+            decision = 'promote' if gated_pass else 'reject'
+            wins = None
+            total = None
+            try:
+                wins = int(res.get('wins')) if isinstance(res, dict) and res.get('wins') is not None else None
+                total = int(res.get('games')) if isinstance(res, dict) and res.get('games') is not None else None
+            except Exception:
+                wins, total = None, None
+            import os as _os
+            cand_name = _os.path.basename(cand) if cand else None
+            base_name = _os.path.basename(base) if base else None
+            msg = f"[gate] done async win_rate={win_rate:.2%}"
+            if wins is not None and total is not None:
+                msg += f" ({wins}/{total})"
+            msg += f" decision={decision} thr={thr:.0%}"
+            if cand_name and base_name:
+                msg += f" cand={cand_name} base={base_name}"
+            if self.logger:
+                self.logger.log_text(msg)
+            else:
+                print(msg)
+        except Exception:
+            pass
+        # 昇格 or 破棄
+        try:
+            if gated_pass and cand is not None:
+                latest_path = self.config.get("checkpoint_path", "checkpoints/policy_value_latest.pt")
+                # 候補を本番(最新)へ昇格
+                os.replace(cand, latest_path)
+                # スナップショット等の付随処理
+                if self.keep_prev_model:
+                    try:
+                        self._snapshot_current_model()
+                    except Exception:
+                        pass
+            else:
+                # 拒否時は候補を削除
+                if cand is not None and os.path.exists(cand):
+                    try:
+                        os.remove(cand)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     # -----------------------------------------------------
     # 直前モデルを対戦相手に混在させる

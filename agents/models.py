@@ -299,6 +299,62 @@ class PolicyValueNet(nn.Module):
         xs = torch.stack([self._encode_state(s) for s in states], dim=0)
         return self._forward_from_tensor(xs)
 
+    # --- Optional variable-length API (compat shim) ---
+    # 可変長アクション対応モデルが未実装の場合の互換用 evaluate。
+    # 既存の固定ヘッド forward を内部で呼び出し、legal_actions の長さ n に合わせて
+    # 先頭 n 要素のロジットを返す。value はプレイヤー数ぶんのベクター（確率; Sigmoid 適用済み）。
+    # 注意: この実装は supports_variable_actions を自動では有効化しません（既存の
+    #       バッチ推論経路を温存するため）。必要な場合は呼び出し側で
+    #       model.supports_variable_actions = True を設定してください。
+    def evaluate(self, state: Dict[str, Any], legal_actions: List[Any]):
+        """Return (policy_logits_for_legal, value_vector) for variable-length actions.
+
+        - policy_logits_for_legal: 長さ len(legal_actions) のロジット配列（softmax は呼び出し側）
+        - value_vector: 長さ num_players の確率ベクター（Sigmoid 済み）
+
+        このメソッドは固定ヘッドモデルの便宜用ラッパーであり、可変長モデルの厳密な
+        行動エンコード（例: アクションID辞書）を行いません。既存の方針（legal の並びに
+        対応して先頭から切り出す）に合わせます。
+        """
+        try:
+            import torch as _t
+            _use_amp = bool(getattr(self.device, 'type', None) == 'cuda')
+            with _t.no_grad():
+                with _t.amp.autocast('cuda', enabled=_use_amp):
+                    logits_full, value_vec_logits = self.forward(state)
+        except Exception:
+            # フォールバック（AMP なし / 例外吸収）
+            logits_full, value_vec_logits = self.forward(state)
+
+        n = len(legal_actions) if legal_actions is not None else 0
+        # policy ロジットを legal 数に合わせて切り出し（不足は 0-padding）
+        if hasattr(logits_full, 'shape'):
+            import torch as _t
+            if logits_full.shape[0] < n:
+                pad = _t.zeros(n - logits_full.shape[0], device=getattr(logits_full, 'device', None), dtype=logits_full.dtype)
+                logits_sel = _t.cat([logits_full, pad], dim=0)
+            else:
+                logits_sel = logits_full[:n]
+            policy_logits = logits_sel.detach().cpu().tolist()
+        else:
+            policy_logits = list(logits_full)[:n]
+            if len(policy_logits) < n:
+                policy_logits += [0.0] * (n - len(policy_logits))
+
+        # value を Sigmoid で確率化してベクター返却
+        try:
+            v_probs = value_vec_logits.sigmoid().detach().cpu().tolist()
+        except Exception:
+            try:
+                raw = value_vec_logits.tolist() if hasattr(value_vec_logits, 'tolist') else list(value_vec_logits)
+                import math as _m
+                v_probs = [float(1.0/(1.0+_m.exp(-float(x)))) for x in raw]
+            except Exception:
+                # 予期せぬ型の場合は安全側に均一分布
+                v_probs = [1.0 / float(self.num_players)] * int(self.num_players)
+
+        return policy_logits, v_probs
+
     def save(self, path: str, *, force_sync: bool = False):
         ckpt = {
             "state_dict": self.state_dict(),

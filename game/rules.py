@@ -1,3 +1,122 @@
+from functools import lru_cache
+
+
+@lru_cache(maxsize=100000)
+def _classify_combo_cached(revo_flag: bool, cards_key: tuple):
+    """副作用なしの役分類をLRUキャッシュで提供する純関数。
+
+    入力:
+      - revo_flag: 革命状態 (strength 解釈に影響)
+      - cards_key: 並び順非依存の正規化キー。
+        形式は tuple( (is_joker:int, suit:str|None, rank:int|None), ... ) をソート済みで格納。
+
+    出力:
+      - dict(type,size,rank,ranks,jokers,strength) | None
+    """
+    cards = list(cards_key)
+    n = len(cards)
+    if n == 0:
+        return None
+    jokers = [c for c in cards if c[0] == 1]
+    non_jokers = [c for c in cards if c[0] == 0]
+
+    def _strength_from_rank(r: int) -> int:
+        if r == 1:
+            return 13
+        if r == 2:
+            return 14
+        return r - 2
+
+    # Joker単体
+    if n == 1 and len(jokers) > 0:
+        return {
+            'type': 'joker_single',
+            'size': 1,
+            'rank': None,
+            'ranks': [],
+            'jokers': 1,
+            'strength': 15,
+        }
+
+    # 階段: あるスートに対し、連続ランク列をジョーカーで補完して成立するか
+    def _is_straight_and_ranks():
+        if n < 3:
+            return None
+        # スート候補: 非ジョーカーのスート集合（非ジョーカーが無いときは全スート）
+        if non_jokers:
+            suit_candidates = set(c[1] for c in non_jokers)
+        else:
+            suit_candidates = set(['\u2660','\u2665','\u2666','\u2663'])
+        # 非ジョーカーの指定スートのランクリスト
+        for suit in suit_candidates:
+            hand_ranks = [c[2] for c in non_jokers if c[1] == suit and c[2] is not None]
+            for start in range(1, 14):
+                expected = [((start + i - 1) % 13) + 1 for i in range(n)]
+                if 2 in expected and expected[-1] != 2:
+                    continue
+                temp = hand_ranks[:]
+                jokers_left = len(jokers)
+                match = 0
+                for val in expected:
+                    if val in temp:
+                        temp.remove(val)
+                        match += 1
+                    else:
+                        if jokers_left > 0:
+                            jokers_left -= 1
+                            match += 1
+                        else:
+                            match = -1
+                            break
+                if match == n:
+                    return expected
+        return None
+
+    straight_ranks = _is_straight_and_ranks()
+    if straight_ranks is not None:
+        strength_ref = min(straight_ranks) if revo_flag else max(straight_ranks)
+        return {
+            'type': 'straight',
+            'size': n,
+            'rank': None,
+            'ranks': straight_ranks,
+            'jokers': len(jokers),
+            'strength': strength_ref,
+        }
+
+    # 同ランク(ジョーカー含む)
+    if len(non_jokers) == 0:
+        # 全ジョーカー
+        t = {1:'single',2:'pair',3:'triple'}.get(n, 'four')
+        return {
+            'type': t,
+            'size': n,
+            'rank': None,
+            'ranks': [],
+            'jokers': len(jokers),
+            'strength': 15,
+        }
+    base_rank = non_jokers[0][2]
+    same_rank = all((c[2] == base_rank) for c in non_jokers)
+    if same_rank:
+        t = {1:'single',2:'pair',3:'triple'}.get(n, 'four')
+        if non_jokers:
+            strengths = [_strength_from_rank(c[2]) for c in non_jokers]
+            strength_ref = min(strengths) if revo_flag else max(strengths)
+        else:
+            strength_ref = 15
+        return {
+            'type': t,
+            'size': n,
+            'rank': base_rank,
+            'ranks': [],
+            'jokers': len(jokers),
+            'strength': strength_ref,
+        }
+
+    return None
+
+
 class RuleChecker:
     def __init__(self):
         self.revolution = False  # 革命フラグ
@@ -26,76 +145,79 @@ class RuleChecker:
     
     # === 役分類 / 比較ユーティリティ =====================================
     def classify_combo(self, cards):
-        """カード集合を役情報へ分類。無効なら None。
-        戻り dict 例:
-          {
-            'type': 'single'|'pair'|'triple'|'four'|'straight'|'joker_single',
-            'size': n,
-            'rank': 基本ランク(同ランク系非ジョーカー) or None,
-            'ranks': 階段ランク列(list) or [],
-            'jokers': ジョーカー枚数,
-            'strength': 比較用整数 (革命を考慮した基準値),
-            'raw_cards': cards,
-          }
+        """カード集合を役情報へ分類（LRUキャッシュ活用）。無効なら None。
+        戻り値は従来フォーマットで 'raw_cards' を追加する。
         """
         if not cards:
             return None
-        n = len(cards)
-        jokers = [c for c in cards if c.is_joker]
-        non_jokers = [c for c in cards if not c.is_joker]
-
-        # Joker単体
-        if n == 1 and jokers:
-            # 単体ジョーカーは代用情報を強制リセットして素の表示に統一
-            jk = jokers[0]
-            jk.joker_as_rank = None
-            jk.joker_as_suit = None
-            return {
-                'type': 'joker_single',
-                'size': 1,
-                'rank': None,
-                'ranks': [],
-                'jokers': 1,
-                'strength': 15,  # 最強扱い
-                'raw_cards': cards,
-            }
-
-        # 階段
-        if self.is_straight(cards):
-            straight_ranks = self.get_straight_ranks(cards)
-            if not straight_ranks:
+        # 正規化キーを生成（順序非依存 + Jokerは (1,None,None)）
+        try:
+            key_elems = []
+            for c in cards:
+                if getattr(c, 'is_joker', False):
+                    key_elems.append((1, None, None))
+                else:
+                    key_elems.append((0, getattr(c, 'suit', None), getattr(c, 'rank', None)))
+            key_elems.sort()
+            res = _classify_combo_cached(bool(self.revolution), tuple(key_elems))
+            if res is None:
                 return None
-            strength_ref = min(straight_ranks) if self.revolution else max(straight_ranks)
-            return {
-                'type': 'straight',
-                'size': n,
-                'rank': None,
-                'ranks': straight_ranks,
-                'jokers': len(jokers),
-                'strength': strength_ref,
-                'raw_cards': cards,
-            }
-
-        # 同ランク(ジョーカー含む) 系
-        if self.is_same_rank_or_joker(cards):
-            base_rank = non_jokers[0].rank if non_jokers else None
-            t = {1: 'single', 2: 'pair', 3: 'triple'}.get(n, 'four')
-            if non_jokers:
-                strengths = [c.strength() for c in non_jokers]
-                strength_ref = min(strengths) if self.revolution else max(strengths)
-            else:
-                strength_ref = 15  # 全ジョーカー -> 最大
-            return {
-                'type': t,
-                'size': n,
-                'rank': base_rank,
-                'ranks': [],
-                'jokers': len(jokers),
-                'strength': strength_ref,
-                'raw_cards': cards,
-            }
-
-        return None
+            out = dict(res)
+            out['raw_cards'] = cards
+            return out
+        except Exception:
+            # 予期せぬ型でも従来ロジックへフォールバック
+            n = len(cards)
+            jokers = [c for c in cards if getattr(c, 'is_joker', False)]
+            non_jokers = [c for c in cards if not getattr(c, 'is_joker', False)]
+            if n == 1 and jokers:
+                jk = jokers[0]
+                try:
+                    jk.joker_as_rank = None
+                    jk.joker_as_suit = None
+                except Exception:
+                    pass
+                return {
+                    'type': 'joker_single',
+                    'size': 1,
+                    'rank': None,
+                    'ranks': [],
+                    'jokers': 1,
+                    'strength': 15,
+                    'raw_cards': cards,
+                }
+            if self.is_straight(cards):
+                straight_ranks = self.get_straight_ranks(cards)
+                if not straight_ranks:
+                    return None
+                strength_ref = min(straight_ranks) if self.revolution else max(straight_ranks)
+                return {
+                    'type': 'straight',
+                    'size': n,
+                    'rank': None,
+                    'ranks': straight_ranks,
+                    'jokers': len(jokers),
+                    'strength': strength_ref,
+                    'raw_cards': cards,
+                }
+            if self.is_same_rank_or_joker(cards):
+                base_rank = non_jokers[0].rank if non_jokers else None
+                t = {1: 'single', 2: 'pair', 3: 'triple'}.get(n, 'four')
+                if non_jokers:
+                    strengths = [c.strength() for c in non_jokers]
+                    strength_ref = min(strengths) if self.revolution else max(strengths)
+                else:
+                    strength_ref = 15
+                return {
+                    'type': t,
+                    'size': n,
+                    'rank': base_rank,
+                    'ranks': [],
+                    'jokers': len(jokers),
+                    'strength': strength_ref,
+                    'raw_cards': cards,
+                }
+            return None
 
     def compare_combos(self, challenger, field_combo):
         """challenger が field_combo を上回れるか。"""

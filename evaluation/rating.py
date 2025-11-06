@@ -28,6 +28,7 @@ import json
 import os
 import csv
 import time
+import threading
 
 
 @dataclass
@@ -43,6 +44,11 @@ class RatingManager:
     config: EloConfig = field(default_factory=EloConfig)
     ratings: Dict[str, float] = field(default_factory=dict)  # key: player_name
     game_index: int = 0  # 永続化された最後のゲーム番号 (CSV の行数ではない)
+    # JSON 保存を無効化（既定 False）。過去互換で読み込みは維持。
+    enable_json_save: bool = False
+    # 一括追記用の履歴バッファ（ゲーム終了時点の全プレイヤーレーティングスナップショット）
+    _history_buffer: List[Tuple[int, int, Dict[str, float]]] = field(default_factory=list, init=False, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self):
         os.makedirs(self.save_dir, exist_ok=True)
@@ -74,6 +80,8 @@ class RatingManager:
                 writer.writerow(["timestamp", "game_index", "player", "rating"])
 
     def _save(self):
+        if not self.enable_json_save:
+            return
         data = {
             "ratings": self.ratings,
             "game_index": self.game_index,
@@ -81,12 +89,33 @@ class RatingManager:
         with open(self._ratings_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-    def _append_history(self):
+    def _buffer_history_snapshot(self):
+        """現在の ratings をゲームインデックス付きでバッファへ格納（CSVは後で一括書き込み）。"""
         ts = int(time.time())
-        with open(self._history_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            for player, rating in self.ratings.items():
-                writer.writerow([ts, self.game_index, player, f"{rating:.2f}"])
+        with self._lock:
+            # ratings の浅いコピーでスナップショット
+            self._history_buffer.append((ts, self.game_index, dict(self.ratings)))
+
+    def flush_history(self):
+        """バッファ内の履歴を一括で CSV へ追記（同期）。"""
+        with self._lock:
+            if not self._history_buffer:
+                return
+            rows: List[List[str]] = []
+            for ts, gi, snap in self._history_buffer:
+                for player, rating in snap.items():
+                    rows.append([ts, gi, player, f"{rating:.2f}"])
+            # 書き込み（1回の open でまとめて）
+            with open(self._history_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerows(rows)
+            # クリア
+            self._history_buffer.clear()
+
+    def flush_history_async(self):
+        """バッファ内の履歴を別スレッドで一括追記（非同期）。"""
+        t = threading.Thread(target=self.flush_history, daemon=True)
+        t.start()
 
     # ----------------------------
     # 公開 API
@@ -135,12 +164,16 @@ class RatingManager:
             self.ratings[p] = new_r
         # ゲームインデックス更新 & 保存
         self.game_index += 1
+        # ratings.json は既定では保存しない（enable_json_save=True の場合のみ保存）
         self._save()
-        self._append_history()
+        # CSV は即書き込みせず、スナップショットをバッファしておく
+        self._buffer_history_snapshot()
 
     def batch_update(self, list_of_rankings: List[List[str]]):
         for r in list_of_rankings:
             self.update_from_rankings(r)
+        # まとめて非同期フラッシュ（大量の評価時のI/Oを削減）
+        self.flush_history_async()
 
     def get_leaderboard(self) -> List[Tuple[str, float]]:
         return sorted(self.ratings.items(), key=lambda x: x[1], reverse=True)

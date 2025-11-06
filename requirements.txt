@@ -14,3 +14,6 @@ protobuf==4.25.3
 
 # Plotting (evaluation visualization)
 matplotlib==3.9.0
+
+# Optional: build Cython extension for faster MCTS select
+cython>=3.0
