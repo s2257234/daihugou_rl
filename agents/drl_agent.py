@@ -748,9 +748,29 @@ class AlphaZeroAgent:
         # 推論時は Dirichlet を既定で無効化
         add_dirichlet_flag = True if training else bool(self.config.get('inference_dirichlet', False))
 
+        # --- 学習時だけ: 学習対象プレイヤー以外のMCTS探索を間引く ---
+        # 既定: 学習プレイヤーは self.num_simulations のまま。
+        #       それ以外は scale(例: 1/8) もしくは固定値(opponent_num_simulations)を使用。
+        sims_to_run = int(self.num_simulations)
+        try:
+            if training:
+                learn_pid = int(self.config.get("learning_player_id", 0) or 0)
+                if int(self.player_id) != learn_pid:
+                    # 絶対指定があれば優先
+                    opp_abs = int(self.config.get("opponent_num_simulations", 0) or 0)
+                    if opp_abs > 0:
+                        sims_to_run = max(1, opp_abs)
+                    else:
+                        scale = float(self.config.get("opponent_sim_scale", 0.125) or 0.125)
+                        min_sim = int(self.config.get("opponent_sim_min", 1) or 1)
+                        sims_to_run = max(min_sim, int(round(sims_to_run * max(0.0, scale))))
+        except Exception:
+            # 何かあっても既定の探索数で継続
+            sims_to_run = int(self.num_simulations)
+
         root = run_puct_mcts(
             root_env_copy=env_copy,
-            num_simulations=self.num_simulations,
+            num_simulations=sims_to_run,
             policy_value_fn=policy_value_fn,
             policy_value_batch_fn=policy_value_batch_fn,
             get_legal_actions_fn=legal_fn,

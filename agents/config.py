@@ -117,6 +117,14 @@ ALPHA_ZERO_CONFIG = {
     "mcts_early_stop_debug": True,
     # Early Stop 計測ログ出力間隔 (何手ごとに平均シミュレーション数を events.log へ書くか)
     "mcts_sims_log_interval": 50,
+    # 学習対象プレイヤー以外の MCTS 探索間引き設定
+    # 学習プレイヤー (learning_player_id) は num_simulations を使用。
+    # opponent_num_simulations > 0 なら絶対値で上書き。
+    # それ以外は num_simulations * opponent_sim_scale を丸め、最低 opponent_sim_min を保証。
+    "learning_player_id": 0,
+    "opponent_num_simulations": 32,
+    "opponent_sim_scale": 0.125,  # 約1/8
+    "opponent_sim_min": 8,
 
     # ---------------------------
     # モデル
