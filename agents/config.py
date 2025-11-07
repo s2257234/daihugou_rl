@@ -34,7 +34,7 @@ ALPHA_ZERO_CONFIG = {
     "lr_warmup_steps": 3000,
     "lr_min": 3e-6,
     # ウォームアップ後、ここまでの更新ステップで lr_min へ到達
-    "lr_cosine_T_max_updates": 21000, #目標ステップ数に応じて変更する
+    "lr_cosine_T_max_updates": 500000, #目標ステップ数に応じて変更する
     # 再開直後に一度だけウォームアップをやり直す（プロセス内一回限り）
     # True にすると、optimizer/scheduler 復元後にスケジューラを last_epoch=-1 で再初期化し、
     # param_group['lr'] を基準学習率に戻します。その後このフラグは False に戻されます。
@@ -44,7 +44,7 @@ ALPHA_ZERO_CONFIG = {
     # MCTS / 探索
     # ---------------------------
     # MCTS シミュレーション回数 (96で速度重視、tau=0.3の強力シャープ化でカバー) 
-    "num_simulations": 384,       # 1手あたりのシミュレーション回数 (速度とバランス)　初期値96
+    "num_simulations": 96,       # 1手あたりのシミュレーション回数 (速度とバランス)　初期値96
     "puct_c": 1.1,                  # PUCT 探索定数 (1.4→1.2で探索を抑制、訪問集中を促進) 初期値1.0
     "dirichlet_alpha": 0.3,          # Dirichlet ノイズ α (ルート) 初期値0.3
     "dirichlet_epsilon": 0.05,       # ノイズ混合率 ε (0.15→0.10でノイズを削減、評価に基づく集中) 
@@ -156,10 +156,10 @@ ALPHA_ZERO_CONFIG = {
     # True で有効化。しきい値は 0.6 (60%)、対局数は100（= 同一配牌のペア×10）。
     "eval_gate_enable": True,
     "eval_gate_games": 40,
-    "eval_gate_threshold": 0.60,
+    "eval_gate_threshold": 0.55,
     # 非同期ゲート: 学習/自己対局を止めずにバックグラウンドで評価し、合格時のみ昇格
     "eval_gate_async": True,
-    "eval_gate_workers": 4,
+    "eval_gate_workers": 2,
     # ゲート評価の乱数シード（Noneでランダム）。同一配牌実現のため random / numpy を固定。
     "eval_gate_seed": 20251031,
     # 評価中は探索ノイズ/序盤ランダムをOFFにして純粋実力を比較
@@ -178,7 +178,7 @@ ALPHA_ZERO_CONFIG = {
     "checkpoint_path": "checkpoints/policy_value_latest.pt",  # 直近モデル
     # 周期保存: 大量エピソード実行時にエピソード間隔で世代チェックポイントを残す
     # 例) 100000 エピソードで 2000 間隔 -> 50 個保存
-    "checkpoint_interval_episodes": 200,       # 0 / None なら無効
+    "checkpoint_interval_episodes": 10000,       # 0 / None なら無効
     "updates_per_iter": 50,                 # ステップだけ学習
     "keep_previous_model_opponent": True,       # 直前世代モデルを一部プレイヤーに割当てて多様性確保
     "previous_model_mix_players": 2,            # 学習プレイヤー以外から2人を過去モデル化
@@ -225,6 +225,50 @@ ALPHA_ZERO_CONFIG = {
     "use_shared_replay": True,       # 全エージェントで単一の共有リプレイバッファを使用
     "replay_recent_sample_ratio": 0.0,  # >0 なら直近一定割合を優先サンプリング (未実装placeholder)
 
+    # =====================================================
+    # プロセス分離 / 非同期アーキテクチャ向け追加キー (初期版)
+    # =====================================================
+    # Self-Play 専用プロセスがサンプルをファイルシャードとして吐き出し
+    # Learner (学習) 専用プロセスがそれを取り込む最小構成。
+    # Windows でも動作するようシンプルなファイルベース (rename による原子化) を採用。
+    # true で有効化しても既存の train_concurrent は維持される (併存可能)。
+    "enable_process_decoupling": True,
+    # サンプルシャード保存ディレクトリ (self-play プロセス側が生成)。
+    "sample_shard_dir": "sample_shards",
+    # 取り込み済みシャードの退避先 (None なら削除)。
+    "sample_shard_ingested_dir": "sample_shards/_ingested",
+    # 1 シャードに詰める最大サンプル数 (到達/エピソード終了でファイルへ flush)。
+    "sample_shard_max_samples": 2000,
+    # Learner がシャードをポーリングする間隔 (秒)。低すぎるとI/O増。
+    "learner_poll_interval_sec": 5.0,
+    # Learner が一度に取り込む最大シャード数 (負荷平準化)。0/None で無制限。
+    "learner_max_shards_per_poll": 10,
+    # モデル最新ファイルポーリング間隔 (Self-Play が最新モデルへ追随する周期)。
+    "selfplay_model_reload_interval_sec": 30.0,
+    # Self-Play プロセスの無限ループ安全停止フラグ (True で一定エピソード後終了)。
+    "selfplay_max_episodes": 0,  # 0 で無限
+    # シャードファイル拡張子 (衝突回避 & grep 用)。
+    "sample_shard_ext": ".shard.joblib",
+    # Learner が取り込み後に保持する ReplayBuffer サイズ上限 (既存 buffer_size と同義だが分離運用時に再確認のため)。
+    "learner_buffer_size": 250000,
+    # 取り込み時に古いサンプルをどれだけ優先削除するかの比率 (0.0～1.0)。 >0 で FIFO 削減を強制。
+    "learner_ingest_purge_ratio": 0.0,
+    # 評価 (ゲート) 用独立プロセスで使用する対局周期 (秒) 0 で毎ポーリング時評価判定。
+    "gate_poll_interval_sec": 60.0,
+    # 評価結果を learner へ通知する簡易ファイル (JSON)。
+    "gate_result_path": "gate_results/latest_gate.json",
+    # 候補モデル保存ディレクトリ (learner が世代 ckpt を置く)。
+    "candidate_model_dir": "checkpoints/candidates",
+    # ベストモデルファイル (self-play / evaluator が参照)。
+    "best_model_path": "checkpoints/policy_value_best.pt",
+    # 候補昇格しきい値 (ゲートプロセスが判定)。既存 eval_gate_threshold と同義だが分離簡易化。
+    # ゲート昇格しきい値: gate_daemon も含め全体で eval_gate_threshold を唯一のキーとして使用
+    # NOTE: gate_daemon / trainer 双方このキーを参照
+    # 例: 0.55 -> 55% 超で採用
+    "eval_gate_threshold": 0.55,
+    # プロセス間簡易シグナルファイル (learner が生成し self-play が再読込を即時誘発)。空ファイルで可。
+    "model_refresh_flag_path": "checkpoints/_refresh.flag",
+
     # ---------------------------
     # 自己対局 並列実行
     # ---------------------------
@@ -236,6 +280,12 @@ ALPHA_ZERO_CONFIG = {
     # 並行学習トリガ: 新規サンプルがこの数だけ取り込まれたら学習を1バースト起動
     # 小さすぎると学習バーストが細切れになり効率低下。大きすぎると応答が遅れる
     "concurrent_min_new_samples_before_train": 1000,  # メモリ削減: 学習頻度を下げて蓄積抑制
+    # Learner 分離プロセス用: 最低新規サンプル蓄積数（この数以上 ingest されたら学習バーストを開始）
+    "learner_min_new_samples_before_train": 8000,
+    # Learner がメモリ保持せずファイルスナップショットのみを使うモード (True で ingest 後メモリ即 purge)
+    "learner_file_only_replay": True,
+    # Learner が統合スナップショット replay_buffer.joblib を保存する間隔(秒)
+    "learner_replay_snapshot_interval_sec": 900,
     # 学習後の最新チェックポイント保存の最短間隔(秒)。0以下で毎回保存（高I/O）
     "concurrent_latest_save_every_sec": 300.0,
     # ワーカー配布用モデル(pt)保存の最短間隔(秒)。0以下で毎回保存
@@ -392,9 +442,9 @@ ALPHA_ZERO_CONFIG = {
     # 有効化スイッチ
     "worker_restart_enable": True,
     # 1ワーカーRSS(MB)がこの高水位閾値を連続観測回数分超えたら graceful 再起動要求
-    "worker_restart_rss_high_mb":1300,
+    "worker_restart_rss_high_mb":1700,
     # 再起動判定用ヒステリシス下限 (未使用: 今回は単純連続超過のみ、将来拡張用)
-    "worker_restart_rss_low_mb": 1000,
+    "worker_restart_rss_low_mb": 1200,
     # 閾値超過を何回連続観測したら発火するか
     "worker_restart_consecutive_required": 3,
     # 同一ワーカーの再起動間隔(秒) 下回る場合は保留 (スラッシング防止)

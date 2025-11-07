@@ -5,6 +5,9 @@ joblib==1.4.2
 # Deep learning (used by agents.models / drl_agent)
 torch==2.3.1
 
+# System / process metrics (RSS 監視と再起動判定で使用)
+psutil==5.9.8
+
 # Logging / visualization (optional but referenced in utils.logger)
 # If you don't need TensorBoard, you can remove this
 tensorboard==2.16.2

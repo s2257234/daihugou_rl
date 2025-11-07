@@ -2961,7 +2961,15 @@ class Trainer:
                 self._last_progress_len = len(line)
             else:
                 if (i + 1) % self.config.get("log_interval", 50) == 0:
-                    print(f"[TRAIN] epoch={i+1}/{num_updates} loss={loss_info}")
+                    # 標準出力に加えて events.log にも同一行を追記
+                    _msg = f"[TRAIN] epoch={i+1}/{num_updates} loss={loss_info}"
+                    try:
+                        if self.logger is not None:
+                            # 既に print も行うため also_print は False
+                            self.logger.log_text(_msg, also_print=False)
+                    except Exception:
+                        pass
+                    print(_msg)
             # ロガーへ (train_step 内で既に push されている場合は二重記録を避ける)
             if self.logger and loss_info.get("loss") is not None and not getattr(self.agents[0], '_logged_inside', False):
                 # 新列: 非並行モードではローカルカウンタで代用（logger 側で update_step をフォールバックに使用）

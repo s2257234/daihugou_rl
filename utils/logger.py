@@ -260,8 +260,13 @@ class TrainingLogger:
                 vpl, vvl,
             ]
             if self._buffer_enabled:
+                # 200ステップ毎の行を即時ディスクへ反映し可視化を早めるため、その場で flush を試みる
                 self._train_buf.append(row)
-                self._maybe_flush_train()
+                # 既存条件に加え: csv_train_every 到達時は即 flush
+                try:
+                    self._flush_train(force=False)
+                except Exception:
+                    self._maybe_flush_train()
             else:
                 try:
                     with open(self.train_csv, "a", newline="", encoding="utf-8") as f:
