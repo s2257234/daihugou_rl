@@ -182,25 +182,48 @@ def _puct_select(node: PUCTNode, c_puct: float, virtual_counts=None) -> PUCTNode
     """子ノードの中から PUCT スコア最大のものを返す"""
     if virtual_counts is None:
         virtual_counts = {}
-    # Fast path: use vectorized selection if extension available
-    if _puct_select_index_fast is not None and node.children:
-        children = list(node.children.values())
-        # Build aligned arrays
+    ch_vals = node.children
+    if not ch_vals:
+        return None
+    # Fast path: Cython implementation if available
+    if _puct_select_index_fast is not None:
+        children = list(ch_vals.values())
         priors = [ch.prior for ch in children]
-        values = [ (0.0 if ch.visit_count == 0 else ch.value_sum / ch.visit_count) for ch in children ]
+        values = [(0.0 if ch.visit_count == 0 else ch.value_sum / ch.visit_count) for ch in children]
         visits = [ch.visit_count for ch in children]
         vcounts = [virtual_counts.get(id(ch), 0) for ch in children]
-        # Pass -1 to compute total_visits inside Cython to avoid Python-side sum overhead
         idx = _puct_select_index_fast(priors, values, visits, vcounts, float(c_puct), -1)
         if 0 <= idx < len(children):
             return children[idx]
-    # Fallback: original Python loop
+    # NumPy vectorized path (when Cython is unavailable)
+    try:
+        import numpy as _np
+        children = list(ch_vals.values())
+        n = len(children)
+        if n == 0:
+            return None
+        vcounts = _np.fromiter((virtual_counts.get(id(ch), 0) for ch in children), dtype=_np.int64, count=n)
+        visits = _np.fromiter((ch.visit_count for ch in children), dtype=_np.int64, count=n)
+        priors = _np.fromiter((ch.prior for ch in children), dtype=_np.float64, count=n)
+        # value = value_sum / max(1, visit_count)
+        vsum = _np.fromiter((ch.value_sum for ch in children), dtype=_np.float64, count=n)
+        denom = _np.maximum(1, visits)
+        values = vsum / denom
+        total_visits = int(_np.maximum(1, (visits + vcounts).sum()))
+        sqrt_total = math.sqrt(total_visits)
+        u = (float(c_puct) * priors * sqrt_total) / (1.0 + visits + vcounts)
+        score = values + u
+        idx = int(score.argmax())
+        return children[idx]
+    except Exception:
+        pass
+    # Fallback: pure-Python loop
     def vc(ch):
         return virtual_counts.get(id(ch), 0)
-    total_visits = max(1, sum(child.visit_count + vc(child) for child in node.children.values()))
+    total_visits = max(1, sum(child.visit_count + vc(child) for child in ch_vals.values()))
     best, best_score = None, -1e18
     sqrt_total = math.sqrt(total_visits)
-    for child in node.children.values():
+    for child in ch_vals.values():
         visit_eff = child.visit_count + vc(child)
         u = c_puct * child.prior * sqrt_total / (1 + visit_eff)
         score = child.value + u
@@ -315,8 +338,87 @@ def run_puct_mcts(root_env_copy,
             child = root.children[a]
             child.prior = child.prior * (1 - dirichlet_epsilon) + n * dirichlet_epsilon
 
+    # --- クローンプール + スナップショット方式 ---
+    # 1) ルートゲームのスナップショットとカード参照辞書
+    try:
+        g_root = root_env_copy.game
+        card_lookup = {}
+        for pl in getattr(g_root, 'players', []):
+            for c in getattr(pl, 'hand', []) or []:
+                card_lookup[str(c)] = c
+        for c in getattr(g_root, 'current_field', []) or []:
+            card_lookup[str(c)] = c
+        # ルート状態のスナップショット
+        snapshot_root = None
+        try:
+            snapshot_root = g_root.get_state_data()  # 実装が無ければ except
+        except Exception:
+            snapshot_root = None
+    except Exception:
+        card_lookup = {}
+        snapshot_root = None
+
+    # 2) プール初期化（batch_eval_size 個）
+    _clone_pool = []
+    _pool_size = max(1, int(batch_eval_size or 1))
+    try:
+        for _ in range(_pool_size):
+            base_env = copy.copy(root_env_copy)
+            g = getattr(root_env_copy, 'game', None)
+            if g is None:
+                _clone_pool.append(base_env)
+                continue
+            g_new = copy.copy(g)
+            # Player オブジェクトは新規に作成し、手札は空で初期化（restore 時に埋め戻す）
+            try:
+                from game.player import Player as _P
+                np_ = getattr(g, 'num_players', len(getattr(g, 'players', [])))
+                players_new = []
+                for i in range(np_):
+                    psrc = g.players[i]
+                    pn = _P(player_id=getattr(psrc, 'player_id', i), name=getattr(psrc, 'name', None))
+                    pn.hand = []
+                    players_new.append(pn)
+                g_new.players = players_new
+            except Exception:
+                # フォールバック: 既存プレイヤーを浅いコピー
+                players_new = []
+                for p in getattr(g, 'players', []):
+                    p_new = copy.copy(p)
+                    p_new.hand = []
+                    players_new.append(p_new)
+                g_new.players = players_new
+            g_new.current_field = []
+            g_new.passed = list(getattr(g, 'passed', []))
+            g_new.rankings = list(getattr(g, 'rankings', []))
+            # RuleChecker は新規
+            try:
+                from game.rules import RuleChecker
+                rc = RuleChecker()
+                rc.revolution = bool(getattr(getattr(g, 'rule_checker', None), 'revolution', False))
+                g_new.rule_checker = rc
+            except Exception:
+                pass
+            base_env.game = g_new
+            _clone_pool.append(base_env)
+    except Exception:
+        _clone_pool = []
+
     def _fast_clone(env):
-        # ルートと同じ軽量コピー方針: game の可変構造を手動複製
+        # プールから 1 つ取り出し、スナップショット復元
+        if _clone_pool:
+            env_new = _clone_pool.pop()
+            try:
+                if snapshot_root is not None and hasattr(env_new.game, 'set_state_data'):
+                    env_new.game.set_state_data(snapshot_root, card_lookup)
+                else:
+                    # フォールバック: 旧軽量コピー
+                    raise RuntimeError('no-snapshot')
+                return env_new
+            except Exception:
+                pass
+            # フォールバック: 旧軽量コピー
+        # ルートと同じ軽量コピー方針
         g = env.game
         g_new = copy.copy(g)
         new_players = []
@@ -328,14 +430,10 @@ def run_puct_mcts(root_env_copy,
         g_new.current_field = list(g.current_field)
         g_new.passed = list(g.passed)
         g_new.rankings = list(getattr(g, 'rankings', []))
-        # 行動履歴コピー (存在すれば)
-        # 行動履歴は MCTS シミュレーションでは参照しないため複製しない（大幅なメモリ削減）
-        # 重要: RuleChecker/Deck の deepcopy は非常に重いので回避し、最小限の状態のみを複製する
         from game.rules import RuleChecker
         rc_src = getattr(g, 'rule_checker', None)
         rc = RuleChecker()
         if rc_src is not None:
-            # 革命フラグなど必要な最低限の状態のみコピー（イベントや履歴はコピーしない）
             try:
                 rc.revolution = bool(getattr(rc_src, 'revolution', False))
             except Exception:
@@ -350,7 +448,6 @@ def run_puct_mcts(root_env_copy,
                 except Exception:
                     pass
         g_new.rule_checker = rc
-        # Deck は配り直し時にしか使用しないため、共有参照で十分（リセットは行わない経路）
         try:
             g_new.deck = getattr(g, 'deck', None)
         except Exception:
@@ -359,41 +456,58 @@ def run_puct_mcts(root_env_copy,
         env_new.game = g_new
         return env_new
 
-    # --------------------------------------
-    # 事前: キャッシュ用キー関数
-    # --------------------------------------
-    if state_key_fn is None:
-        def state_key_fn_default(e):
-            try:
-                g = e.game
-                # 軽量キー（手番 / 場 / 各手札の整数カードID / パス状況 / ランキング / 革命）
-                turn = getattr(g, 'turn', 0)
-                def _cid(c):
-                    try:
-                        # Joker を 52 とする。通常カードは suit*13 + (rank-1)
-                        if getattr(c, 'is_joker', False):
-                            return 52
-                        suit = getattr(c, 'suit', 'S')
-                        suit_map = {'S':0, 'H':1, 'D':2, 'C':3, '\u2660':0, '\u2665':1, '\u2666':2, '\u2663':3}
-                        sid = suit_map.get(suit, 0)
-                        r = int(getattr(c, 'rank', 1)) - 1
-                        if r < 0: r = 0
-                        if r > 12: r = 12
-                        return sid * 13 + r
-                    except Exception:
-                        return 52
-                field = tuple(_cid(c) for c in getattr(g, 'current_field', []))
-                hands = tuple(tuple(sorted(_cid(c) for c in p.hand)) for p in getattr(g, 'players', []))
-                passed = tuple(bool(x) for x in getattr(g, 'passed', []))
-                rankings = tuple(getattr(g, 'rankings', []))
-                revo = bool(getattr(getattr(g, 'rule_checker', None), 'revolution', False))
-                return (turn, field, hands, passed, rankings, revo)
-            except Exception:
-                return None
-        state_key_fn = state_key_fn_default
-
     # トランスポジションテーブル（None の場合はキャッシュ無効）
     TT = transposition_table if transposition_table is not None else None
+    # キー使用の有無（不要なら計算コストをゼロに）
+    use_keys = (TT is not None) or bool(enable_legal_cache)
+
+    # --------------------------------------
+    # 事前: キャッシュ用キー関数（ビットマスク化）
+    # --------------------------------------
+    if state_key_fn is None:
+        if use_keys:
+            def state_key_fn_default(e):
+                try:
+                    g = e.game
+                    # Zobrist ハッシュがあれば優先
+                    if hasattr(g, 'get_zobrist_key'):
+                        return g.get_zobrist_key(True)
+                except Exception:
+                    pass
+                # フォールバック: 旧ビットマスク方式
+                try:
+                    g = e.game
+                    turn = getattr(g, 'turn', 0)
+                    def _cid(c):
+                        try:
+                            if getattr(c, 'is_joker', False):
+                                return 52
+                            suit = getattr(c, 'suit', 'S')
+                            suit_map = {'S':0, 'H':1, 'D':2, 'C':3, '\u2660':0, '\u2665':1, '\u2666':2, '\u2663':3}
+                            sid = suit_map.get(suit, 0)
+                            r = int(getattr(c, 'rank', 1)) - 1
+                            if r < 0: r = 0
+                            if r > 12: r = 12
+                            return sid * 13 + r
+                        except Exception:
+                            return 52
+                    def _mask(iter_cards):
+                        m = 0
+                        for c in iter_cards:
+                            m |= (1 << _cid(c))
+                        return m
+                    field_mask = _mask(getattr(g, 'current_field', []))
+                    hands_mask = tuple(_mask(getattr(p, 'hand', [])) for p in getattr(g, 'players', []))
+                    passed = tuple(bool(x) for x in getattr(g, 'passed', []))
+                    rankings = tuple(getattr(g, 'rankings', []))
+                    revo = bool(getattr(getattr(g, 'rule_checker', None), 'revolution', False))
+                    return (turn, field_mask, hands_mask, passed, rankings, revo)
+                except Exception:
+                    return None
+            state_key_fn = state_key_fn_default
+        else:
+            def state_key_fn(_e):
+                return None
 
     # --------------------------------------
     # 反復: バッチ評価付き MCTS
@@ -429,6 +543,45 @@ def run_puct_mcts(root_env_copy,
             # どうしても適用できない場合は no-op とする
             return None
 
+    # 例外分岐を一度だけ解決してキャッシュする高速版
+    _step_mode = {"mode": None}
+    def _step_env_fast(e, act):
+        m = _step_mode["mode"]
+        if m is None:
+            # 1回だけ解決
+            try:
+                e.step(return_info=False, external_action=act, simulate=True)
+                _step_mode["mode"] = "ext"
+                return
+            except Exception:
+                pass
+            try:
+                e.step(force_action=act)
+                _step_mode["mode"] = "force"
+                return
+            except Exception:
+                pass
+            _step_mode["mode"] = "positional"
+            try:
+                e.step(act)
+                return
+            except Exception:
+                # 解決失敗時は no-op
+                return
+        else:
+            try:
+                if m == "ext":
+                    e.step(return_info=False, external_action=act, simulate=True)
+                elif m == "force":
+                    e.step(force_action=act)
+                else:
+                    e.step(act)
+                return
+            except Exception:
+                # 失敗したらモードをリセットして再解決
+                _step_mode["mode"] = None
+                return _step_env_fast(e, act)
+
     # ラン中の合法手キャッシュ（TTに無い近傍を節約）
     # オプションで LRU (OrderedDict) を使い上限を設ける
     from collections import OrderedDict
@@ -456,6 +609,12 @@ def run_puct_mcts(root_env_copy,
             if determinize_fn is not None:
                 try:
                     determinize_fn(env_copy, root_env_copy, root_player_id)
+                    # Zobrist: 外部から手札を書き換えた可能性があるため再計算要求
+                    try:
+                        if hasattr(env_copy, 'game'):
+                            setattr(env_copy.game, '_zkey_dirty', True)
+                    except Exception:
+                        pass
                 except Exception:
                     pass  # フォールバックでそのまま
             node = root
@@ -464,7 +623,7 @@ def run_puct_mcts(root_env_copy,
                 node = _puct_select(node, c_puct, virtual_counts)
                 # 同一バッチ中に同じ経路が過剰に選ばれないよう仮想訪問を加算
                 virtual_counts[id(node)] = virtual_counts.get(id(node), 0) + 1
-                _step_env_safe(env_copy, node.action)
+                _step_env_fast(env_copy, node.action)
                 # 仮想損失を適用して同一ノードがバッチに偏らないようにする
                 if enable_virtual_loss:
                     try:
@@ -599,7 +758,24 @@ def run_puct_mcts(root_env_copy,
             node.expand(getattr(leaf_envs[i].game, 'turn', 0), {a: policy_leaf[a] for a in leg if a in policy_leaf})
             node.backup(leaf_value)
 
+        # 適用した仮想損失をリバート（正しい統計に戻す）
+        if enable_virtual_loss and virtual_applied:
+            for nd, vc, vv in virtual_applied:
+                try:
+                    nd.visit_count -= vc
+                    nd.value_sum -= vv
+                except Exception:
+                    pass
+
         sims_done += len(leaf_nodes)
+
+        # 使用したクローンをプールへ戻す（次バッチで再利用）
+        try:
+            if _clone_pool is not None:
+                for e in leaf_envs:
+                    _clone_pool.append(e)
+        except Exception:
+            pass
 
         # ---------------- Early Stop 判定 ----------------
         if early_stop_enable and sims_done >= max(1, early_stop_min_sims):

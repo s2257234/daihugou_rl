@@ -48,6 +48,10 @@ class SelfplayDaemonWorker:
         self.check_interval_episodes = int(self.config.get("concurrent_model_check_every", 5) or 5)
         self.ep_since_check = 0
         self.max_steps = int(self.config.get("max_episode_steps", 1000))
+        # ロガー（Trainer からローカル呼び出し時に注入される場合あり）
+        self.logger = None
+        # ローカル通番 (metrics interval 判定用)
+        self._local_episode_counter = 0
 
     # ---------- setup utilities ----------
     def _setup_threads_env(self):
@@ -231,7 +235,10 @@ class SelfplayDaemonWorker:
             pass
         self.last_mtime = cur_mtime
 
-    def play_one_episode(self) -> int:
+    def play_one_episode(self, *, flush: bool = True) -> int:
+        # 通番更新
+        self._local_episode_counter += 1
+        ep_index = self._local_episode_counter - 1
         if hasattr(self.env, 'reset'):
             self.env.reset()
         for ag in self.agents:
@@ -267,17 +274,88 @@ class SelfplayDaemonWorker:
         for az in self.agents:
             az.flush_unfinished_phase()
             az.finalize_game()
-        # 送信
-        self._flush_local_buffers_to_queue()
+        # メトリクス算出・ロギング
         try:
-            self.event_queue.put(("ep_done", 1), block=True)
+            rankings = list(getattr(self.env.game, 'rankings', []))
+            avg_rank = None
+            first_rate = 0.0
+            if rankings:
+                try:
+                    if self.learning_pid in rankings:
+                        avg_rank = rankings.index(self.learning_pid) + 1
+                    first_rate = 1.0 if rankings and rankings[0] == self.learning_pid else 0.0
+                except Exception:
+                    pass
+            learner_agent = self.agents[self.learning_pid]
+            cum_phase_rate = None
+            if isinstance(learner_agent, AlphaZeroAgent) and getattr(learner_agent, 'total_value_samples', 0) > 0:
+                try:
+                    cum_phase_rate = learner_agent.total_positive / max(1, learner_agent.total_value_samples)
+                except Exception:
+                    cum_phase_rate = None
+            # フェーズ勝率 (episode 内集計) と精度
+            phase_wins = getattr(learner_agent, 'episode_phase_correct', None)
+            phase_attempts = getattr(learner_agent, 'episode_phase_total', None)
+            phase_win_rate = None
+            if isinstance(phase_wins, int) and isinstance(phase_attempts, int) and phase_attempts > 0:
+                phase_win_rate = phase_wins / phase_attempts
+            phase_acc = phase_win_rate  # 互換: 正答率を win_rate と同一扱い
+            ep_metrics: Dict[str, Any] = {
+                'avg_rank': avg_rank,
+                'first_rate': first_rate,
+                'episode_len': step_count,
+                'phase_acc': phase_acc,
+                'phase_win_rate': phase_win_rate,
+                'phase_wins': phase_wins,
+                'phase_attempts': phase_attempts,
+                'cum_phase_win_rate': cum_phase_rate,
+                'avg_moves_per_game': step_count,
+            }
+            # 追加計測: forward / game time
+            if bool(self.config.get('measure_forward_time', False)):
+                try:
+                    if hasattr(learner_agent, '_perf_infer_calls') and learner_agent._perf_infer_calls > 0:
+                        avg_fwd_ms = learner_agent._perf_infer_ms_accum / max(1, learner_agent._perf_infer_calls)
+                        ep_metrics['t_forward_avg_ms'] = float(avg_fwd_ms)
+                        if getattr(learner_agent, '_forward_time_ms_ema', None) is not None:
+                            ep_metrics['t_forward_ema_ms'] = float(learner_agent._forward_time_ms_ema)
+                except Exception:
+                    pass
+            if bool(self.config.get('measure_game_time', False)):
+                try:
+                    ep_metrics['t_game_sec'] = float(time.time() - t_game_start)
+                except Exception:
+                    pass
+            # measure_log_every_episodes 間隔で簡易ログ (forward+game 両方有効時)
+            if self.logger and bool(self.config.get('measure_forward_time', False)) and bool(self.config.get('measure_game_time', False)):
+                try:
+                    interval = int(self.config.get('measure_log_every_episodes', 20) or 20)
+                except Exception:
+                    interval = 20
+                if interval > 0 and ((ep_index + 1) % interval == 0):
+                    try:
+                        self.logger.log_text(f"[perf-ep] ep={ep_index+1} t_forward_ms={ep_metrics.get('t_forward_avg_ms')} t_game_sec={ep_metrics.get('t_game_sec')} moves={step_count}")
+                    except Exception:
+                        pass
+            if self.logger:
+                try:
+                    self.logger.log_episode(ep_metrics)
+                except Exception:
+                    pass
         except Exception:
             pass
+        # 送信（通常は flush するが、呼び出し側で制御できるようにフラグ化）
+        if flush:
+            self._flush_local_buffers_to_queue()
+            try:
+                self.event_queue.put(("ep_done", 1), block=True)
+            except Exception:
+                pass
         # パフォーマンスイベント（簡略）
         try:
             payload = {
                 'wid': int(self.worker_id),
-                'ep': 0,  # 呼び出し側で通番管理する場合は上書き
+                'ep': int(ep_index),
                 'moves': int(step_count),
                 't_game_sec': float(time.time() - t_game_start),
             }

@@ -12,6 +12,7 @@ import random
 import time
 import queue as _queue
 import multiprocessing as mp
+import copy as _cp
 from typing import Any, Dict, List
 
 from agents.config import ALPHA_ZERO_CONFIG
@@ -20,10 +21,9 @@ from agents.models import PolicyValueNet
 from agents.factory import create_env_and_agents
 from utils.logger import TrainingLogger
 from agents.replay_buffer import ReplayBuffer
-from trainer.workers import selfplay_daemon_worker_entry as _daemon_worker_entry
+from trainer.workers import selfplay_daemon_worker_entry as _daemon_worker_entry, SelfplayDaemonWorker
+from trainer import orchestrator as _orc
 
-
-# 非同期評価ゲートのワーカー関数は evaluation/gating.py へ移行
 
 def _selfplay_worker_entry(worker_id: int, num_episodes: int, cfg: Dict[str, Any], model_path: str):
     """短期チャンク自己対局ワーカー (_self_play_parallel 用)。
@@ -489,7 +489,6 @@ class Trainer:
     # 自己対局 (データ収集)
     # -----------------------------------------------------
     def self_play(self, num_episodes: int = 1):
-        from trainer import orchestrator as _orc
         return _orc.self_play(self, num_episodes=num_episodes)
 
     # -----------------------------------------------------
@@ -504,7 +503,6 @@ class Trainer:
         queue_maxsize: int = 15000,
         progress_print_every: int = 50,
     ):
-        from trainer import orchestrator as _orc
         return _orc.train_concurrent(
             self,
             total_episodes=total_episodes,
@@ -516,7 +514,6 @@ class Trainer:
 
     # ---------------- 並列自己対局 ----------------
     def _self_play_parallel(self, num_episodes: int, workers: int):
-        from trainer import orchestrator as _orc
         return _orc._self_play_parallel(self, num_episodes=num_episodes, workers=workers)
 
     # -----------------------------------------------------
@@ -562,7 +559,6 @@ class Trainer:
                 snap.load_state_dict(self.model.state_dict(), strict=True)  # type: ignore[arg-type]
             except Exception as e_build:
                 # 最終フォールバック: 既存モデルを deepcopy して CPU へ移動（互換重視 / shape mismatch 無視）
-                import copy as _cp
                 print(f"[snapshot][WARN] 標準スナップショット再構築失敗 -> deepcopy fallback ({type(e_build).__name__}: {e_build})")
                 snap = _cp.deepcopy(self.model)
                 try:
@@ -620,133 +616,31 @@ class Trainer:
                 print()
 
     def _play_one_episode(self, episode_index: int):
-        # 環境を初期化 (DaifugoSimpleEnv が reset を持つ想定)
-        if hasattr(self.env, "reset"):
-            t_game_start = time.time() if bool(self.config.get('measure_game_time', False)) else None
-            self.env.reset()
-        # エピソード内フェーズ勝利カウント (学習プレイヤー視点)
-        phase_wins = 0
-        phase_attempts = 0
-        # 各学習エージェントの move カウンタをリセット
-        for ag in self.agents:
-            if isinstance(ag, AlphaZeroAgent) and hasattr(ag, 'reset_episode'):
-                ag.reset_episode()
-        # ゲーム進行ループ (env.game.done を監視)
-        step_count = 0
-        prev_rankings: List[int] = list(getattr(self.env.game, "rankings", []))
-        max_steps = self.config.get("max_episode_steps", 1000)
-        while not getattr(self.env.game, "done", False):
-            if step_count >= max_steps:
-                print(f"[WARN] episode_index={episode_index} step_limit_reached={max_steps} -> force_terminate")
-                break
-            current_player_id = self.env.game.turn
-            agent = self.agents[current_player_id]
-            # 学習エージェントと簡易エージェントで呼び出し方法を分岐
-            if isinstance(agent, AlphaZeroAgent):
-                action = agent.select_action(self.env, training=True)
-            else:
-                # 観測と合法手を取得しシンプルエージェントへ渡す
-                current_player = self.env.game.players[self.env.game.turn]
-                hand = current_player.hand
-                field = self.env.game.current_field[:]
-                legal_actions = self.env._generate_legal_actions(hand, field)
-                obs_simple = {'hand': hand, 'field': field}
-                action = agent.select_action(obs_simple, legal_actions=legal_actions)
-            # 行動適用
-            # パス表現は None に統一 (環境側 step で None を直接パス処理できるようになった)
-            ext_act = action  # action が None ならそのままパス
-            try:
-                self.env.step(external_action=ext_act)
-            except TypeError:
-                self.env.step(ext_act)
-            step_count += 1
-            # フェーズ(誰かが新たに上がった)検知
-            current_rankings: List[int] = list(getattr(self.env.game, "rankings", []))
-            if len(current_rankings) > len(prev_rankings):
-                # 新規に上がったプレイヤー(複数同時も許容)
-                new_winners = current_rankings[len(prev_rankings):]
-                for winner_id in new_winners:
-                    for ag in self.agents:
-                        if isinstance(ag, AlphaZeroAgent):
-                            was_active = ag.player_id not in prev_rankings  # 以前まだ上がっていなかったか
-                            # 学習プレイヤー視点のフェーズ統計更新
-                            if ag.player_id == self.learning_player_id and was_active:
-                                phase_attempts += 1
-                                if winner_id == self.learning_player_id:
-                                    phase_wins += 1
-                            ag.finalize_phase(winner_player_id=winner_id, was_active=was_active)
-                prev_rankings = current_rankings
-        # 念のため未確定フェーズを 0 でクリア
-        for ag in self.agents:
-            if isinstance(ag, AlphaZeroAgent):
-                ag.flush_unfinished_phase()
-    # ステップ上限で打ち切られた場合も flush 済なのでそのまま終了
-        # 最終順位ベース報酬は付与しない方針 (finalize_game は no-op)
-        for ag in self.agents:
-            if isinstance(ag, AlphaZeroAgent):
-                ag.finalize_game()
-        # Episode メトリクス集計
-        rankings = list(getattr(self.env.game, 'rankings', []))
-        episode_len = step_count
-        avg_rank = None
-        first_rate = 0.0
-        if rankings:
-            # 学習プレイヤー順位 (1-based)
-            if self.learning_player_id in rankings:
-                avg_rank = rankings.index(self.learning_player_id) + 1
-            first_rate = 1.0 if rankings and rankings[0] == self.learning_player_id else 0.0
-        # 学習プレイヤーの累積フェーズ勝率 (Agent内のカウンタ) 取得
-        learner_agent = self.agents[self.learning_player_id]
-        cum_phase_rate = None
-        if isinstance(learner_agent, AlphaZeroAgent) and learner_agent.total_value_samples > 0:
-            cum_phase_rate = learner_agent.total_positive / learner_agent.total_value_samples
-
-        phase_win_rate = (phase_wins / phase_attempts) if phase_attempts > 0 else None
-        # フェーズ予測精度 (学習プレイヤーでのみ定義)
-        phase_acc = None
-        if isinstance(learner_agent, AlphaZeroAgent) and learner_agent.episode_phase_total > 0:
-            phase_acc = learner_agent.episode_phase_correct / learner_agent.episode_phase_total
-        ep_metrics = {
-            "avg_rank": avg_rank,
-            "first_rate": first_rate,
-            "episode_len": episode_len,
-            "phase_acc": phase_acc,
-            "phase_win_rate": phase_win_rate,
-            "phase_wins": phase_wins,
-            "phase_attempts": phase_attempts,
-            "cum_phase_win_rate": cum_phase_rate,
-        }
-        # --- 追加計測 (forward時間 / ゲーム時間 / 平均手数) ---
-        try:
-            if bool(self.config.get('measure_forward_time', False)):
-                learner = self.agents[self.learning_player_id]
-                if hasattr(learner, '_perf_infer_calls') and learner._perf_infer_calls > 0:
-                    avg_fwd_ms = learner._perf_infer_ms_accum / max(1, learner._perf_infer_calls)
-                    ep_metrics['t_forward_avg_ms'] = float(avg_fwd_ms)
-                    if getattr(learner, '_forward_time_ms_ema', None) is not None:
-                        ep_metrics['t_forward_ema_ms'] = float(learner._forward_time_ms_ema)
-            if bool(self.config.get('measure_game_time', False)) and t_game_start is not None:
-                ep_metrics['t_game_sec'] = float(time.time() - t_game_start)
-            # episode_len は手数なので avg_moves_per_game としても利用可能
-            ep_metrics['avg_moves_per_game'] = episode_len
-        except Exception:
-            pass
-        # ログ頻度制御: measure_log_every_episodes ごとに events.log へ出す（logger がある場合）
-        try:
-            # [perf-ep] は forward と game の両方の計測が有効なときのみ出力
-            if bool(self.config.get('measure_forward_time', False)) and bool(self.config.get('measure_game_time', False)):
-                interval = int(self.config.get('measure_log_every_episodes', 20) or 20)
-                if interval > 0 and ((episode_index + 1) % interval == 0):
-                    if self.logger:
-                        self.logger.log_text(f"[perf-ep] ep={episode_index+1} t_forward_ms={ep_metrics.get('t_forward_avg_ms')} t_game_sec={ep_metrics.get('t_game_sec')} moves={episode_len}")
-        except Exception:
-            pass
-        if self.logger:
-            self.logger.log_episode(ep_metrics)
-
-    # 旧最終順位一括報酬方式は廃止 (フェーズごとの finalize_phase を利用)
-    def _finalize_episode_rewards(self):  # 互換: 何もしない
-        return
+        # Worker へ委譲（ロギング含む処理は worker 内で完結）
+        sample_q = _queue.Queue()
+        event_q = _queue.Queue()
+        stop_ev = mp.Event()
+        model_path = self.config.get("checkpoint_path", os.path.join(self.config.get("checkpoint_dir", "checkpoints"), "policy_value_latest.pt"))
+        worker = SelfplayDaemonWorker(
+            worker_id=0,
+            config=self.config,
+            model_path=model_path,
+            sample_queue=sample_q,
+            event_queue=event_q,
+            stop_event=stop_ev,
+            control_queue=None,
+            request_q=None,
+            response_q=None,
+        )
+        # 既存インスタンス共有
+        worker.env = self.env
+        worker.agents = self.agents
+        worker.model = self.model
+        worker.device = getattr(self, "device", "cpu") if hasattr(self, "device") else "cpu"
+        worker.max_steps = int(self.config.get("max_episode_steps", 1000) or 1000)
+        worker.logger = self.logger  # ロガー注入
+        # flush=False でサンプルは残し、ロギングのみ反映
+        _ = worker.play_one_episode(flush=False)
 
     # -----------------------------------------------------
     # モデル学習 (ダミー)
@@ -807,37 +701,15 @@ class Trainer:
                         ratio = own / total
                         if ratio < 0.15:  # しきい値は暫定
                             print(f"[WARN] low data share for learner: {own}/{total} ({ratio:.2%})")
-            # 進捗出力 (動的バー)
-            if self.minimal_progress and self.use_progress_bar:
-                done = i + 1
-                # シンプル表示: バー無し / ETA無し / 一行上書き
-                if isinstance(loss_info, dict) and loss_info.get("loss") is not None:
-                    loss_part = f"loss={loss_info['loss']:.4f}"
-                else:
-                    loss_part = "loss=----"
-                lr_val = None
+            # 進捗出力: 動的バーは廃止し、間欠ログのみ
+            if (i + 1) % self.config.get("log_interval", 50) == 0:
+                _msg = f"[TRAIN] epoch={i+1}/{num_updates} loss={loss_info}"
                 try:
-                    opt = getattr(self.agents[0], '_optimizer', None)
-                    if opt and hasattr(opt, 'param_groups') and opt.param_groups:
-                        lr_val = opt.param_groups[0].get('lr', None)
+                    if self.logger is not None:
+                        self.logger.log_text(_msg, also_print=False)
                 except Exception:
-                    lr_val = None
-                lr_part = f"lr={lr_val:.2e}" if lr_val is not None else "lr=----"
-                line = f"[TRAIN] {done}/{num_updates} {loss_part} {lr_part}"
-                pad = max(0, self._last_progress_len - len(line))
-                print(line + ' ' * pad, end='\r' if done < num_updates else '\n', flush=True)
-                self._last_progress_len = len(line)
-            else:
-                if (i + 1) % self.config.get("log_interval", 50) == 0:
-                    # 標準出力に加えて events.log にも同一行を追記
-                    _msg = f"[TRAIN] epoch={i+1}/{num_updates} loss={loss_info}"
-                    try:
-                        if self.logger is not None:
-                            # 既に print も行うため also_print は False
-                            self.logger.log_text(_msg, also_print=False)
-                    except Exception:
-                        pass
-                    print(_msg)
+                    pass
+                print(_msg)
             # ロガーへ (train_step 内で既に push されている場合は二重記録を避ける)
             if self.logger and loss_info.get("loss") is not None and not getattr(self.agents[0], '_logged_inside', False):
                 # 新列: 非並行モードではローカルカウンタで代用（logger 側で update_step をフォールバックに使用）
@@ -963,16 +835,7 @@ class Trainer:
         except Exception:
             pass
 
-    # -----------------------------------------------------
-    # 進捗バー生成ヘルパー
-    # -----------------------------------------------------
-    def _make_progress_bar(self, done: int, total: int, pct: float | None = None):
-        width = max(10, int(self.progress_bar_width))
-        ratio = 0.0 if total <= 0 else min(1.0, max(0.0, done / total))
-        fill = int(ratio * width)
-        bar = "#" * fill + "-" * (width - fill)
-        pct_val = ratio * 100.0
-        return f"[{bar}] {pct_val:6.2f}%", f"{pct_val:6.2f}"
+    
 
     # -----------------------------------------------------
     # チェックポイント

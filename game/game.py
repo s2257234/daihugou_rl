@@ -27,6 +27,12 @@ class Game:
         self.auto_dump_revolution_events = True
         # 見出しを一度だけ出すための内部フラグ
         self._rev_events_header_printed = False
+        # Zobrist Hash 準備
+        self._zkey = 0
+        self._zkey_dirty = True
+        self._zobrist = None  # lazy init
+        self._zobrist_init_tables()
+        self._zobrist_reset_full()
 
     def _all_others_passed(self):
         """
@@ -73,6 +79,8 @@ class Game:
 
         if diamond3_player is not None:
             self.turn = diamond3_player
+        # ハッシュ再計算
+        self._zobrist_reset_full()
         # 場は空のまま、ダイヤ3を持つ人から自由に1枚出しでスタート
         return self.get_state(self.turn)  # 最初の状態を返す
 
@@ -106,6 +114,150 @@ class Game:
         if getattr(self, 'silent', False):
             return
         print(msg)
+
+    # --- スナップショット API ---
+    def get_state_data(self):
+        """現在のゲーム状態を最小限のプリミティブでスナップショットとして返す。
+
+        返却フォーマット:
+          {
+            'num_players': int,
+            'turn': int,
+            'turn_count': int,
+            'passed': List[bool],
+            'last_player': Optional[int],
+            'rankings': List[int],
+            'done': bool,
+            'field': List[str],
+            'hands': List[List[str]],
+            'revo': bool,
+          }
+        """
+        try:
+            hands = []
+            for p in self.players:
+                hands.append([str(c) for c in getattr(p, 'hand', [])])
+            field = [str(c) for c in getattr(self, 'current_field', [])]
+            data = {
+                'num_players': int(self.num_players),
+                'turn': int(self.turn),
+                'turn_count': int(self.turn_count),
+                'passed': list(self.passed),
+                'last_player': None if self.last_player is None else int(self.last_player),
+                'rankings': list(getattr(self, 'rankings', [])),
+                'done': bool(getattr(self, 'done', False)),
+                'field': field,
+                'hands': hands,
+                'revo': bool(getattr(getattr(self, 'rule_checker', None), 'revolution', False)),
+            }
+            return data
+        except Exception:
+            # 最低限のフォールバック
+            return {
+                'num_players': int(getattr(self, 'num_players', len(getattr(self, 'players', [])))) or 0,
+                'turn': int(getattr(self, 'turn', 0)),
+                'turn_count': int(getattr(self, 'turn_count', 0)),
+                'passed': list(getattr(self, 'passed', [])) or [False]*len(getattr(self, 'players', [])),
+                'last_player': getattr(self, 'last_player', None),
+                'rankings': list(getattr(self, 'rankings', [])) or [],
+                'done': bool(getattr(self, 'done', False)),
+                'field': [],
+                'hands': [[] for _ in range(len(getattr(self, 'players', [])))],
+                'revo': bool(getattr(getattr(self, 'rule_checker', None), 'revolution', False)),
+            }
+
+    def set_state_data(self, data, card_lookup=None):
+        """スナップショットからゲーム状態を復元する。
+
+        Args:
+          data: get_state_data で得た辞書
+          card_lookup: Optional[Dict[str, Card]] 文字列表現→Card参照の辞書。
+            無い場合は現在の self から可能な限り再構築（不足は from_string で補完）。
+        """
+        # プレイヤー数の整合
+        try:
+            np_ = int(data.get('num_players', self.num_players))
+        except Exception:
+            np_ = self.num_players
+        if np_ != getattr(self, 'num_players', np_):
+            # プレイヤーを作り直し
+            from .player import Player
+            self.num_players = np_
+            self.players = [Player(player_id=i) for i in range(np_)]
+        # カード辞書のフォールバック構築
+        if card_lookup is None:
+            card_lookup = {}
+            try:
+                for p in getattr(self, 'players', []):
+                    for c in getattr(p, 'hand', []) or []:
+                        card_lookup[str(c)] = c
+                for c in getattr(self, 'current_field', []) or []:
+                    card_lookup[str(c)] = c
+            except Exception:
+                card_lookup = {}
+        # ハンド復元
+        hands = data.get('hands', [[] for _ in range(self.num_players)])
+        for i in range(self.num_players):
+            ids = hands[i] if i < len(hands) else []
+            lst = []
+            for s in ids:
+                c = card_lookup.get(s)
+                if c is None:
+                    try:
+                        from .card import Card
+                        c = Card.from_string(s) if hasattr(Card, 'from_string') else Card(s)
+                    except Exception:
+                        c = None
+                if c is not None:
+                    lst.append(c)
+            self.players[i].hand = lst
+        # フィールド復元
+        field_ids = data.get('field', [])
+        field_lst = []
+        for s in field_ids:
+            c = card_lookup.get(s)
+            if c is None:
+                try:
+                    from .card import Card
+                    c = Card.from_string(s) if hasattr(Card, 'from_string') else Card(s)
+                except Exception:
+                    c = None
+            if c is not None:
+                field_lst.append(c)
+        self.current_field = field_lst
+        # そのほかの状態
+        try:
+            self.turn = int(data.get('turn', self.turn))
+        except Exception:
+            pass
+        try:
+            self.turn_count = int(data.get('turn_count', self.turn_count))
+        except Exception:
+            pass
+        try:
+            self.passed = list(data.get('passed', self.passed))
+        except Exception:
+            pass
+        self.last_player = data.get('last_player', self.last_player)
+        try:
+            self.rankings = list(data.get('rankings', self.rankings))
+        except Exception:
+            pass
+        try:
+            self.done = bool(data.get('done', getattr(self, 'done', False)))
+        except Exception:
+            pass
+        # 革命フラグ
+        try:
+            if hasattr(self, 'rule_checker') and self.rule_checker is not None:
+                self.rule_checker.revolution = bool(data.get('revo', bool(self.rule_checker.revolution)))
+        except Exception:
+            pass
+        # Zobrist: 外部復元後は再計算要求（次回取得時にO(N)一度だけ）
+        try:
+            self._zkey_dirty = True
+        except Exception:
+            pass
 
     def step(self, player_id, action_cards):
         """
@@ -181,6 +333,9 @@ class Game:
                 pass
             new_rev = self.rule_checker.revolution
             rev_changed = (prev_rev != new_rev)
+            if rev_changed:
+                # Zobrist: 革命フラグ切替
+                self._zkey ^= self._zobrist['REVO']
             # トグル仕様: 変化したら [+REV] / [-REV]
             rev_flag = ' (REV)' if new_rev else ''
             trig = ''
@@ -224,7 +379,10 @@ class Game:
             rev_flag = ' (REV)' if self.rule_checker.revolution else ''
             #self.log(f"Player {self.turn} passed.{rev_flag}")
             action_cards = None
-            self.passed[self.turn] = True
+            if not self.passed[self.turn]:
+                # Zobrist: pass フラグを立てる
+                self._zkey ^= self._zobrist['PASSED'][self.turn]
+                self.passed[self.turn] = True
             # 最後に出したプレイヤー以外が全員パス → 場リセット
             if self._all_others_passed():
                 self._reset_field()
@@ -255,6 +413,7 @@ class Game:
 
     def _advance_turn(self):
         """次のプレイヤーにターンを進める（手札がない場合はスキップ）"""
+        old_turn = self.turn
         next_turn = (self.turn + 1) % self.num_players
         skip_count = 0
         while len(self.players[next_turn].hand) == 0:
@@ -264,6 +423,10 @@ class Game:
                 break
         if next_turn != self.turn:
             self.turn_count += 1
+        # Zobrist: turn 切替
+        if next_turn != old_turn:
+            self._zkey ^= self._zobrist['TURN'][old_turn]
+            self._zkey ^= self._zobrist['TURN'][next_turn]
         self.turn = next_turn
 
     def _handle_special_rules(self, card_objs):
@@ -294,9 +457,18 @@ class Game:
         """
         if len(player.hand) == 0 and player_id not in self.rankings:
             self.rankings.append(player_id)
+            # Zobrist: ランキングに入ったプレイヤーをマーク
+            try:
+                self._zkey ^= self._zobrist['RANKED'][int(player_id)]
+            except Exception:
+                pass
         if len(self.rankings) == self.num_players - 1:
             last_player = [i for i in range(self.num_players) if i not in self.rankings][0]
             self.rankings.append(last_player)
+            try:
+                self._zkey ^= self._zobrist['RANKED'][int(last_player)]
+            except Exception:
+                pass
             self.done = True
             if self.auto_dump_revolution_events:
                 self.dump_revolution_events()
@@ -397,20 +569,152 @@ class Game:
                 return
             indices.append(found_idx)
 
+        # Zobrist: まず現在の場カードを外す
+        if getattr(self, 'current_field', None):
+            for c in self.current_field:
+                try:
+                    cid = self._card_id(c)
+                    self._zkey ^= self._zobrist['FIELD'][cid]
+                except Exception:
+                    pass
         # 場更新（表示用に浅いコピー）
         self.current_field = card_objs[:]
+        # Zobrist: 手札→場への移動を反映（手札から外し、場に追加）
+        try:
+            pid = player.player_id
+        except Exception:
+            pid = None
+        for c in card_objs:
+            try:
+                cid = self._card_id(c)
+                if pid is not None:
+                    self._zkey ^= self._zobrist['HAND'][pid][cid]
+                self._zkey ^= self._zobrist['FIELD'][cid]
+            except Exception:
+                pass
         # 実削除（後ろから）
         for idx in sorted(indices, reverse=True):
             del player.hand[idx]
         # パス情報リセット
+        # Zobrist: pass を全解除
+        for i, f in enumerate(self.passed):
+            if f:
+                try:
+                    self._zkey ^= self._zobrist['PASSED'][i]
+                except Exception:
+                    pass
         self.passed = [False] * self.num_players
 
     def _reset_field(self):
         """場をリセットし、パス情報もリセット"""
+        # Zobrist: 場カードを全て外す
+        for c in self.current_field:
+            try:
+                cid = self._card_id(c)
+                self._zkey ^= self._zobrist['FIELD'][cid]
+            except Exception:
+                pass
         self.current_field = []
+        # Zobrist: pass を全解除
+        for i, f in enumerate(self.passed):
+            if f:
+                try:
+                    self._zkey ^= self._zobrist['PASSED'][i]
+                except Exception:
+                    pass
         self.passed = [False] * self.num_players
         self.turn_count += 1
         # 場リセット時は必ず最後に出したプレイヤーから再開
         if self.last_player is not None:
+            if self.turn != self.last_player:
+                # Zobrist: turn 切替
+                try:
+                    self._zkey ^= self._zobrist['TURN'][self.turn]
+                    self._zkey ^= self._zobrist['TURN'][self.last_player]
+                except Exception:
+                    pass
             self.turn = self.last_player
         #self.log("--- 場がリセットされました ---")
+
+    # --- Zobrist Hash 実装 ----------------------------------
+    def _zobrist_init_tables(self):
+        if self._zobrist is not None:
+            return
+        import random as _r
+        _r.seed(0xC0FFEE)  # 安定性のため固定シード（必要に応じ変更）
+        num_players = max(1, int(getattr(self, 'num_players', 4)))
+        NUM_CARDS = 53  # 52枚 + Joker(=52)
+        HAND = [[_r.getrandbits(64) for _ in range(NUM_CARDS)] for __ in range(num_players)]
+        FIELD = [_r.getrandbits(64) for _ in range(NUM_CARDS)]
+        PASSED = [_r.getrandbits(64) for _ in range(num_players)]
+        TURN = [_r.getrandbits(64) for _ in range(num_players)]
+        RANKED = [_r.getrandbits(64) for _ in range(num_players)]
+        REVO = _r.getrandbits(64)
+        self._zobrist = {
+            'HAND': HAND,
+            'FIELD': FIELD,
+            'PASSED': PASSED,
+            'TURN': TURN,
+            'RANKED': RANKED,
+            'REVO': REVO,
+        }
+
+    def _card_id(self, c):
+        try:
+            if getattr(c, 'is_joker', False):
+                return 52
+            suit = getattr(c, 'suit', '\u2660')
+            suit_map = {'\u2660':0, '\u2665':1, '\u2666':2, '\u2663':3, '♠':0, '♥':1, '♦':2, '♣':3, 'S':0,'H':1,'D':2,'C':3}
+            sid = suit_map.get(suit, 0)
+            r = int(getattr(c, 'rank', 1)) - 1
+            if r < 0: r = 0
+            if r > 12: r = 12
+            return sid * 13 + r
+        except Exception:
+            return 52
+
+    def _zobrist_reset_full(self):
+        # テーブルは lazy init 済み前提
+        self._zkey = 0
+        # hands
+        for pidx, p in enumerate(getattr(self, 'players', [])):
+            for c in getattr(p, 'hand', []) or []:
+                try:
+                    cid = self._card_id(c)
+                    self._zkey ^= self._zobrist['HAND'][pidx][cid]
+                except Exception:
+                    pass
+        # field
+        for c in getattr(self, 'current_field', []) or []:
+            try:
+                cid = self._card_id(c)
+                self._zkey ^= self._zobrist['FIELD'][cid]
+            except Exception:
+                pass
+        # passed
+        for i, f in enumerate(getattr(self, 'passed', []) or []):
+            if f:
+                self._zkey ^= self._zobrist['PASSED'][i]
+        # rankings (フラグ化)
+        ranks = set(getattr(self, 'rankings', []) or [])
+        for i in range(len(getattr(self, 'players', []))):
+            if i in ranks:
+                self._zkey ^= self._zobrist['RANKED'][i]
+        # revo
+        try:
+            if bool(getattr(getattr(self, 'rule_checker', None), 'revolution', False)):
+                self._zkey ^= self._zobrist['REVO']
+        except Exception:
+            pass
+        # turn
+        try:
+            self._zkey ^= self._zobrist['TURN'][int(getattr(self, 'turn', 0))]
+        except Exception:
+            pass
+        self._zkey_dirty = False
+
+    def get_zobrist_key(self, recompute_if_dirty=True) -> int:
+        if recompute_if_dirty and getattr(self, '_zkey_dirty', False):
+            self._zobrist_init_tables()
+            self._zobrist_reset_full()
+        return int(self._zkey)
