@@ -1,5 +1,6 @@
 import os, json, csv, time, atexit
 import threading
+import queue as _queue
 from typing import Dict, Any, Optional
 
 class TrainingLogger:
@@ -95,6 +96,8 @@ class TrainingLogger:
         self._val_losses_by_step = {}
         # 直近の検証ロス（毎トレイン行に同梱するためのフォールバック）
         self._last_val_pair = (None, None)
+        # 検証手札予測損失（hand_pred_loss）最新値
+        self._last_val_hand = None
 
         # headers (既存挙動維持: ただし即時ファイル生成はバッファ有効時も保持)
         if not self.disable_csv and not self.csv_summary_only:
@@ -102,11 +105,20 @@ class TrainingLogger:
                 with open(self.train_csv, "w", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
                     writer.writerow([
-                        "update_step","policy_loss","value_loss","entropy","train_count",
+                        "update_step","policy_loss","value_loss","hand_pred_loss","entropy","train_count",
                         "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","samples",
-                        # 追加: 検証ロス（要望により loss のみ）
-                        "val_policy_loss","val_value_loss"
+                        # 検証ロス: policy/value/hand
+                        "val_policy_loss","val_value_loss","val_hand_pred_loss"
                     ])
+            # 既存行の有無を記録（初回1行は必ず出すための判定に利用）
+            try:
+                self._train_rows_written = 0
+                if os.path.exists(self.train_csv):
+                    with open(self.train_csv, 'r', encoding='utf-8') as rf:
+                        # ヘッダを除くデータ行数を概算
+                        self._train_rows_written = max(0, sum(1 for _ in rf) - 1)
+            except Exception:
+                self._train_rows_written = 0
             if not os.path.exists(self.episode_csv):
                 with open(self.episode_csv, "w", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
@@ -127,6 +139,23 @@ class TrainingLogger:
         self._disk_full_reason = None
         # メモリスナップショット制御
         self._last_mem_log_time = 0.0
+
+        # --- 非同期テキスト追記（[perf-ep]向け） ---
+        # 設定: async_text_enabled=True なら有効化し、[perf-ep]行は即時に専用スレッドで events.log に追記する
+        # バッファフラッシュの間隔待ちを避け、可視性を高める目的
+        self._async_text_enabled = bool(self.cfg.get('async_text_enabled', True))
+        self._async_text_perf_only = bool(self.cfg.get('async_text_perf_only', True))  # True の場合、[perf-ep] のみ対象
+        self._async_text_q = None
+        self._async_text_thread = None
+        self._async_text_stop = False
+        if self._async_text_enabled:
+            try:
+                self._async_text_q = _queue.Queue(maxsize=int(self.cfg.get('async_text_queue_size', 2048) or 2048))
+                self._async_text_thread = threading.Thread(target=self._async_text_writer_loop, name="TrainingLoggerAsyncText", daemon=True)
+                self._async_text_thread.start()
+            except Exception:
+                self._async_text_q = None
+                self._async_text_thread = None
 
         # atexit で強制 flush (プロセス終了前に残バッファを吐き出す)
         try:
@@ -156,6 +185,86 @@ class TrainingLogger:
                 self._bg_thread.start()
             except Exception:
                 self._bg_thread = None
+
+    # ---------------- Runtime config update (new) ----------------
+    def update_config(self, new_cfg: dict | None = None):
+        """ランタイムでログ関連設定を更新するためのヘルパー。
+
+        既存の logger インスタンス生成後に config 辞書を変更しても反映されない問題を解消します。
+        必要に応じて trainer 側で設定値を変更した直後に呼び出してください。
+
+        更新対象:
+          - disable_csv_logging / csv_summary_only
+          - csv_train_log_every / csv_episode_log_every
+          - tensorboard_train_log_every / tensorboard_episode_log_every
+          - log_buffer_enabled および flush 間隔関連
+        """
+        if not isinstance(new_cfg, dict):
+            return
+        # マージ
+        try:
+            self.cfg.update(new_cfg)
+        except Exception:
+            pass
+        # 基本フラグ
+        self.disable_csv = bool(self.cfg.get("disable_csv_logging", self.disable_csv))
+        self.csv_summary_only = bool(self.cfg.get("csv_summary_only", self.csv_summary_only)) and not self.disable_csv
+        # 頻度 (1 以上)
+        try:
+            self.csv_train_every = max(1, int(self.cfg.get("csv_train_log_every", self.csv_train_every) or 1))
+        except Exception:
+            pass
+        try:
+            self.csv_episode_every = max(1, int(self.cfg.get("csv_episode_log_every", self.csv_episode_every) or 1))
+        except Exception:
+            pass
+        try:
+            self.tb_train_every = max(1, int(self.cfg.get("tensorboard_train_log_every", self.tb_train_every) or 1))
+        except Exception:
+            pass
+        try:
+            self.tb_ep_every = max(1, int(self.cfg.get("tensorboard_episode_log_every", self.tb_ep_every) or 1))
+        except Exception:
+            pass
+        # バッファリング関連
+        try:
+            self._buffer_enabled = bool(self.cfg.get("log_buffer_enabled", self._buffer_enabled))
+        except Exception:
+            pass
+        try:
+            self._buf_flush_interval = float(self.cfg.get("log_buffer_flush_interval_sec", self._buf_flush_interval) or self._buf_flush_interval)
+        except Exception:
+            pass
+        try:
+            self._buf_max_records = int(self.cfg.get("log_buffer_max_records", self._buf_max_records) or self._buf_max_records)
+        except Exception:
+            pass
+        try:
+            self._text_buf_max_lines = int(self.cfg.get("log_text_buffer_max_lines", self._text_buf_max_lines) or self._text_buf_max_lines)
+        except Exception:
+            pass
+        try:
+            self._text_buf_flush_interval = float(self.cfg.get("log_text_flush_interval_sec", self._text_buf_flush_interval) or self._text_buf_flush_interval)
+        except Exception:
+            pass
+        # 非同期テキスト設定 (キュー再生成は避ける。必要なら再初期化ロジックを別途実装)
+        try:
+            self._async_text_perf_only = bool(self.cfg.get('async_text_perf_only', self._async_text_perf_only))
+        except Exception:
+            pass
+        # 必要に応じてヘッダ再生成 (頻度のみの変更では不要)
+        if not self.disable_csv and not self.csv_summary_only:
+            try:
+                if not os.path.exists(self.train_csv):
+                    with open(self.train_csv, 'w', newline='', encoding='utf-8') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([
+                            "update_step","policy_loss","value_loss","hand_pred_loss","entropy","train_count",
+                            "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","samples",
+                            "val_policy_loss","val_value_loss","val_hand_pred_loss"
+                        ])
+            except Exception:
+                pass
 
     # ---------------- Memory snapshot ----------------
     def log_memory_snapshot(self, sample_count: int | None = None, force: bool = False):
@@ -215,6 +324,9 @@ class TrainingLogger:
                 # 新規列: val_policy_loss / val_value_loss が無ければ再生成
                 if ('val_policy_loss' not in header_line) or ('val_value_loss' not in header_line):
                     needs_rebuild = True
+                # 新規列: hand_pred_loss / val_hand_pred_loss が無ければ再生成
+                if ('hand_pred_loss' not in header_line) or ('val_hand_pred_loss' not in header_line):
+                    needs_rebuild = True
                 if needs_rebuild:
                     # バックアップして新ヘッダで再生成
                     bak = self.train_csv + '.bak'
@@ -223,9 +335,9 @@ class TrainingLogger:
                         with open(self.train_csv, 'w', newline='', encoding='utf-8') as wf:
                             writer = csv.writer(wf)
                             writer.writerow([
-                                "update_step","policy_loss","value_loss","entropy","train_count",
+                                "update_step","policy_loss","value_loss","hand_pred_loss","entropy","train_count",
                                 "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","samples",
-                                "val_policy_loss","val_value_loss"
+                                "val_policy_loss","val_value_loss","val_hand_pred_loss"
                             ])
         except Exception:
             pass
@@ -240,14 +352,20 @@ class TrainingLogger:
         # CSV 書き込み間引き
         if self.csv_summary_only:
             self._last_train_metrics = dict(metrics)
-        if (not self.disable_csv) and (not self.csv_summary_only) and (self.update_step % self.csv_train_every) == 0:
+        # 初回1行は必ず出す: 既存データ行が0の場合は間引き条件を無視
+        should_write = (not self.disable_csv) and (not self.csv_summary_only) and (
+            (self.update_step % self.csv_train_every) == 0 or getattr(self, '_train_rows_written', 0) == 0
+        )
+        if should_write:
             # 毎トレイン行に直近の検証ロスを必ず同梱（検証が未実施なら None）
             vpl, vvl = self._last_val_pair
+            vhl = self._last_val_hand
 
             row = [
                 self.update_step,
                 metrics.get("policy_loss"),
                 metrics.get("value_loss"),
+                metrics.get("hand_pred_loss"),
                 metrics.get("entropy"),
                 metrics.get("train_count", self.update_step),
                 metrics.get("value_acc"),
@@ -257,23 +375,26 @@ class TrainingLogger:
                 metrics.get("pos_rate"),
                 metrics.get("cum_pos_rate"),
                 metrics.get("samples"),
-                vpl, vvl,
+                vpl, vvl, vhl,
             ]
-            if self._buffer_enabled:
-                # 200ステップ毎の行を即時ディスクへ反映し可視化を早めるため、その場で flush を試みる
-                self._train_buf.append(row)
-                # 既存条件に加え: csv_train_every 到達時は即 flush
+            # 直接追記 (頻度1や小間隔で確実に行が出るようにする) + バッファは補助的に使用
+            try:
+                with open(self.train_csv, "a", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(row)
+                self._train_rows_written = getattr(self, '_train_rows_written', 0) + 1
+            except OSError as e:
+                self._mark_disk_full(e, 'train_csv')
+                return
+            except Exception:
+                pass
+            # 直接追記を採用するため、ここでは _train_buf へは追加しない（重複flush防止）
+        else:
+            # デバッグ: 書き込みスキップ理由 (任意フラグ train_csv_debug が True のとき出力)
+            if bool(self.cfg.get('train_csv_debug', False)):
                 try:
-                    self._flush_train(force=False)
+                    self.log_text(f"[train-csv-skip] step={self.update_step} every={self.csv_train_every} rows={getattr(self,'_train_rows_written',None)} summary={self.csv_summary_only}")
                 except Exception:
-                    self._maybe_flush_train()
-            else:
-                try:
-                    with open(self.train_csv, "a", newline="", encoding="utf-8") as f:
-                        csv.writer(f).writerow(row)
-                except OSError as e:
-                    self._mark_disk_full(e, 'train_csv')
-                    return
+                    pass
         # TensorBoard 間引き
         if self.tb and not self._disk_full and (self.update_step % self.tb_train_every) == 0:
             try:
@@ -308,9 +429,11 @@ class TrainingLogger:
         try:
             vp = metrics.get("policy_loss")
             vv = metrics.get("value_loss")
+            vh = metrics.get("hand_pred_loss")
             self._val_losses_by_step[step] = (vp, vv)
             # 直近値を更新（毎トレイン行に同梱するため）
             self._last_val_pair = (vp, vv)
+            self._last_val_hand = vh
         except Exception:
             pass
         # ここではCSVへ即時追記せず、次の学習行に同梱する（重複行を防ぐ）
@@ -424,23 +547,58 @@ class TrainingLogger:
         if not self._disk_full:
             ts = time.strftime('%Y-%m-%d %H:%M:%S')
             line = f"[{ts}] {text}\n"
-            if self._buffer_enabled:
-                self._text_buf.append(line)
-                if also_print:
-                    print(line.strip())
-                self._maybe_flush_text()
-            else:
+            # [perf-ep] を優先的に非同期追記
+            if self._async_text_enabled and (not self._async_text_perf_only or (isinstance(text, str) and text.startswith('[perf-ep]'))):
+                put_ok = False
                 try:
-                    path = os.path.join(self.log_dir, filename)
-                    os.makedirs(self.log_dir, exist_ok=True)
-                    with open(path, 'a', encoding='utf-8') as f:
-                        f.write(line)
+                    if self._async_text_q is not None:
+                        self._async_text_q.put_nowait(line)
+                        put_ok = True
+                except Exception:
+                    put_ok = False
+                if put_ok:
                     if also_print:
                         print(line.strip())
-                except OSError as e:
-                    self._mark_disk_full(e, 'text')
-                except Exception:
+                    # 非同期キューへ載せたらここで終了（通常バッファには載せない）
                     pass
+                else:
+                    # キューに載せられない場合のみ従来経路（バッファ or 直書き）でフォールバック
+                    if self._buffer_enabled:
+                        self._text_buf.append(line)
+                        if also_print:
+                            print(line.strip())
+                        self._maybe_flush_text()
+                    else:
+                        try:
+                            path = os.path.join(self.log_dir, filename)
+                            os.makedirs(self.log_dir, exist_ok=True)
+                            with open(path, 'a', encoding='utf-8') as f:
+                                f.write(line)
+                            if also_print:
+                                print(line.strip())
+                        except OSError as e:
+                            self._mark_disk_full(e, 'text')
+                        except Exception:
+                            pass
+            else:
+                # 従来経路
+                if self._buffer_enabled:
+                    self._text_buf.append(line)
+                    if also_print:
+                        print(line.strip())
+                    self._maybe_flush_text()
+                else:
+                    try:
+                        path = os.path.join(self.log_dir, filename)
+                        os.makedirs(self.log_dir, exist_ok=True)
+                        with open(path, 'a', encoding='utf-8') as f:
+                            f.write(line)
+                        if also_print:
+                            print(line.strip())
+                    except OSError as e:
+                        self._mark_disk_full(e, 'text')
+                    except Exception:
+                        pass
 
         if self.tb and not self._disk_full:
             try:
@@ -471,20 +629,23 @@ class TrainingLogger:
                     with open(self.train_csv, 'w', newline='', encoding='utf-8') as f:
                         writer = csv.writer(f)
                         writer.writerow([
-                            "update_step","policy_loss","value_loss","entropy","train_count",
+                            "update_step","policy_loss","value_loss","hand_pred_loss","entropy","train_count",
                             "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","samples",
-                            "val_policy_loss","val_value_loss"
+                            "val_policy_loss","val_value_loss","val_hand_pred_loss"
                         ])
                 with open(self.train_csv, 'a', newline='', encoding='utf-8') as f:
                     m = self._last_train_metrics
                     writer = csv.writer(f)
                     # summary モードでも current → prev の順で検証ロスを拾う
-                    vpl, vvl = None, None
+                    vpl, vvl, vhl = None, None, None
                     try:
                         vp, vv = self._val_losses_by_step.get(self.update_step, (None, None))
-                        if vp is None and vv is None and self.update_step > 0:
-                            vp, vv = self._val_losses_by_step.get(self.update_step - 1, (None, None))
-                            if vp is not None or vv is not None:
+                        # hand は pair とは別に保持しているので最新属性から取得
+                        vh = self._last_val_hand if self.update_step == self.update_step else self._last_val_hand
+                        if (vp is None and vv is None) and self.update_step > 0:
+                            vp_prev, vv_prev = self._val_losses_by_step.get(self.update_step - 1, (None, None))
+                            if vp_prev is not None or vv_prev is not None:
+                                vp, vv = vp_prev, vv_prev
                                 try:
                                     self._val_losses_by_step.pop(self.update_step - 1, None)
                                 except Exception:
@@ -494,15 +655,15 @@ class TrainingLogger:
                                 self._val_losses_by_step.pop(self.update_step, None)
                             except Exception:
                                 pass
-                        vpl, vvl = vp, vv
+                        vpl, vvl, vhl = vp, vv, vh
                     except Exception:
                         pass
                     writer.writerow([
                         self.update_step,
-                        m.get("policy_loss"), m.get("value_loss"), m.get("entropy"), m.get("train_count", self.update_step),
+                        m.get("policy_loss"), m.get("value_loss"), m.get("hand_pred_loss"), m.get("entropy"), m.get("train_count", self.update_step),
                         m.get("value_acc"), m.get("value_brier"), m.get("policy_kl"), m.get("policy_top1_match"),
                         m.get("pos_rate"), m.get("cum_pos_rate"), m.get("samples"),
-                        vpl, vvl
+                        vpl, vvl, vhl
                     ])
             if self._last_episode_metrics:
                 if self._buffer_enabled and self._episode_buf:
@@ -650,6 +811,19 @@ class TrainingLogger:
 
     def _atexit_flush(self):  # pragma: no cover (プロセス終了パス)
         try:
+            # 非同期テキストスレッドを停止し、残キューを吐き出す
+            try:
+                self._async_text_stop = True
+                if self._async_text_q is not None:
+                    # センチネル投入
+                    try:
+                        self._async_text_q.put_nowait(None)  # type: ignore[arg-type]
+                    except Exception:
+                        pass
+                if self._async_text_thread is not None:
+                    self._async_text_thread.join(timeout=1.5)
+            except Exception:
+                pass
             self._bg_stop = True
             self.flush_buffers(force=True)
         except Exception:
@@ -659,6 +833,35 @@ class TrainingLogger:
         try:
             self.flush_buffers(force=True)
         except Exception:
+            pass
+
+    # ------------ 非同期テキスト書き込みループ ([perf-ep]用) ------------
+    def _async_text_writer_loop(self):  # pragma: no cover
+        path = os.path.join(self.log_dir, 'events.log')
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+        except Exception:
+            pass
+        q = self._async_text_q
+        if q is None:
+            return
+        try:
+            while not self._async_text_stop:
+                try:
+                    item = q.get(timeout=0.5)
+                except Exception:
+                    continue
+                if item is None:
+                    break
+                try:
+                    with open(path, 'a', encoding='utf-8') as f:
+                        f.write(item)
+                except OSError as e:
+                    self._mark_disk_full(e, 'text')
+                except Exception:
+                    pass
+        except Exception:
+            # 静かに終了
             pass
 
 __all__ = ["TrainingLogger"]

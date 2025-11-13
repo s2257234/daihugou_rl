@@ -8,21 +8,21 @@
 ====================================
 1. 入力特徴 (full_input のみ / 簡易入力廃止)
     - 形式: 1 次元ベクトル (float32) 長さ full_feature_dim
-    - 最新レイアウト v4 (v3 + FieldCards + PlayHistory) : 59N + 125
+    - 最新レイアウト v5 (Belief/PlayHistory を除去 + OpponentDiscards + PassMatrix 拡張): 72N + 59
         * Self 55
         * OppSummary 5(N-1)
         * Field 22
         * FieldCards 53
-        * PlayHistory 53
-        * Belief 53(N-1)
         * Turn N
-        合計: (55 + 22 + 53 + 53) + 58(N-1) + N = 59N + 125
+        * OpponentDiscards 53(N-1)
+        * PassMatrix 13(N-1)
+        合計: 55 + 22 + 53 + [5(N-1) + N + 53(N-1) + 13(N-1)] = 72N + 59
+    - 旧レイアウト (v4: Belief除去後 / PlayHistoryあり) : 59N + 125 + 53(N-1) + 13(N-1) - 53
     - 直前レイアウト v3 (部分観測 + belief, rank4) : 59N + 19
         * Self: 53 card bits + pass + remain = 55
         * OppSummary: (remain + rank4 one-hot) * (N-1) = 5(N-1)
         * Field: 1 revolution + 7 combo + 13 rank base + 1 field_size_norm = 22
-        * Belief: 53 * (N-1)
-        * Turn: N  → 合計 59N + 19
+    * Turn: N  → 合計 59N + 19
     - 旧レイアウト v2 (rank5) : 60N + 18 （互換読み込みのみ。新規生成しない）
     - さらに旧フル情報 v1 : 56N + 22 （全プレイヤー手札ビットを含む完全情報）
     - 生成は `agents.drl_agent._extract_state` が行い、full_input_dim を常に期待値に揃える。
@@ -81,11 +81,13 @@ import torch.nn as nn
 class PolicyValueNet(nn.Module):
     def __init__(self,
                  max_policy_size: int = 128,
-                 hidden_size: int = 128,
+                 hidden_size: int = 256,
                  num_players: int = 4,
                  device: Optional[str] = None,
                  use_full_features: bool = True,
-                 full_feature_dim: Optional[int] = None):
+                 full_feature_dim: Optional[int] = None,
+                 enable_hand_prediction_head: bool = True,
+                 context_out_dim: int = 256):
         """Policy-Value Net (フル特徴専用)
 
         簡易入力 (hand_size/field_size/turn_onehot) のフォールバックを廃止し、常に
@@ -102,16 +104,19 @@ class PolicyValueNet(nn.Module):
         self.device = torch.device(device) if device else torch.device("cpu")
         self.use_full_features = True
 
-        # ---- Feature partition (v4 layout) ----
+        # ---- Feature partition (v5 layout: no PlayHistory, Belief removed, with OpponentDiscards/PassMatrix) ----
         # Self: 55
         self.self_dim = 55
-        # Belief: 53 * (N-1)
-        self.belief_dim = 53 * (num_players - 1)
-        # Context: OppSummary 5*(N-1) + Field 22 + FieldCards 53 + PlayHistory 53 + Turn N
-        self.context_dim = 5 * (num_players - 1) + 22 + 53 + 53 + num_players
-        # Expected full feature dimension (v4): 59N + 125
-        self.full_feature_dim = self.self_dim + self.belief_dim + self.context_dim
-
+        # Context (v5 base): OppSummary 5*(N-1) + Field 22 + FieldCards 53 + Turn N
+        base_context_dim = 5 * (num_players - 1) + 22 + 53 + num_players
+        # New extensions:
+        #   OpponentDiscards: 53*(N-1)
+        #   PassMatrix: 13*(N-1)
+        self.opponent_discards_dim = 53 * (num_players - 1)
+        self.pass_matrix_dim = 13 * (num_players - 1)
+        self.context_dim = base_context_dim + self.opponent_discards_dim + self.pass_matrix_dim
+        # Expected full feature dimension (v5): 55 + [5*(N-1) + 22 + 53 + N + 53*(N-1) + 13*(N-1)] = 72N + 59
+        self.full_feature_dim = int(self.self_dim + self.context_dim)
         # 互換: 引数の full_feature_dim が与えられ、計算値と異なる場合は警告の上で採用
         if full_feature_dim is not None and int(full_feature_dim) != int(self.full_feature_dim):
             # 最終防衛線として、明示指定を優先して各セクションの配分は既定値のままにし、パディング/切り詰めで吸収する
@@ -119,36 +124,54 @@ class PolicyValueNet(nn.Module):
             self.full_feature_dim = int(full_feature_dim)
 
         # ---- Small encoders for each component ----
-        # 出力次元は例に倣って Self=32, Belief=64, Context=32
+        # 出力次元: Self=32, Context=可変 (デフォルト256)。旧 ckpt 互換のため可変化。
+        self.self_out_dim = 32
+        self.context_out_dim = int(context_out_dim)
         self.self_encoder = nn.Sequential(
-            nn.Linear(self.self_dim, 32),
-            nn.ReLU(),
-        )
-        self.belief_encoder = nn.Sequential(
-            nn.Linear(self.belief_dim, 64),
+            nn.Linear(self.self_dim, self.self_out_dim),
             nn.ReLU(),
         )
         self.context_encoder = nn.Sequential(
-            nn.Linear(self.context_dim, 32),
+            nn.Linear(self.context_dim, self.context_out_dim),
             nn.ReLU(),
         )
 
         # ---- Backbone & Heads ----
         h = hidden_size
-        backbone_input_dim = 32 + 64 + 32  # encoders' output dims
+        self.hidden_size = h  # メタ保存用
+        self.backbone_in_dim = self.self_out_dim + self.context_out_dim  # encoders' output dims (self + context)
         self.backbone = nn.Sequential(
-            nn.Linear(backbone_input_dim, h),
+            nn.Linear(self.backbone_in_dim, h),
             nn.ReLU(),
             nn.Linear(h, h),
             nn.ReLU(),
         )
-        self.policy_head = nn.Linear(h, max_policy_size)
+        # Policy head: 旧 Linear(h->max_policy_size) から MLP 化 (Linear->ReLU->Linear)
+        # 旧 ckpt 互換: load() 側で 'policy_head.weight' が存在する場合は最終層へ移植
+        self.policy_head = nn.Sequential(
+            nn.Linear(h, h),
+            nn.ReLU(),
+            nn.Linear(h, max_policy_size),
+        )
         # value_head: ロジット出力 (Sigmoid は呼び出し側で適用 / BCEWithLogitsLoss 用)
         self.value_head = nn.Sequential(
             nn.Linear(h, h),
             nn.ReLU(),
             nn.Linear(h, num_players),
         )
+        # 追加ヘッド: 相手手札予測（belief）
+        self.enable_hand_prediction_head = bool(enable_hand_prediction_head)
+        # belief 入力は削除したが、出力は (num_players-1)*53 を維持
+        self.hand_pred_dim = 53 * (num_players - 1)
+        if self.enable_hand_prediction_head:
+            self.hand_head = nn.Sequential(
+                nn.Linear(h, h),
+                nn.ReLU(),
+                # 拡張分（OpponentDiscards, PassMatrix）は context に含まれており、backbone 経由で hand_head 入力に反映される
+                nn.Linear(h, self.hand_pred_dim),  # (num_players-1)*53
+            )
+        else:
+            self.hand_head = None  # type: ignore[assignment]
         self.to(self.device)
 
     def _encode_state(self, state: Dict[str, Any]):
@@ -247,24 +270,15 @@ class PolicyValueNet(nn.Module):
         出力: policy_logits [B, max_policy_size], value_vec [B, num_players]
         """
         x = self._ensure_2d(x)
-        # safety: pad/truncate to expected dimension
         x = self._pad_or_truncate(x, self.full_feature_dim)
-
-        # Split into components
-        parts = torch.split(x, [self.self_dim, self.belief_dim, self.context_dim], dim=1)
-        if len(parts) != 3:
-            # 極端な不一致時はフォールバックで全体を backbone へ（安全側）
-            h = self.backbone(x.new_zeros(x.size(0), 32 + 64 + 32))
+        parts = torch.split(x, [self.self_dim, self.context_dim], dim=1)
+        if len(parts) != 2:
+            h = self.backbone(x.new_zeros(x.size(0), self.backbone_in_dim))
             return self.policy_head(h), self.value_head(h)
-        self_feat, belief_feat, context_feat = parts
-
-        # Encode each component
+        self_feat, context_feat = parts
         self_emb = self.self_encoder(self_feat)
-        belief_emb = self.belief_encoder(belief_feat)
         context_emb = self.context_encoder(context_feat)
-        combined = torch.cat([self_emb, belief_emb, context_emb], dim=1)
-
-        # Backbone + Heads
+        combined = torch.cat([self_emb, context_emb], dim=1)
         h = self.backbone(combined)
         policy_logits = self.policy_head(h)
         value_vec = self.value_head(h)
@@ -288,6 +302,50 @@ class PolicyValueNet(nn.Module):
         if val.dim() == 2 and val.size(0) == 1:
             val = val.squeeze(0)
         return pol, val
+
+    def forward_with_belief(self, state_or_x: Any):
+        """拡張 forward.
+
+        戻り値:
+            policy_logits: shape [..., max_policy_size]
+            value_vec:     shape [..., num_players] (ロジット; Sigmoid は呼び出し側)
+            hand_logits:   shape [..., hand_pred_dim] or None (ロジット; Sigmoid は呼び出し側)
+
+        以前の実装では hand_probs (Sigmoid 済み確率) を返していたが、
+        学習を BCEWithLogitsLoss で統一するためロジットを直接返す仕様に変更。
+        下位互換のため呼び出し側は hand_logits を受け取り必要に応じて torch.sigmoid。
+        """
+        if isinstance(state_or_x, dict):
+            x = self._encode_state(state_or_x)
+        else:
+            x = state_or_x
+        x = self._ensure_2d(x)
+        x = self._pad_or_truncate(x, self.full_feature_dim)
+        parts = torch.split(x, [self.self_dim, self.context_dim], dim=1)
+        if len(parts) != 2:
+            h = self.backbone(x.new_zeros(x.size(0), self.backbone_in_dim))
+            policy_logits = self.policy_head(h)
+            value_vec = self.value_head(h)
+            hand_logits = None
+        else:
+            self_feat, context_feat = parts
+            self_emb = self.self_encoder(self_feat)
+            context_emb = self.context_encoder(context_feat)
+            combined = torch.cat([self_emb, context_emb], dim=1)
+            h = self.backbone(combined)
+            policy_logits = self.policy_head(h)
+            value_vec = self.value_head(h)
+            if self.enable_hand_prediction_head and self.hand_head is not None:
+                hand_logits = self.hand_head(h)
+            else:
+                hand_logits = None
+        if policy_logits.dim() == 2 and policy_logits.size(0) == 1:
+            policy_logits = policy_logits.squeeze(0)
+        if value_vec.dim() == 2 and value_vec.size(0) == 1:
+            value_vec = value_vec.squeeze(0)
+        if hand_logits is not None and hand_logits.dim() == 2 and hand_logits.size(0) == 1:
+            hand_logits = hand_logits.squeeze(0)
+        return policy_logits, value_vec, hand_logits
 
     def forward_batch(self, states: List[Dict[str, Any]]):
         if not states:
@@ -359,12 +417,17 @@ class PolicyValueNet(nn.Module):
         ckpt = {
             "state_dict": self.state_dict(),
             "max_policy_size": self.max_policy_size,
-            "hidden_size": self.policy_head.in_features,
+            "hidden_size": int(getattr(self, "hidden_size", 256)),
             "num_players": self.num_players,
             "use_full_features": True,
             # 重要: full_feature_dim はバックボーン入力ではなく raw 特徴の全長
             "full_feature_dim": int(self.full_feature_dim),
             "model_format_version": 3,
+            "has_hand_head": bool(self.enable_hand_prediction_head),
+            # 互換のため、エンコーダ出力次元も保存
+            "context_out_dim": int(getattr(self, "context_out_dim", 256)),
+            # self_out_dim は固定32だが将来の変更に備える
+            "self_out_dim": int(getattr(self, "self_out_dim", 32)),
         }
         # 非同期 I/O 設定が利用可能ならオフロード
         try:
@@ -415,6 +478,19 @@ class PolicyValueNet(nn.Module):
                 if w is None:
                     raise ValueError("旧チェックポイントから full_feature_dim を推定できません。")
                 full_dim = w.shape[1]
+            # 互換: context/self 出力次元の検出
+            context_out_dim = ckpt.get("context_out_dim")
+            self_out_dim = ckpt.get("self_out_dim", 32)
+            if context_out_dim is None:
+                w_ctx = state_dict.get("context_encoder.0.weight")
+                if w_ctx is not None and hasattr(w_ctx, "shape") and len(w_ctx.shape) == 2:
+                    context_out_dim = int(w_ctx.shape[0])
+                else:
+                    w_bb = state_dict.get("backbone.0.weight")
+                    if w_bb is not None and hasattr(w_bb, "shape") and len(w_bb.shape) == 2:
+                        context_out_dim = max(int(w_bb.shape[1]) - int(self_out_dim), 1)
+                    else:
+                        context_out_dim = 32
         else:  # 完全旧形式 (state_dict 直保存)
             state_dict = ckpt
             max_policy_size = 128
@@ -424,10 +500,32 @@ class PolicyValueNet(nn.Module):
             if w is None:
                 raise ValueError("旧形式 ckpt に backbone.0.weight が存在しません。")
             full_dim = w.shape[1]
+            context_out_dim = 32
+            self_out_dim = 32
 
-        model = PolicyValueNet(max_policy_size=max_policy_size, hidden_size=hidden_size,
-                               num_players=num_players, use_full_features=True, full_feature_dim=int(full_dim))
-        model.load_state_dict(state_dict)
+        model = PolicyValueNet(max_policy_size=max_policy_size,
+                               hidden_size=hidden_size,
+                               num_players=num_players,
+                               use_full_features=True,
+                               full_feature_dim=int(full_dim),
+                               enable_hand_prediction_head=ckpt.get("has_hand_head", False),
+                               context_out_dim=int(context_out_dim))
+        # 旧 ckpt の単層 policy_head (policy_head.weight) を MLP 最終層へ移植
+        try:
+            if ("policy_head.weight" in state_dict and "policy_head.2.weight" in model.state_dict()):
+                w_old = state_dict.get("policy_head.weight")
+                b_old = state_dict.get("policy_head.bias")
+                w_new = model.state_dict().get("policy_head.2.weight")
+                if w_old is not None and w_new is not None and w_old.shape == w_new.shape:
+                    state_dict["policy_head.2.weight"] = w_old
+                    if b_old is not None and "policy_head.2.bias" in model.state_dict():
+                        state_dict["policy_head.2.bias"] = b_old
+        except Exception:
+            pass
+        try:
+            model.load_state_dict(state_dict, strict=False)  # 追加ヘッド後互換
+        except TypeError:
+            model.load_state_dict(state_dict)
         # map_location を指定していた場合はモデル本体をそのデバイスへ移動し device 属性を同期
         if map_location:
             try:

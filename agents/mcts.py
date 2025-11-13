@@ -219,7 +219,6 @@ def run_puct_mcts(root_env_copy,
                   dirichlet_alpha: float = 0.3,
                   dirichlet_epsilon: float = 0.25,
                   root_player_id: int = 0,
-                  *,
                   policy_value_batch_fn=None,
                   batch_eval_size: int = 1,
                   transposition_table: dict | None = None,
@@ -232,10 +231,39 @@ def run_puct_mcts(root_env_copy,
                   early_stop_log_sample_rate: float = 0.0,
                   early_stop_post_min_batch: int | None = None,
                   early_stop_debug: bool = False,
-                  early_stop_logger=None):
+                  early_stop_logger=None,
+                  profile: bool = False,
+                  profile_output: str | None = None,
+                  enable_legal_cache: bool = True,
+                  legal_cache_max_size: int | None = 4096,
+                  # virtual loss options (for single-process batched MCTS)
+                  enable_virtual_loss: bool = True,
+                  virtual_loss_count: int = 1,
+                  virtual_loss_value: float = -100.0):
     """AlphaZero 風 PUCT MCTS 実行 (正規化 & 欠損補完対応版)。"""
+    import time as _time
+
+    run_start = _time.perf_counter()
+
+    # Optional: full cProfile for the entire run
+    _prof = None
+    if profile:
+        try:
+            import cProfile as _cProfile
+            _prof = _cProfile.Profile()
+            _prof.enable()
+        except Exception:
+            _prof = None
+
+    # timing counters for legal action computation
+    legal_calls = 0
+    legal_total_s = 0.0
+
     # ルート合法手
+    t0_lr = _time.perf_counter()
     legal_root = get_legal_actions_fn(root_env_copy)
+    legal_total_s += (_time.perf_counter() - t0_lr)
+    legal_calls += 1
     if not legal_root:
         legal_root = ["pass"]
     policy_root, root_value = policy_value_fn(root_env_copy)
@@ -402,8 +430,16 @@ def run_puct_mcts(root_env_copy,
             return None
 
     # ラン中の合法手キャッシュ（TTに無い近傍を節約）
-    _legal_cache = {}
+    # オプションで LRU (OrderedDict) を使い上限を設ける
+    from collections import OrderedDict
+    if enable_legal_cache:
+        _legal_cache = OrderedDict()
+    else:
+        _legal_cache = None
+    legal_cache_hits = 0
     while sims_done < num_simulations:
+        # track virtual losses applied in this batch so we can revert after real backups
+        virtual_applied = []  # list of (node, cnt, val_delta)
         # 1バッチ分の葉を収集
         leaf_nodes = []
         leaf_envs = []
@@ -429,6 +465,16 @@ def run_puct_mcts(root_env_copy,
                 # 同一バッチ中に同じ経路が過剰に選ばれないよう仮想訪問を加算
                 virtual_counts[id(node)] = virtual_counts.get(id(node), 0) + 1
                 _step_env_safe(env_copy, node.action)
+                # 仮想損失を適用して同一ノードがバッチに偏らないようにする
+                if enable_virtual_loss:
+                    try:
+                        vc = int(virtual_loss_count)
+                        vv = float(virtual_loss_value) * vc
+                        node.visit_count += vc
+                        node.value_sum += vv
+                        virtual_applied.append((node, vc, vv))
+                    except Exception:
+                        pass
             leaf_nodes.append(node)
             leaf_envs.append(env_copy)
             k = state_key_fn(env_copy)
@@ -440,11 +486,30 @@ def run_puct_mcts(root_env_copy,
                 if isinstance(cached, tuple) and len(cached) == 3:
                     leg = cached[2]
             if leg is None:
-                if k in _legal_cache:
+                # キャッシュ利用はキーが有効な場合のみ
+                if _legal_cache is not None and k is not None and k in _legal_cache:
                     leg = _legal_cache[k]
+                    legal_cache_hits += 1
                 else:
-                    leg = get_legal_actions_fn(env_copy)
-                    _legal_cache[k] = leg
+                    # measure legal actions cost
+                    try:
+                        t0_leg = _time.perf_counter()
+                        leg = get_legal_actions_fn(env_copy) or []
+                        legal_total_s += (_time.perf_counter() - t0_leg)
+                        legal_calls += 1
+                    except Exception:
+                        # fall back
+                        leg = get_legal_actions_fn(env_copy) or []
+                    # キャッシュに保存 (キーが None の場合はキャッシュしない)
+                    if _legal_cache is not None and k is not None:
+                        try:
+                            _legal_cache[k] = leg
+                            # サイズ制限 (LRU eviction)
+                            if legal_cache_max_size is not None and len(_legal_cache) > legal_cache_max_size:
+                                _legal_cache.popitem(last=False)
+                        except Exception:
+                            # 安全のため例外は無視
+                            pass
             leaf_legal.append(leg)
         # まずキャッシュヒットを適用
         eval_indices = []
@@ -512,7 +577,6 @@ def run_puct_mcts(root_env_copy,
             if not leg:
                 node.backup(leaf_value)
                 continue
-
             if not policy_leaf:
                 policy_leaf = {a: 1.0 / len(leg) for a in leg}
             else:
@@ -568,6 +632,59 @@ def run_puct_mcts(root_env_copy,
                         break
             except Exception:
                 pass
+    # profile: dump / summary (SUPPRESSED: [PROFILE][mcts] line removed per request)
+    # ここでは内部統計を保持したい場合に備え、値だけを root に埋め込む (ログ出力なし)
+    try:
+        run_end = _time.perf_counter()
+        run_s = run_end - run_start
+        pct = (legal_total_s / run_s) if run_s > 0 else 0.0
+        cache_size = len(_legal_cache) if _legal_cache is not None else 0
+        try:
+            root._profile_stats = {
+                'legal_calls': legal_calls,
+                'legal_total_s': legal_total_s,
+                'run_s': run_s,
+                'legal_time_ratio': pct,
+                'legal_cache_hits': legal_cache_hits,
+                'legal_cache_size': cache_size,
+            }
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # profiler dump
+    if _prof is not None:
+        try:
+            _prof.disable()
+            if profile_output:
+                try:
+                    import pstats as _pstats
+                    _pstats.Stats(_prof).sort_stats('cumtime').dump_stats(profile_output)
+                except Exception:
+                    pass
+            else:
+                # write short top-10 cumtime to events.log
+                try:
+                    import io, pstats as _pstats
+                    s = io.StringIO()
+                    ps = _pstats.Stats(_prof, stream=s).sort_stats('cumtime')
+                    ps.print_stats(10)
+                    txt = s.getvalue()
+                    # append to events.log
+                    import os, datetime
+                    log_dir = 'logs'
+                    os.makedirs(log_dir, exist_ok=True)
+                    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    with open(os.path.join(log_dir, 'events.log'), 'a', encoding='utf-8') as f:
+                        f.write(f"[{ts}] [PROFILE][cprofile]\n")
+                        for line in txt.splitlines():
+                            f.write(f"[{ts}] {line}\n")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     # root へ実行実績メタデータを付与 (呼び出し側計測用)
     try:
         root._actual_simulations = sims_done  # type: ignore[attr-defined]

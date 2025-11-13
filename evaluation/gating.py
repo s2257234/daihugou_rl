@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import os
 import random
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
+import multiprocessing as mp
 
 
 def _override_eval_config(base_cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -155,3 +156,191 @@ def evaluate_candidate(
 
     win_rate = wins / float(total)
     return {"wins": wins, "games": total, "win_rate": win_rate, "details": details}
+
+
+# -------------------- Async Gate Helpers --------------------
+def gate_worker_eval_proc(
+    candidate_path: str,
+    baseline_path: str,
+    cfg: Dict[str, Any],
+    games: int,
+    seed: Optional[int],
+    device: str,
+    out_queue,
+):
+    """Spawned process entry for async evaluation gate.
+    Loads candidate & baseline models then calls evaluate_candidate.
+    Puts result or error dict on out_queue.
+    """
+    try:
+        from agents.models import PolicyValueNet as _PVN
+        cand_model = _PVN.load(candidate_path, map_location=device)
+        base_model = _PVN.load(baseline_path, map_location=device)
+        if device:
+            cand_model.to(device)  # type: ignore[arg-type]
+            base_model.to(device)  # type: ignore[arg-type]
+        res = evaluate_candidate(cand_model, base_model, cfg, games=games, seed=seed)
+        out_queue.put(res)
+    except Exception as e:
+        try:
+            out_queue.put({"error": str(e)})
+        except Exception:
+            pass
+
+
+def start_async_gate(
+    candidate_path: str,
+    baseline_path: str,
+    cfg: Dict[str, Any],
+    *,
+    games: int,
+    seed: Optional[int] = None,
+    device: str = "cpu",
+    ctx: Optional[mp.context.BaseContext] = None,
+):
+    """Start async evaluation gate in a separate process.
+    Returns (proc, queue).
+    """
+    if ctx is None:
+        try:
+            ctx = mp.get_context("spawn")
+        except Exception:
+            ctx = mp
+    q = ctx.Queue()
+    p = ctx.Process(
+        target=gate_worker_eval_proc,
+        args=(candidate_path, baseline_path, dict(cfg), int(games), seed, device, q),
+        daemon=True,
+    )
+    p.start()
+    return p, q
+
+
+def poll_async_gate(q, *, block: bool = False, timeout: float = 0.0):
+    """Poll result from async gate queue.
+    Returns result dict or None if not ready.
+    """
+    try:
+        if block:
+            return q.get(timeout=timeout)
+        else:
+            return q.get_nowait()
+    except Exception:
+        return None
+
+
+def decide_sync(
+    candidate_model,
+    baseline_model,
+    cfg: Dict[str, Any],
+    *,
+    games: Optional[int] = None,
+    seed: Optional[int] = None,
+):
+    """Run sync evaluation and produce decision using cfg threshold.
+    Returns: { 'result': <eval dict>, 'pass': bool, 'threshold': float }
+    """
+    g = int(cfg.get("eval_gate_games", 20) or 20) if games is None else int(games)
+    thr = float(cfg.get("eval_gate_threshold", 0.6) or 0.6)
+    res = evaluate_candidate(candidate_model, baseline_model, cfg, games=g, seed=seed)
+    return {"result": res, "pass": bool(res.get("win_rate", 0.0) >= thr), "threshold": thr}
+
+
+def finalize_async_gate_if_ready(
+    proc,
+    q,
+    *,
+    cand_path: Optional[str],
+    base_path: Optional[str],
+    cfg: Dict[str, Any],
+    logger: Optional[Any],
+    keep_prev_model: bool,
+    snapshot_cb: Optional[callable] = None,
+) -> Optional[Dict[str, Any]]:
+    """If async gate has produced a result, finalize promotion/rejection.
+
+    - Non-blocking: returns None if result not yet available.
+    - On completion: moves or deletes candidate file and logs decision.
+    - Returns a dict: { 'result': <eval dict or {'win_rate':..}>, 'pass': bool, 'threshold': float }
+    """
+    if proc is None:
+        return None
+    # Fetch result non-blocking
+    if proc.is_alive():
+        res = poll_async_gate(q)
+        if res is None:
+            return None
+    else:
+        res = poll_async_gate(q)
+    # Cleanup process (best-effort)
+    try:
+        if not proc.is_alive():
+            proc.join(timeout=1)
+    except Exception:
+        pass
+    # No result case
+    if res is None:
+        if logger:
+            try:
+                logger.log_text("[WARN] eval-gate async finished without result")
+            except Exception:
+                pass
+        return {"result": None, "pass": False, "threshold": float(cfg.get("eval_gate_threshold", 0.6) or 0.6)}
+    # Error case
+    if isinstance(res, dict) and "error" in res:
+        if logger:
+            try:
+                logger.log_text(f"[WARN] eval-gate async failed: {res['error']}")
+            except Exception:
+                pass
+        return {"result": None, "pass": False, "threshold": float(cfg.get("eval_gate_threshold", 0.6) or 0.6)}
+    # Decision
+    thr = float(cfg.get("eval_gate_threshold", 0.6) or 0.6)
+    win_rate = float(res.get("win_rate", 0.0)) if isinstance(res, dict) else 0.0
+    gated_pass = (win_rate >= thr)
+    # Log summary
+    try:
+        decision = 'promote' if gated_pass else 'reject'
+        wins = None
+        total = None
+        try:
+            wins = int(res.get('wins')) if isinstance(res, dict) and res.get('wins') is not None else None
+            total = int(res.get('games')) if isinstance(res, dict) and res.get('games') is not None else None
+        except Exception:
+            wins, total = None, None
+        import os as _os
+        cand_name = _os.path.basename(cand_path) if cand_path else None
+        base_name = _os.path.basename(base_path) if base_path else None
+        msg = f"[gate] done async win_rate={win_rate:.2%}"
+        if wins is not None and total is not None:
+            msg += f" ({wins}/{total})"
+        msg += f" decision={decision} thr={thr:.0%}"
+        if cand_name and base_name:
+            msg += f" cand={cand_name} base={base_name}"
+        if logger:
+            logger.log_text(msg)
+        else:
+            print(msg)
+    except Exception:
+        pass
+    # Promote or discard
+    try:
+        if gated_pass and cand_path is not None:
+            latest_path = cfg.get("checkpoint_path", "checkpoints/policy_value_latest.pt")
+            os.replace(cand_path, latest_path)
+            if keep_prev_model and snapshot_cb is not None:
+                try:
+                    snapshot_cb()
+                except Exception:
+                    pass
+        else:
+            if cand_path is not None and os.path.exists(cand_path):
+                try:
+                    os.remove(cand_path)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return {"result": res if isinstance(res, dict) else {"win_rate": win_rate}, "pass": gated_pass, "threshold": thr}
+
+

@@ -70,6 +70,7 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
     policy_losses = []
     value_losses = []
     entropies = []
+    hand_losses = []  # 手札予測損失 (BCEWithLogits)
     valid = 0
 
     collected_pi = []
@@ -90,6 +91,8 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
                 pi_arrays = []
                 v_targets_list = []
                 lengths: List[int] = []
+                hand_label_list: List[Optional[_np.ndarray]] = []  # 手札ラベル (存在するサンプルのみ格納、無い場合 None)
+                any_hand_labels = False
 
                 for sample in batch:
                     # Restore pi
@@ -130,9 +133,70 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
                     pi_arrays.append(pi_arr)
                     v_targets_list.append(float(v_target))
                     lengths.append(int(pi_arr.shape[0]))
+                    # 手札ラベル収集 (vectorized hand head 対応)
+                    hl = None
+                    try:
+                        st = sample.get('state') or {}
+                        if isinstance(st, dict) and ('hand_labels' in st):
+                            raw_hl = st.get('hand_labels')
+                            if raw_hl is not None:
+                                if hasattr(raw_hl, 'astype'):
+                                    hl = raw_hl.astype(_np.float32, copy=False)
+                                else:
+                                    hl = _np.asarray(list(raw_hl), dtype=_np.float32)
+                    except Exception:
+                        hl = None
+                    hand_label_list.append(hl)
+                    if hl is not None and hl.size > 0:
+                        any_hand_labels = True
 
                 if states:
-                    policy_logits_batch, value_logits_batch = agent.model.forward_batch(states)
+                    # --- バッチ forward (policy/value/hand) ---
+                    # 既存の forward_batch では hand_logits を返さないため、内部パスを再構築
+                    # states -> tensor エンコード
+                    import torch as _t
+                    xs = _t.stack([agent.model._encode_state(s) for s in states], dim=0)
+                    # モデル内部処理を再現 (models.PolicyValueNet._forward_from_tensor と同等)
+                    x2d = xs.to(agent.model.device).float()
+                    if x2d.dim() == 1:
+                        x2d = x2d.unsqueeze(0)
+                    # pad/truncate to full_feature_dim
+                    try:
+                        fdim = int(getattr(agent.model, 'full_feature_dim', x2d.size(-1)))
+                    except Exception:
+                        fdim = x2d.size(-1)
+                    cur = x2d.size(-1)
+                    if cur != fdim:
+                        if cur < fdim:
+                            pad = _t.zeros(x2d.size(0), fdim - cur, device=agent.model.device, dtype=x2d.dtype)
+                            x2d = _t.cat([x2d, pad], dim=1)
+                        else:
+                            x2d = x2d[:, :fdim]
+                    # split self / context
+                    self_dim = int(getattr(agent.model, 'self_dim', 32))
+                    context_dim = int(getattr(agent.model, 'context_dim', fdim - self_dim))
+                    parts = _t.split(x2d, [self_dim, context_dim], dim=1)
+                    if len(parts) != 2:
+                        # フォールバック: zeros backbone
+                        h = _t.zeros(x2d.size(0), int(getattr(agent.model, 'backbone_in_dim', 512)), device=agent.model.device)
+                        policy_logits_batch = agent.model.policy_head(h)
+                        value_logits_batch = agent.model.value_head(h)
+                        hand_logits_batch = None
+                    else:
+                        self_feat, context_feat = parts
+                        self_emb = agent.model.self_encoder(self_feat)
+                        context_emb = agent.model.context_encoder(context_feat)
+                        combined = _t.cat([self_emb, context_emb], dim=1)
+                        h = agent.model.backbone(combined)
+                        policy_logits_batch = agent.model.policy_head(h)
+                        value_logits_batch = agent.model.value_head(h)
+                        if getattr(agent.model, 'enable_hand_prediction_head', False) and getattr(agent.model, 'hand_head', None) is not None:
+                            try:
+                                hand_logits_batch = agent.model.hand_head(h)
+                            except Exception:
+                                hand_logits_batch = None
+                        else:
+                            hand_logits_batch = None
                     device = getattr(policy_logits_batch, 'device', None)
                     max_len = max(lengths)
                     B = len(states)
@@ -180,6 +244,41 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
                         v_prob = _t.sigmoid(v_logits[i])
                         collected_v_pred.append(v_prob.detach())
                         collected_v_t.append(v_targets_t[i].detach())
+                    # --- 手札予測損失 (vectorized) ---
+                    if any_hand_labels and hand_logits_batch is not None:
+                        try:
+                            # BCEWithLogitsLoss (reduction='none') で各サンプル損失を計算
+                            import torch.nn as _nn
+                            hlog = hand_logits_batch
+                            if hlog.dim() == 1:
+                                hlog = hlog.unsqueeze(0)
+                            # hand_logits_batch.shape = [B, hand_pred_dim]
+                            hand_dim = hlog.size(1)
+                            bce_hand = _nn.BCEWithLogitsLoss(reduction='none')
+                            hp_losses_sample = []
+                            for i, hl in enumerate(hand_label_list):
+                                if hl is None or hl.size == 0:
+                                    continue
+                                # pad/truncate hl to hand_dim
+                                if hl.shape[0] != hand_dim:
+                                    if hl.shape[0] < hand_dim:
+                                        pad = _np.zeros(hand_dim, dtype=_np.float32)
+                                        pad[:hl.shape[0]] = hl
+                                        hlv = pad
+                                    else:
+                                        hlv = hl[:hand_dim]
+                                else:
+                                    hlv = hl
+                                hl_t = _t.from_numpy(hlv.astype(_np.float32)).to(device)
+                                logits_i = hlog[i]
+                                # per element losses -> mean
+                                per_elem = bce_hand(logits_i.view(-1), hl_t.view(-1))
+                                hp_losses_sample.append(per_elem.mean())
+                            if hp_losses_sample:
+                                # 平均を hand_losses へ集約 (同一インターフェイス維持)
+                                hand_losses.append(_t.stack(hp_losses_sample).mean())
+                        except Exception:
+                            pass
                     vectorized_ok = True
             except Exception:
                 vectorized_ok = False
@@ -303,6 +402,40 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
                     collected_model.append(probs.detach())
                     collected_v_pred.append(v_prob.detach())
                     collected_v_t.append(v_t.detach())
+                    # --- 手札予測損失 ---
+                    try:
+                        if getattr(agent.model, 'enable_hand_prediction_head', False) and hasattr(agent.model, 'forward_with_belief'):
+                            st = sample.get('state') or {}
+                            hl = None
+                            if isinstance(st, dict) and ('hand_labels' in st):
+                                import numpy as _np
+                                raw = st.get('hand_labels')
+                                if hasattr(raw, 'astype'):
+                                    hl = raw.astype(_np.float32, copy=False)
+                                else:
+                                    try:
+                                        hl = _np.asarray(list(raw), dtype=_np.float32)
+                                    except Exception:
+                                        hl = None
+                            if hl is not None and hl.size > 0:
+                                import torch as _t
+                                pol_l, val_l, hand_logits = agent.model.forward_with_belief(st)
+                                if hand_logits is not None:
+                                    hl_t = _t.from_numpy(hl).to(hand_logits.device)
+                                    # pad/truncate 次元調整
+                                    n = min(int(hl_t.numel()), int(hand_logits.numel()))
+                                    if n > 0:
+                                        if hl_t.numel() != n:
+                                            hl_t = hl_t[:n]
+                                        if hand_logits.numel() != n:
+                                            hand_logits = hand_logits.view(-1)[:n]
+                                        if 'bce_logits_loss_fn_hand' not in agent.__dict__:
+                                            import torch.nn as _nn
+                                            agent.bce_logits_loss_fn_hand = _nn.BCEWithLogitsLoss()
+                                        hp_loss = agent.bce_logits_loss_fn_hand(hand_logits.view(-1)[:n], hl_t.view(-1)[:n])
+                                        hand_losses.append(hp_loss)
+                    except Exception:
+                        pass
                 except Exception:
                     continue
 
@@ -320,6 +453,7 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
     policy_loss_mean = _t.stack(policy_losses).mean()
     value_loss_mean = _t.stack(value_losses).mean()
     entropy_mean = _t.stack(entropies).mean()
+    hand_loss_mean = _t.stack(hand_losses).mean() if hand_losses else None
 
     # Common metrics
     try:
@@ -328,10 +462,19 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
     except Exception:
         metrics_extra = {"policy_kl": None, "policy_top1_match": None, "value_acc": None, "value_brier": None}
 
-    return {
+    out = {
         "policy_loss": float(policy_loss_mean.item()),
         "value_loss": float(value_loss_mean.item()),
         "entropy": float(entropy_mean.item()),
         "samples": valid,
         **metrics_extra,
     }
+    # 手札予測損失が計算できた場合は追加
+    try:
+        if hand_loss_mean is not None:
+            out["hand_pred_loss"] = float(hand_loss_mean.item())
+        else:
+            out["hand_pred_loss"] = None
+    except Exception:
+        out["hand_pred_loss"] = None
+    return out

@@ -19,6 +19,8 @@ import copy
 from collections import deque
 from typing import Any, Dict, List, Optional
 import joblib
+import time
+import uuid
 
 try:  # model
     from agents.models import PolicyValueNet  # noqa: F401
@@ -89,7 +91,7 @@ class AlphaZeroAgent:
         self.puct_c = self.config.get("puct_c", 1.4)
         self.dirichlet_alpha = self.config.get("dirichlet_alpha", 0.3)
         self.dirichlet_epsilon = self.config.get("dirichlet_epsilon", 0.25)
-        # バッチ推論/TT 設定（デフォルトは挙動不変: バッチ=1, キャッシュoff）
+        # バッチ推論/ルート並列用設定
         self.mcts_batch_eval_size = int(self.config.get("mcts_batch_eval_size", 1))
         self.enable_mcts_tt = bool(self.config.get("enable_mcts_tt", False))
         self.mcts_tt_capacity = int(self.config.get("mcts_tt_capacity", 10000))
@@ -102,8 +104,7 @@ class AlphaZeroAgent:
         self.move_count = 0  # エピソード内手数カウンタ
         # 自己対戦エピソードカウンタ（温度スケジュール短縮用）
         self.episodes_played = 0
-
-        # 学習用ハイパーパラメータ
+        # 学習関連
         self.lr = self.config.get("lr", 1e-4)
         self.weight_decay = self.config.get("weight_decay", 1e-4)
         self.policy_loss_coef = self.config.get("policy_loss_coef", 1.0)
@@ -132,22 +133,25 @@ class AlphaZeroAgent:
         self._belief_cache = None
         # 直近状態（差分用ヒント）
         self._last_state = None
-
-        # 統計: 累積フェーズラベル分布
         self.total_value_samples = 0
         self.total_positive = 0
-        # フェーズ予測精度集計
         self.phase_total = 0
         self.phase_correct = 0
         self.episode_phase_total = 0
         self.episode_phase_correct = 0
-        # リプレイ追い出し検知
         self.lost_phase_samples = 0
-        # TT 統計
         self.tt_hits = 0
         self.tt_misses = 0
-        # pos weight (クラス不均衡対策) optional
         self.pos_weight = float(self.config.get("value_pos_weight", 1.5))
+        # pos_weight 調整ログのスロットリング用
+        self._posw_last_log_samples = 0
+        self._posw_last_log_value = float(self.pos_weight)
+        # クラス別ミックスの過学習対策: 直近使用した陽性UIDを避けるバッファ
+        try:
+            from collections import deque as _dq
+            self._recent_pos_uids = _dq(maxlen=int(self.config.get('value_pos_recent_buffer', 2000)))
+        except Exception:
+            self._recent_pos_uids = []
 
         # --- MCTS 実効シミュレーション統計（低頻度ログ用に集計） ---
         try:
@@ -159,6 +163,8 @@ class AlphaZeroAgent:
         self._mcts_early_stop = 0
         # MCTS パフォーマンス計測用（1手あたりのNN推論時間の集計）
         self._perf_infer_ms_accum = 0.0
+        self._perf_infer_calls = 0
+        self._forward_time_ms_ema = None
         # ルートノードに属性を付けられない(__slots__)場合のフォールバック保持
         self._last_perf_clone_ms: Optional[float] = None
         self._last_perf_det_mode: Optional[str] = None
@@ -213,6 +219,8 @@ class AlphaZeroAgent:
                 self._mcts_tt_tick = 0
         except Exception:
             pass
+
+    # 旧: 推論専用モデルは廃止（self.model を常に使用）
 
     def set_model_version(self, version: int):
         """Trainer 側からモデル世代を更新するフック（TTは世代で分離）."""
@@ -325,8 +333,6 @@ class AlphaZeroAgent:
         # 行動サンプリング用: 現在のスケジュールに従う（高温→低温）
         tau_action = self._select_temperature(training=training)
         pi_action = self._apply_temperature_to_visits(visits, tau_action)
-        
-        # 学習ターゲット用: policy_target_tau で固定（訪問数の素直な正規化）
         tau_target = float(self.config.get("policy_target_tau", 1.0))
         pi_target = self._apply_temperature_to_visits(visits, tau_target)
 
@@ -385,8 +391,6 @@ class AlphaZeroAgent:
         if isinstance(action_env, tuple):  # tuple を list 化
             action_env = list(action_env)
         action_env = self._validate_action(env, action_env)
-
-        # 直近状態の抽出（差分用ヒント）。評価時でも次回の差分計算に必要なため常に作成。
         state_repr = self._extract_state(env, prev_state=getattr(self, '_last_state', None))
 
         # リプレイサンプル保存 (value=None : 未確定)
@@ -605,7 +609,8 @@ class AlphaZeroAgent:
         # legal_list: 事前計算済みの合法手（run_puct_mcts から渡される）。再計算を避けるために使用。
         def policy_value_batch_fn(env_list, legal_list=None):
             try:
-                if self.model is None:
+                mdl = self.model
+                if mdl is None:
                     outs = []
                     for i, e in enumerate(env_list):
                         legal = (legal_list[i] if legal_list is not None else self._get_legal_actions(e))
@@ -615,22 +620,109 @@ class AlphaZeroAgent:
                             p = 1.0 / len(legal)
                             outs.append(({a: p for a in legal}, 0.0))
                     return outs
+                # If remote inference is available, delegate per-request and remap to legal actions
+                rq = getattr(self, '_remote_request_q', None)
+                rsp_q = getattr(self, '_remote_response_q', None)
+                wid = getattr(self, '_remote_worker_id', None)
+                if rq is not None and rsp_q is not None and wid is not None:
+                    import uuid, time as _tmo
+                    n_env = len(env_list)
+                    outs = [None] * n_env
+                    req_ids = []
+                    start_lat = _tmo.time()
+                    # send requests
+                    for i, e in enumerate(env_list):
+                        try:
+                            payload = self._extract_state(e)
+                        except Exception:
+                            payload = None
+                        rid = uuid.uuid4().hex
+                        req_ids.append(rid)
+                        try:
+                            rq.put((int(wid), rid, payload))
+                        except Exception:
+                            pass
+                    # collect with timeout
+                    timeout = float(self.config.get('remote_infer_timeout', 5.0) or 5.0)
+                    start_ts = _tmo.time()
+                    received = 0
+                    while received < n_env and (_tmo.time() - start_ts) < timeout:
+                        try:
+                            rrid, out = rsp_q.get(timeout=0.5)
+                        except Exception:
+                            continue
+                        try:
+                            if rrid in req_ids:
+                                idx = req_ids.index(rrid)
+                                outs[idx] = out
+                                received += 1
+                        except Exception:
+                            pass
+                    # 計測: バッチ遅延を per-env 平均として加算
+                    try:
+                        dt_ms = float((_tmo.time() - start_lat) * 1000.0)
+                        self._perf_infer_ms_accum += dt_ms
+                        self._perf_infer_calls += max(1, n_env)
+                        if bool(self.config.get('measure_forward_time', False)):
+                            alpha = float(self.config.get('measure_ema_alpha', 0.3) or 0.3)
+                            per_env_ms = dt_ms / max(1, n_env)
+                            if self._forward_time_ms_ema is None:
+                                self._forward_time_ms_ema = float(per_env_ms)
+                            else:
+                                self._forward_time_ms_ema = float(alpha * per_env_ms + (1.0 - alpha) * self._forward_time_ms_ema)
+                    except Exception:
+                        pass
+                    # map to legal actions, fallback locally if missing
+                    results = []
+                    for i, e in enumerate(env_list):
+                        legal = (legal_list[i] if legal_list is not None else self._get_legal_actions(e))
+                        if outs[i] is None:
+                            # local fallback
+                            results.append(self._policy_value(e))
+                            continue
+                        out = outs[i]
+                        try:
+                            # out could be (pol,val) or (pol,val,extras)
+                            pol_raw, val_raw = out[0], out[1]
+                            extras = out[2] if (isinstance(out, tuple) and len(out) >= 3) else None
+                            # cache hand probs if present (last one wins)
+                            if isinstance(extras, dict) and isinstance(extras.get('hand_probs'), (list, tuple)):
+                                self._remote_hand_probs = list(extras.get('hand_probs'))
+                            # remap index->prob to legal actions if keys are indices
+                            mapped = {}
+                            if legal and pol_raw:
+                                if all(isinstance(k, int) for k in getattr(pol_raw, 'keys', lambda: [])()):
+                                    # index mapping
+                                    for j, a in enumerate(legal):
+                                        try:
+                                            mapped[a] = float(pol_raw.get(j, 0.0))
+                                        except Exception:
+                                            mapped[a] = 0.0
+                                else:
+                                    mapped = pol_raw
+                            else:
+                                mapped = {}
+                            results.append((mapped, val_raw))
+                        except Exception:
+                            # final fallback local
+                            results.append(self._policy_value(e))
+                    return results
                 # 可変長アクションモデルはバッチ困難 → 個別に処理
-                if getattr(self.model, 'supports_variable_actions', False) and hasattr(self.model, 'evaluate'):
+                if getattr(mdl, 'supports_variable_actions', False) and hasattr(mdl, 'evaluate'):
                     return [self._policy_value(e) for e in env_list]
                 # forward_batch があれば使う
-                if hasattr(self.model, 'forward_batch'):
+                if hasattr(mdl, 'forward_batch'):
                     states = [self._extract_state(e) for e in env_list]
                     # 推論は勾配不要 + CUDA では AMP を利用
                     try:
                         import torch as _t
-                        _dev = getattr(self.model, 'device', None)
+                        _dev = getattr(mdl, 'device', None)
                         _use_amp = bool(getattr(_dev, 'type', None) == 'cuda')
                         with _t.no_grad():
                             with _t.amp.autocast('cuda', enabled=_use_amp):
                                 import time as _tperf
                                 _t0 = _tperf.time()
-                                logits_b, value_vec_b = self.model.forward_batch(states)
+                                logits_b, value_vec_b = mdl.forward_batch(states)
                         try:
                             self._perf_infer_ms_accum += ( (_tperf.time() - _t0) * 1000.0 )
                         except Exception:
@@ -638,7 +730,7 @@ class AlphaZeroAgent:
                     except Exception:
                         import time as _tperf
                         _t0 = _tperf.time()
-                        logits_b, value_vec_b = self.model.forward_batch(states)
+                        logits_b, value_vec_b = mdl.forward_batch(states)
                         try:
                             self._perf_infer_ms_accum += ( (_tperf.time() - _t0) * 1000.0 )  # best-effort
                         except Exception:
@@ -817,30 +909,127 @@ class AlphaZeroAgent:
 
     def _policy_value(self, env):
         """1 環境に対する policy 分布と value を返す。"""
+        # If remote inference queue is attached, delegate single-eval to master
+        try:
+            rq = getattr(self, '_remote_request_q', None)
+            rsp_q = getattr(self, '_remote_response_q', None)
+            wid = getattr(self, '_remote_worker_id', None)
+            if rq is not None and rsp_q is not None and wid is not None:
+                # build lightweight payload (feature/state dict)
+                try:
+                    payload = self._extract_state(env)
+                except Exception:
+                    payload = None
+                try:
+                    # generate a robust unique request id
+                    req_id = uuid.uuid4().hex
+                    import time as _tperf
+                    _t0 = _tperf.time()
+                    try:
+                        rq.put((int(wid), req_id, payload))
+                    except Exception:
+                        pass
+                    # wait for response
+                    timeout = float(self.config.get('remote_infer_timeout', 5.0) or 5.0)
+                    start = time.time()
+                    while True:
+                        try:
+                            rid, out = rsp_q.get(timeout=0.5)
+                            if rid == req_id:
+                                # out expected shapes:
+                                #   legacy: (policy_dict, value)
+                                #   extended: (policy_dict, value, extras)
+                                pol_raw, val_raw = None, None
+                                extras = None
+                                try:
+                                    pol_raw = out[0]; val_raw = out[1]
+                                    extras = out[2] if (isinstance(out, tuple) and len(out) >= 3) else None
+                                except Exception:
+                                    pass
+                                # 計測: 遠隔推論の往復遅延を1コールとして加算
+                                try:
+                                    dt_ms = (_tperf.time() - _t0) * 1000.0
+                                    self._perf_infer_ms_accum += float(dt_ms)
+                                    self._perf_infer_calls += 1
+                                    if bool(self.config.get('measure_forward_time', False)):
+                                        alpha = float(self.config.get('measure_ema_alpha', 0.3) or 0.3)
+                                        if self._forward_time_ms_ema is None:
+                                            self._forward_time_ms_ema = float(dt_ms)
+                                        else:
+                                            self._forward_time_ms_ema = float(alpha * dt_ms + (1.0 - alpha) * self._forward_time_ms_ema)
+                                except Exception:
+                                    pass
+                                # cache hand_probs if present
+                                try:
+                                    if isinstance(extras, dict) and isinstance(extras.get('hand_probs'), (list, tuple)):
+                                        self._remote_hand_probs = list(extras.get('hand_probs'))
+                                except Exception:
+                                    pass
+                                # remap index->prob to legal actions if keys are indices
+                                try:
+                                    legal_local = self._get_legal_actions(env)
+                                except Exception:
+                                    legal_local = []
+                                mapped = {}
+                                try:
+                                    if legal_local and pol_raw:
+                                        if hasattr(pol_raw, 'keys') and all(isinstance(k, int) for k in pol_raw.keys()):
+                                            for j, a in enumerate(legal_local):
+                                                try:
+                                                    mapped[a] = float(pol_raw.get(j, 0.0))
+                                                except Exception:
+                                                    mapped[a] = 0.0
+                                        else:
+                                            mapped = pol_raw
+                                except Exception:
+                                    mapped = {}
+                                return (mapped, val_raw)
+                            # else ignore
+                        except Exception:
+                            # timeout on get -> check global timeout
+                            if (time.time() - start) >= timeout:
+                                break
+                    # fallback to local if remote failed/timeout
+                except Exception:
+                    pass
+        except Exception:
+            pass
         state = self._extract_state(env)
         legal = self._get_legal_actions(env)
         n = len(legal)
         if n == 0:
             return {}, 0.0
-        if self.model is None:
+        mdl = self.model
+        if mdl is None:
             p = 1.0 / n
             return {a: p for a in legal}, 0.0
 
         # 可変長アクション対応モデル
         try:
             import torch as _t
-            _dev = getattr(self.model, 'device', None)
+            _dev = getattr(mdl, 'device', None)
             _use_amp = bool(getattr(_dev, 'type', None) == 'cuda')
             with _t.no_grad():
-                if getattr(self.model, 'supports_variable_actions', False) and hasattr(self.model, 'evaluate'):
+                if getattr(mdl, 'supports_variable_actions', False) and hasattr(mdl, 'evaluate'):
                     # 可変長アクションモデルの逐次評価
                     # 期待: value は各プレイヤーのロジット/確率ベクター
                     # 後方互換: スカラーしか返らない場合は N 人分に複製
                     import time as _tperf
                     _t0 = _tperf.time()
-                    logits, value_out = self.model.evaluate(state, legal)
+                    logits, value_out = mdl.evaluate(state, legal)
                     try:
-                        self._perf_infer_ms_accum += ( (_tperf.time() - _t0) * 1000.0 )
+                        _dt_ms = (_tperf.time() - _t0) * 1000.0
+                        self._perf_infer_ms_accum += _dt_ms
+                        self._perf_infer_calls += 1
+                        if bool(self.config.get('measure_forward_time', False)):
+                            alpha = float(self.config.get('measure_ema_alpha', 0.3) or 0.3)
+                            try:
+                                if self._forward_time_ms_ema is None:
+                                    self._forward_time_ms_ema = float(_dt_ms)
+                                else:
+                                    self._forward_time_ms_ema = float(alpha * _dt_ms + (1.0 - alpha) * self._forward_time_ms_ema)
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                     # value_out をベクターへ
@@ -865,9 +1054,20 @@ class AlphaZeroAgent:
                     import time as _tperf
                     with _t.amp.autocast('cuda', enabled=_use_amp):
                         _t0 = _tperf.time()
-                        logits_t, value_vec_t = self.model.forward(state)  # tensors
+                        logits_t, value_vec_t = mdl.forward(state)  # tensors
                     try:
-                        self._perf_infer_ms_accum += ( (_tperf.time() - _t0) * 1000.0 )
+                        _dt_ms = (_tperf.time() - _t0) * 1000.0
+                        self._perf_infer_ms_accum += _dt_ms
+                        self._perf_infer_calls += 1
+                        if bool(self.config.get('measure_forward_time', False)):
+                            alpha = float(self.config.get('measure_ema_alpha', 0.3) or 0.3)
+                            try:
+                                if self._forward_time_ms_ema is None:
+                                    self._forward_time_ms_ema = float(_dt_ms)
+                                else:
+                                    self._forward_time_ms_ema = float(alpha * _dt_ms + (1.0 - alpha) * self._forward_time_ms_ema)
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                     if hasattr(logits_t, 'shape') and logits_t.shape[0] < n:  # 念のためパディング（不可視化: -1e9）
@@ -884,12 +1084,23 @@ class AlphaZeroAgent:
                     logits = logits_t.tolist() if hasattr(logits_t, 'tolist') else list(logits_t)
         except Exception:
             # フォールバック（従来通り）
-            if getattr(self.model, 'supports_variable_actions', False) and hasattr(self.model, 'evaluate'):
+            if getattr(mdl, 'supports_variable_actions', False) and hasattr(mdl, 'evaluate'):
                 import time as _tperf
                 _t0 = _tperf.time()
-                logits, value_out = self.model.evaluate(state, legal)
+                logits, value_out = mdl.evaluate(state, legal)
                 try:
-                    self._perf_infer_ms_accum += ( (_tperf.time() - _t0) * 1000.0 )
+                    _dt_ms = (_tperf.time() - _t0) * 1000.0
+                    self._perf_infer_ms_accum += _dt_ms
+                    self._perf_infer_calls += 1
+                    if bool(self.config.get('measure_forward_time', False)):
+                        alpha = float(self.config.get('measure_ema_alpha', 0.3) or 0.3)
+                        try:
+                            if self._forward_time_ms_ema is None:
+                                self._forward_time_ms_ema = float(_dt_ms)
+                            else:
+                                self._forward_time_ms_ema = float(alpha * _dt_ms + (1.0 - alpha) * self._forward_time_ms_ema)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 try:
@@ -905,9 +1116,20 @@ class AlphaZeroAgent:
             else:
                 import time as _tperf
                 _t0 = _tperf.time()
-                logits_t, value_vec_t = self.model.forward(state)
+                logits_t, value_vec_t = mdl.forward(state)
                 try:
-                    self._perf_infer_ms_accum += ( (_tperf.time() - _t0) * 1000.0 )
+                    _dt_ms = (_tperf.time() - _t0) * 1000.0
+                    self._perf_infer_ms_accum += _dt_ms
+                    self._perf_infer_calls += 1
+                    if bool(self.config.get('measure_forward_time', False)):
+                        alpha = float(self.config.get('measure_ema_alpha', 0.3) or 0.3)
+                        try:
+                            if self._forward_time_ms_ema is None:
+                                self._forward_time_ms_ema = float(_dt_ms)
+                            else:
+                                self._forward_time_ms_ema = float(alpha * _dt_ms + (1.0 - alpha) * self._forward_time_ms_ema)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 if hasattr(logits_t, 'shape') and logits_t.shape[0] < n:
@@ -936,6 +1158,13 @@ class AlphaZeroAgent:
             out = {a: (1.0/len(legal)) for a in legal}
             value_scalar = 0.5
         # value_scalar は list/dict/float を許容（MCTS 側で各ノードの to_play 視点を抽出）
+        # If remote hand probs were cached and determinization wants them, expose via side-channel attr
+        try:
+            if getattr(self, '_remote_hand_probs', None) is not None:
+                # Mark timestamp for freshness if needed later
+                self._remote_hand_probs_ts = time.time()
+        except Exception:
+            pass
         return out, value_scalar
 
     # ---------------- Env helpers ----------------
@@ -1128,15 +1357,13 @@ class AlphaZeroAgent:
                         continue
                     cnt = len(fb)
                     ranks = []
-                    for s in fb:
-                        core = s[:-1]
+                    for cid in fb:
                         try:
+                            core = cid[:-1]
                             ranks.append(int(core))
                         except Exception:
                             pass
-                    if not ranks:
-                        continue
-                    base_rank = min(ranks)
+                    base_rank = min(ranks) if ranks else 0
                     pass_reqs.append({
                         'pid': h.get('pid'), 'count': cnt, 'min_rank': base_rank,
                         'revo': bool(h.get('revo', False)), 'combo_type': h.get('combo_type'),
@@ -1151,17 +1378,161 @@ class AlphaZeroAgent:
             import random as _r
             opp_ids = [i for i in range(len(g_new.players)) if i != root_pid]
             max_retry = max(1, int(self._det_cfg.get('retry_max', 8)))
+            # Step4: 手札予測ヘッドによるガイド付き割当
+            guided_enable = False
+            hand_card_probs = None  # dict: opponent_pid -> list[53] (probabilities)
+            try:
+                mdl = self.model
+                if bool(getattr(self.config, 'get', lambda k, d=None: d)('hand_pred_use_in_determinization', False)) or \
+                   bool(self.config.get('hand_pred_use_in_determinization', False)):
+                    # 予測ヘッドがモデルに存在するか確認
+                    num_players_local = len(g_new.players)
+                    remote_hp = getattr(self, '_remote_hand_probs', None)
+                    fresh = True
+                    try:
+                        ttl = float(self.config.get('hand_pred_cache_ttl_sec', 0.5) or 0.5)
+                        ts = float(getattr(self, '_remote_hand_probs_ts', 0.0) or 0.0)
+                        import time as _time
+                        if ttl > 0 and (ts <= 0 or (_time.time() - ts) > ttl):
+                            fresh = False
+                    except Exception:
+                        fresh = True
+                    if fresh and isinstance(remote_hp, (list, tuple)) and len(remote_hp) == 53 * (num_players_local - 1):
+                        opponents_order = [i for i in range(num_players_local) if i != root_pid]
+                        hand_card_probs = {}
+                        for oi, pid_ in enumerate(opponents_order):
+                            start = oi * 53
+                            hand_card_probs[pid_] = list(remote_hp[start:start+53])
+                        guided_enable = True
+                    elif self.model is not None and getattr(self.model, 'enable_hand_prediction_head', False) and hasattr(self.model, 'forward_with_belief'):
+                        state_root = self._extract_state(original_env)
+                        import torch as _t
+                        _dev = getattr(self.model, 'device', None)
+                        _use_amp = bool(getattr(_dev, 'type', None) == 'cuda')
+                        with _t.no_grad():
+                            with _t.amp.autocast('cuda', enabled=_use_amp):
+                                try:
+                                    _, _, hand_logits_t = self.model.forward_with_belief(state_root)
+                                except Exception:
+                                    hand_logits_t = None
+                        if hand_logits_t is not None:
+                            try:
+                                import torch as _t
+                                if isinstance(hand_logits_t, _t.Tensor):
+                                    hp = _t.sigmoid(hand_logits_t).detach().cpu().tolist()
+                                else:
+                                    import math as _m
+                                    seq = (hand_logits_t.detach().cpu().tolist() if hasattr(hand_logits_t, 'detach') else (hand_logits_t.tolist() if hasattr(hand_logits_t, 'tolist') else list(hand_logits_t)))
+                                    hp = [1.0/(1.0+_m.exp(-float(x))) for x in seq]
+                            except Exception:
+                                hp = list(hand_logits_t)
+                            expected = 53 * (num_players_local - 1)
+                            if len(hp) == expected:
+                                opponents_order = [i for i in range(num_players_local) if i != root_pid]
+                                hand_card_probs = {}
+                                for oi, pid_ in enumerate(opponents_order):
+                                    start = oi * 53
+                                    hand_card_probs[pid_] = hp[start:start+53]
+                                guided_enable = True
+            except Exception:
+                guided_enable = False
+                hand_card_probs = None
+
             for attempt in range(max_retry):
                 unknown = list(unknown_seed)
-                _r.shuffle(unknown)
-                cursor = 0
-                assignment_hands = {}
-                for i in opp_ids:
-                    p_new = g_new.players[i]
-                    sz = len(p_new.hand)
-                    pick = unknown[cursor:cursor+sz]
-                    cursor += sz
-                    assignment_hands[i] = list(pick)
+                guided_used = False
+                if guided_enable and attempt == 0:
+                    # ガイド付き: 各カードを opponent の確率に基づきサンプリング
+                    try:
+                        _r.shuffle(unknown)  # 順番ランダム化
+                        # 容量 (各 opponent の所持枚数)
+                        capacities = {i: len(g_new.players[i].hand) for i in opp_ids}
+                        assignment_hands = {i: [] for i in opp_ids}
+                        from game.card import Card
+                        def _card_index_from_str(cid: str) -> int:
+                            try:
+                                # Card.from_string があれば利用
+                                c_obj = Card.from_string(cid) if hasattr(Card, 'from_string') else Card(cid)
+                                # _extract_state と同じロジック
+                                if getattr(c_obj, 'is_joker', False):
+                                    return 52
+                                suit_order = {'\u2660':0,'\u2665':1,'\u2666':2,'\u2663':3, 'S':0,'H':1,'D':2,'C':3}
+                                s = suit_order.get(getattr(c_obj,'suit','S'),0)
+                                r = int(getattr(c_obj,'rank',1)) - 1
+                                idx = s * 13 + r
+                                if idx < 0 or idx >= 53:
+                                    return 52
+                                return idx
+                            except Exception:
+                                # 失敗時は Joker 扱いで 52 へフォールバック
+                                return 52
+                        for cid in unknown:
+                            remaining_opps = [i for i in opp_ids if capacities[i] > 0]
+                            if not remaining_opps:
+                                break
+                            idx = _card_index_from_str(cid)
+                            # 生確率取得
+                            probs_raw = []
+                            total = 0.0
+                            for pid_ in remaining_opps:
+                                p_val = 0.0
+                                try:
+                                    p_list = hand_card_probs.get(pid_, None)
+                                    if p_list and 0 <= idx < len(p_list):
+                                        p_val = float(p_list[idx])
+                                except Exception:
+                                    p_val = 0.0
+                                probs_raw.append(p_val)
+                                total += p_val
+                            if total <= 1e-12:
+                                # 全ゼロ → 一様分布
+                                probs_norm = [1.0/len(remaining_opps)] * len(remaining_opps)
+                            else:
+                                probs_norm = [p/total for p in probs_raw]
+                            # サンプリング
+                            r = _r.random()
+                            cum = 0.0
+                            chosen = remaining_opps[-1]
+                            for j, pid_ in enumerate(remaining_opps):
+                                cum += probs_norm[j]
+                                if r <= cum:
+                                    chosen = pid_
+                                    break
+                            assignment_hands[chosen].append(cid)
+                            capacities[chosen] -= 1
+                        # 足りない場合 (容量残り) → 余った unknown から再配分
+                        leftover_unknown = [cid for cid in unknown if all(cid not in v for v in assignment_hands.values())]
+                        if leftover_unknown:
+                            for cid in leftover_unknown:
+                                targets = [i for i in opp_ids if capacities[i] > 0]
+                                if not targets:
+                                    break
+                                choice = _r.choice(targets)
+                                assignment_hands[choice].append(cid)
+                                capacities[choice] -= 1
+                        # 各 opponent の枚数が期待通りか簡易検証; 不整合ならガイド失敗として通常ランダムへフォールバック
+                        mismatch = False
+                        for i in opp_ids:
+                            if len(assignment_hands[i]) != len(g_new.players[i].hand):
+                                mismatch = True
+                                break
+                        if not mismatch:
+                            guided_used = True
+                            self._det_stats['guided_assignments'] = self._det_stats.get('guided_assignments', 0) + 1
+                        else:
+                            guided_used = False
+                    except Exception:
+                        guided_used = False
+                if not guided_used:
+                    _r.shuffle(unknown)
+                    cursor = 0
+                    assignment_hands = {}
+                    for i in opp_ids:
+                        p_new = g_new.players[i]
+                        sz = len(p_new.hand)
+                        pick = unknown[cursor:cursor+sz]
+                        cursor += sz
+                        assignment_hands[i] = list(pick)
                 # 矛盾検査
                 consistent = True
                 for req in pass_reqs:
@@ -1238,7 +1609,52 @@ class AlphaZeroAgent:
         """現在手番プレイヤーの合法手集合を可変長リストで返す。
 
         変更点:
-          - 「場が空」の場合はパスを合法手から除外する。
+                # If remote inference queue is attached, delegate to master in per-request fashion
+                rq = getattr(self, '_remote_request_q', None)
+                rsp_q = getattr(self, '_remote_response_q', None)
+                wid = getattr(self, '_remote_worker_id', None)
+                if rq is not None and rsp_q is not None and wid is not None:
+                    outs = [None] * len(env_list)
+                    req_ids = []
+                    # send all requests with robust uuid ids
+                    for i, e in enumerate(env_list):
+                        try:
+                            payload = self._extract_state(e)
+                        except Exception:
+                            payload = None
+                        req_id = uuid.uuid4().hex
+                        req_ids.append(req_id)
+                        try:
+                            rq.put((int(wid), req_id, payload))
+                        except Exception:
+                            pass
+                    # collect responses with timeout
+                    timeout = float(self.config.get('remote_infer_timeout', 5.0) or 5.0)
+                    start = time.time()
+                    received = 0
+                    while received < len(env_list) and (time.time() - start) < timeout:
+                        try:
+                            rid, out = rsp_q.get(timeout=0.5)
+                        except Exception:
+                            continue
+                        try:
+                            # match response to local index by req id
+                            if rid in req_ids:
+                                idx = req_ids.index(rid)
+                                outs[idx] = out
+                                received += 1
+                        except Exception:
+                            pass
+                    # For any missing responses, fallback to local evaluation
+                    for i in range(len(env_list)):
+                        if outs[i] is None:
+                            try:
+                                # compute locally
+                                outs[i] = self._policy_value(env_list[i])
+                            except Exception:
+                                outs[i] = ({}, 0.0)
+                    return outs
+                if self.model is None:
           - 合法手は正規化・重複排除後、カノニカル順に安定ソートする。
         """
         try:
@@ -1318,32 +1734,25 @@ class AlphaZeroAgent:
             return None
 
     def _extract_state(self, env, prev_state=None):
-        """部分観測用特徴量 (full_input v4)。
+        """部分観測用特徴量 (Belief 入力削除後のフル特徴レイアウト)。
 
-                レイアウト (rank クラス 4 種: daifugo,fugo,hinmin,daihinmin):
-                    Self(55):  自分手札53bit + pass1 + remain_norm1
-                    OppSummary( (1 + 4) * (N-1) = 5(N-1) ): 各 opponent の remain_norm1 + rank one-hot(4)
-                    Field(22): revolution1 + combo7 + base_rank13 + field_size_norm1
-                    FieldCards(53): 現在場に出ている具体カードビット
-                    PlayHistory(53): これまで公開された(場 or 自分が保持して見えた)カードフラグ
-                    Belief(53*(N-1)): opponent ごとのカード存在確率 (所在不明カードのみ一定値)
-                    Turn(N): 手番 one-hot
+        新レイアウト (rank クラス 4 種: daifugo,fugo,hinmin,daihinmin):
+            - Self(55): 自分手札53bit + pass1 + remain_norm1
+            - OppSummary(5*(N-1)): 各 opponent の remain_norm1 + rank one-hot(4)
+            - Field(22): revolution1 + combo7 + base_rank13 + field_size_norm1
+            - FieldCards(53): 現在場に出ている具体カードビット
+            - OpponentDiscards(53*(N-1)): 各相手がこれまでに場へ出したカードフラグ
+            - PassMatrix(13*(N-1)): パスで示唆された“到達不能”ランクの近似フラグ
+            - Turn(N): 手番 one-hot
 
-                        合計次元:
-                                                        = Self 55
-                                                            + OppSummary 5(N-1)
-                                                            + Field 22
-                                                            + FieldCards 53
-                                                            + PlayHistory 53
-                                                            + Belief 53(N-1)
-                                                            + Turn N
-                                                        = (55 + 22 + 53 + 53) + 5(N-1) + 53(N-1) + N
-                                                        = 183 + 58(N-1) + N
-                                                        = 183 + 58N - 58 + N
-                                                        = 59N + 125
-                                                したがって expected_full_dim = 59 * num_players + 125
-                                (v3 との差異: FieldCards + PlayHistory の 106 次元追加)
-                """
+        合計次元 (Belief と PlayHistory を除去し OpponentDiscards/PassMatrix を追加):
+            expected_full_dim = 72 * num_players + 59
+
+        備考:
+            - hand_labels (53*(N-1)) は引き続き教師として生成し、モデルの hand_head 出力ロジットに対し
+              BCEWithLogitsLoss で使用する。
+            - 旧 Belief ベクトルは生成しない。
+        """
         try:
             g = env.game
             pid = g.turn
@@ -1360,7 +1769,11 @@ class AlphaZeroAgent:
             if not use_full:
                 return base
             num_players = len(g.players)
-            expected_full_dim = 59 * num_players + 125
+            # 追加ブロック: OpponentDiscards 53*(N-1) + PassMatrix 13*(N-1)
+            opp_discards_dim = 53 * (num_players - 1)
+            pass_matrix_dim = 13 * (num_players - 1)
+            # 新期待次元（Belief と PlayHistory を除去）: 72N + 59
+            expected_full_dim = 72 * num_players + 59
 
             def card_index(card):
                 try:
@@ -1402,6 +1815,25 @@ class AlphaZeroAgent:
                 return one
             opponents = [i for i in range(num_players) if i != pid]
             opp_remains = {i: len(g.players[i].hand) for i in opponents}
+            # ラベル作成（学習用・相手手札の実ラベル）
+            try:
+                if bool(getattr(self, 'config', {}).get('enable_hand_prediction_head', False)) and \
+                   float(getattr(self, 'config', {}).get('hand_pred_loss_coef', 0.0) or 0.0) > 0.0:
+                    hand_labels = []  # 53*(N-1) の 0/1
+                    for i in opponents:
+                        vec = [0.0] * 53
+                        for c in getattr(g.players[i], 'hand', []):
+                            try:
+                                idx = card_index(c)
+                                if 0 <= idx < 53:
+                                    vec[idx] = 1.0
+                            except Exception:
+                                pass
+                        hand_labels.extend(vec)
+                    base['hand_labels'] = hand_labels
+                    base['hand_labels_dim'] = len(hand_labels)
+            except Exception:
+                pass
             for i in opponents:
                 feat.append(opp_remains[i]/53.0)
                 feat.extend(encode_rank(g.players[i]))
@@ -1442,209 +1874,85 @@ class AlphaZeroAgent:
                 except Exception:
                     pass
             feat.extend(field_bits)
-            # PlayHistory (53)
-            history_bits = [0.0]*53
+            # PlayHistory 入力は削除
+
+            # OpponentDiscards (53*(N-1)) プレイヤー別に「その相手が場に出したことのあるカード」フラグ
+            # 対象: 自分以外の相手。play_history から自分以外の行動を抽出。
+            opp_discards_map = {i: [0.0]*53 for i in opponents}
             try:
-                hist_cards = list(getattr(g, 'play_history', []))
+                action_hist = list(getattr(g, '_action_history', []) or [])
             except Exception:
-                hist_cards = []
-            merged = set()
-            for seq in (getattr(me,'hand',[]), hist_cards, field):
-                for c in seq:
-                    try:
-                        idx = card_index(c)
-                        if 0 <= idx < 53:
-                            merged.add(idx)
-                    except Exception:
-                        pass
-            for idx in merged:
-                history_bits[idx] = 1.0
-            feat.extend(history_bits)
-
-            # --- Belief 計算用の履歴インデックス（除去済み・公開済み）---
-            # 重要: Belief の「所在不明」からは、過去に場へ出て流れたカード（play_history）も除外する。
-            # これにより「既に除去済みカードを相手が持っている確率が >0」という論理矛盾を防ぐ。
-            history_idx = set()
-            for c in hist_cards:
+                action_hist = []
+            for h in action_hist:
                 try:
-                    idx = card_index(c)
-                    if 0 <= idx < 53:
-                        history_idx.add(idx)
+                    pid_act = h.get('pid')
+                    act = h.get('action')
+                    if pid_act in opp_discards_map and act not in (None, 'pass'):
+                        # action はカードリスト (tuple/list) または単体カード
+                        cards_iter = act if isinstance(act, (list, tuple)) else [act]
+                        for c in cards_iter:
+                            try:
+                                idx = card_index(c)
+                                if 0 <= idx < 53:
+                                    opp_discards_map[pid_act][idx] = 1.0
+                            except Exception:
+                                pass
                 except Exception:
-                    pass
+                    continue
+            # 出力順は opponents の順番で連結
+            for i in opponents:
+                feat.extend(opp_discards_map[i])
 
-            # Belief distributions
-            # 目的: "所在不明" の各カードが 各 opponent の手札にある確率 P(card=k ∈ hand_i) を推定し 53*(N-1) 次元に展開。
-            # 改良: パス時の論理的消去法を導入し、各相手 i の PossibilitySet_i を構成。
-            #      パスが発生した手番の場の状態(役タイプ/基準ランク/枚数/革命)に基づき、
-            #      その時点で出せたはずの全ての“候補カード”を PossibilitySet_i から除外する。
-            #      シンプルに、single/pair/triple/four については基準を満たすランク(とJOKER)の全スートカードを除外。
-            #      straight については安全のため現段階では除外ロジックを適用しない（過剰除外を避ける）。
-            #      最終的に x_i[k] は k∈PossibilitySet_i のとき H_i / |PossibilitySet_i|、それ以外は 0 とする（上限1.0にクリップ）。
-            #      |PossibilitySet_i|==0 の場合はフォールバックとして 0 をセットする。
-            # ステップ1: 所在不明カード集合 U を構成 (自分の手札 / 現在フィールド / PlayHistory を除外)
-            self_idx = set()
-            for c in getattr(me,'hand',[]):
+            # PassMatrix (13*(N-1)) ランク別に「その相手がそのランク以上(革命時は以下)に対してパスした」近似情報
+            # 方針: pass した直前の場 field_before から基準ランク base_rank を推定し、
+            # single/pair/triple/four のみ対象。革命時は大小比較を反転。
+            pass_matrix_map = {i: [0.0]*13 for i in opponents}
+            def _rank_str_to_int(s: str):
                 try:
-                    idx = card_index(c)
-                    if 0 <= idx < 53:
-                        self_idx.add(idx)
+                    core = s[1:]
+                    mp = {'A':1,'J':11,'Q':12,'K':13}
+                    return mp.get(core.upper(), int(core))
                 except Exception:
-                    pass
-            field_idx = set()
-            for c in field:
-                try:
-                    idx = card_index(c)
-                    if 0 <= idx < 53:
-                        field_idx.add(idx)
-                except Exception:
-                    pass
-            # PlayHistory 由来の公開・除去カードも unknown から除外する
-            unknown = [i for i in range(53) if i not in self_idx and i not in field_idx and i not in history_idx]
-            unknown_set = set(unknown)
-
-            # ステップ2: 各 opponent の手札残数 H_i を取得
-            opp_ids = opponents
-            H = {i: opp_remains[i] for i in opp_ids}
-
-            # 逆引きヘルパ: index -> (rank, suit, is_joker)
-            def index_to_rsi(idx: int):
-                if idx == 52:
-                    return (None, None, True)
-                try:
-                    suit_idx = idx // 13
-                    rank = (idx % 13) + 1
-                    suits = ['S','H','D','C']
-                    suit = suits[suit_idx] if 0 <= suit_idx < 4 else 'S'
-                    return (rank, suit, False)
-                except Exception:
-                    return (None, None, False)
-
-            def idxs_of_rank(r: int):
-                if r is None:
-                    return []
-                base = (r - 1)
-                return [base + 13 * s for s in range(4)]  # S,H,D,C の順
-
-            # ステップ3: パス履歴に基づく PossibilitySet_i の構築
-            # キャッシュがあれば差分適用のみ行う（毎回の全履歴再走査を避ける）
-            try:
-                history = list(getattr(g, '_action_history', []) or [])
-            except Exception:
-                history = []
-
-            use_cache = False
-            poss_sets = None
-            start_idx = 0
-            cached = getattr(self, '_belief_cache', None)
-            if isinstance(cached, dict) and cached.get('num_players') == num_players:
-                c_poss = cached.get('poss_sets')
-                c_hist = cached.get('hist_len')
-                if isinstance(c_poss, dict) and isinstance(c_hist, int) and 0 <= c_hist <= len(history):
-                    # 既存キャッシュをベースに差分だけ適用
-                    poss_sets = c_poss  # 参照のまま更新（差分適用）
-                    start_idx = c_hist
-                    # 対象プレイヤー集合が一致しない場合は再初期化
-                    if set(poss_sets.keys()) != set(opp_ids):
-                        poss_sets = None
-                    else:
-                        use_cache = True
-            if not use_cache or poss_sets is None:
-                # キャッシュなし/不整合時は初期化
-                poss_sets = {i: set(unknown_set) for i in opp_ids}
-                start_idx = 0
-
-            # 場の基準情報抽出用ユーティリティ
-            def _base_rank_from_field_strs(field_strs: List[str]) -> Optional[int]:
-                # 例: ['♦10'] 等 → ランク最小/最大は revolution で解釈が変わるが、pair/triple は同ランク
-                ranks = []
-                for s in field_strs:
-                    try:
-                        core = s[1:]  # 先頭はスート
-                        map_face = {'A':1,'J':11,'Q':12,'K':13}
-                        ranks.append(map_face.get(core.upper(), int(core)))
-                    except Exception:
-                        pass
-                if not ranks:
                     return None
-                return min(ranks)  # 基準として最小ランクを用いる（compare は revolution で吸収）
-
-            for h in history[start_idx:]:
+            for h in action_hist:
                 try:
                     if h.get('action') != 'pass':
                         continue
                     pid_pass = h.get('pid')
-                    if pid_pass is None or pid_pass == pid:
-                        # 自分のパスは Belief には不要
+                    if pid_pass not in pass_matrix_map:
                         continue
-                    field_before = h.get('field_before') or []
-                    if not field_before:
-                        # 場が空でのパス（実質起きない）は制約なし
+                    fb = h.get('field_before') or []
+                    if not fb:
                         continue
                     combo_type = h.get('combo_type')
+                    if combo_type not in (None,'single','pair','triple','four','joker_single'):
+                        continue  # straight などは除外
+                    base_rank = None
+                    ranks_tmp = []
+                    for s in fb:
+                        r = _rank_str_to_int(s)
+                        if r is not None:
+                            ranks_tmp.append(r)
+                    if ranks_tmp:
+                        base_rank = min(ranks_tmp)
+                    if base_rank is None:
+                        continue
                     revo_flag = bool(h.get('revo', False))
-                    base_rank = _base_rank_from_field_strs(field_before)
-                    # 除外候補 index 集合
-                    exclude_idxs: set[int] = set()
-                    if combo_type in (None, 'single', 'joker_single'):
-                        # single 系: 基準を上回れる単カード全て（革命時は逆順）+ Joker
-                        if combo_type == 'joker_single':
-                            # Joker 同士のみ可能 → Joker を排除
-                            exclude_idxs.add(52)
-                        else:
-                            # ランク 1..13 のうち条件を満たすもの
-                            for r in range(1, 14):
-                                ok = (r > base_rank) if not revo_flag else (r < base_rank)
-                                if ok:
-                                    exclude_idxs.update(idxs_of_rank(r))
-                            # Joker は常に上位として扱う
-                            exclude_idxs.add(52)
-                    elif combo_type in ('pair','triple','four'):
-                        # 同ランク複数枚: 基準を上回れるランク r の単カード全て（組めるなら出せたはず → 強めの除外）
-                        size = len(field_before)
-                        # ランク判定
-                        for r in range(1, 14):
-                            ok_rank = (r > base_rank) if not revo_flag else (r < base_rank)
-                            if not ok_rank:
-                                continue
-                            # r の全スートカード（組合せ要件はここでは近似として無視し、積極的に除外）
-                            exclude_idxs.update(idxs_of_rank(r))
-                        # Joker も代用として使える可能性が高いので除外
-                        exclude_idxs.add(52)
-                    elif combo_type == 'straight':
-                        # 階段は構成の自由度が高く、過剰除外のリスクが大きいので現段階では適用しない
-                        exclude_idxs = set()
-                    # 適用: 未知カードのみ対象
-                    if pid_pass in poss_sets:
-                        poss_sets[pid_pass] -= (exclude_idxs & unknown_set)
+                    # パス時点で「出せたはずの（勝てる）ランク」集合を近似：non-revo で base_rank より上、revo で下
+                    if not revo_flag:
+                        target_ranks = [r for r in range(base_rank+1, 14)]
+                    else:
+                        target_ranks = [r for r in range(1, base_rank)]
+                    for r in target_ranks:
+                        if 1 <= r <= 13:
+                            pass_matrix_map[pid_pass][r-1] = 1.0
+                    # Joker は 52 index だが PassMatrix は 13 ランクのみを扱う設計
                 except Exception:
                     continue
-
-            # キャッシュ更新
-            try:
-                self._belief_cache = {
-                    'num_players': num_players,
-                    'poss_sets': poss_sets,
-                    'hist_len': len(history),
-                }
-            except Exception:
-                pass
-
-            # ステップ4: 53 長ベクトル生成 (非所在 or 自手札/場カードは 0)。
-            #           x_i[k] = H_i / |PossibilitySet_i| (k ∈ PossibilitySet_i), それ以外は 0。上限は 1.0 にクリップ。
             for i in opponents:
-                probs = [0.0] * 53
-                S_i = poss_sets.get(i, set()) & unknown_set
-                size_si = len(S_i)
-                h_i = int(H.get(i, 0) or 0)
-                if size_si > 0 and h_i > 0:
-                    p_each = min(1.0, float(h_i) / float(size_si))
-                    for idx in S_i:
-                        probs[idx] = p_each
-                # size==0 または h_i==0 の場合は 0 埋め
-                feat.extend(probs)
-            # 以前は unknown_count と opponent remains の不一致を一度だけ通知していたが
-            # 運用で冗長になったためログ出力を廃止 (計算ロジックはそのまま)。
+                feat.extend(pass_matrix_map[i])
+
+            # Belief 分布は入力から削除済みのため、ここでの計算・付加は行わない
 
             # Turn one-hot
             turn_onehot = [0.0]*num_players
@@ -1659,11 +1967,11 @@ class AlphaZeroAgent:
                 else:
                     del feat[expected_full_dim:]
                 if not hasattr(self,'_warned_full_dim_autofix'):
-                    print(f"[WARN] adjusted full_input length from {cur_len} to expected {expected_full_dim}")
+                    print(f"[WARN] adjusted full_input length from {cur_len} to expected {expected_full_dim} (layout: no Belief/PlayHistory + OpponentDiscards + PassMatrix)")
                     self._warned_full_dim_autofix = True
             base['full_input'] = feat
             base['full_input_dim'] = expected_full_dim
-            base['full_input_version'] = 4
+            base['full_input_version'] = 6
             return base
         except Exception:
             return {"turn": 0}
@@ -1693,7 +2001,18 @@ class AlphaZeroAgent:
             if self.config.get('use_full_features') and sample['feature_version'] == 0:
                 return sample
             if self._use_shared and hasattr(self.replay_buffer, 'append'):
-                self.replay_buffer.append(sample)
+                # 非同期挿入が有効なら append_async を使用
+                try:
+                    if bool(self.config.get('replay_async_enabled', False)) and hasattr(self.replay_buffer, 'append_async'):
+                        drop_oldest = bool(self.config.get('replay_async_drop_oldest', True))
+                        self.replay_buffer.append_async(sample, drop_oldest=drop_oldest)
+                    else:
+                        self.replay_buffer.append(sample)
+                except Exception:
+                    try:
+                        self.replay_buffer.append(sample)
+                    except Exception:
+                        pass
                 return sample
             # ローカル (list / deque) 互換処理
             try:
@@ -1710,18 +2029,13 @@ class AlphaZeroAgent:
         # ==============================================================
         # --- メモリ削減: full_input をコンパクト表現へ圧縮 (packbits + float16) ---
         try:
-            # store_full_input=False の場合は featureベクトル自体を保持しない
-            if isinstance(state, dict) and not self.config.get('store_full_input', True):
-                # full_input / compact の両方削除 (既に圧縮済みでも除去)
-                if 'full_input' in state:
-                    try: del state['full_input']
-                    except Exception: pass
-                if 'full_compact' in state:
-                    try: del state['full_compact']
-                    except Exception: pass
+            # 圧縮方針:
+            #   1) enable_compact_full_input が True なら、store_full_input の値に関わらず
+            #      まず full_input から full_compact を生成（未生成時のみ）。
+            #   2) store_full_input が False の場合は raw full_input を削除し、圧縮表現のみ保持して学習可能にする。
+            #      以前は両方削除して feature_version=0 になり学習が停止してしまっていたため修正。
             if (self.config.get('use_full_features') and
                 self.config.get('enable_compact_full_input', True) and
-                self.config.get('store_full_input', True) and
                 isinstance(state, dict) and 'full_input' in state and 'full_compact' not in state):
                 fi = state.get('full_input')
                 import numpy as _np
@@ -1791,8 +2105,37 @@ class AlphaZeroAgent:
                             'full_input_dim': int(total_len),
                             'layout_version': int(layout_version),
                         }
+                        # store_full_input が False なら raw full_input を削除してメモリ節約
+                        if not self.config.get('store_full_input', True):
+                            try:
+                                del state['full_input']
+                            except Exception:
+                                pass
+                    else:
+                        # v5 など未対応レイアウト用の汎用フォールバック圧縮
                         try:
-                            del state['full_input']
+                            bin_mask = (fi_arr <= 1e-6) | (fi_arr >= 1.0 - 1e-6)
+                            binary_indices = _np.where(bin_mask)[0].tolist()
+                            float_indices = _np.where(~bin_mask)[0].tolist()
+                            if binary_indices or float_indices:
+                                bin_vals = fi_arr[binary_indices] if binary_indices else fi_arr[0:0]
+                                bin_bits = (bin_vals > 0.5).astype(_np.uint8) if binary_indices else _np.zeros(0, dtype=_np.uint8)
+                                packed = _np.packbits(bin_bits).tobytes() if bin_bits.size > 0 else b''
+                                float_vals = fi_arr[float_indices].astype(_np.float16) if float_indices else fi_arr[0:0].astype(_np.float16)
+                                state['full_compact'] = {
+                                    'packed_bits': packed,
+                                    'floats': float_vals,
+                                    'binary_len': int(bin_bits.shape[0]),
+                                    'num_players': int(self.config.get('num_players', 4)),
+                                    'format': 'cfv1',
+                                    'full_input_dim': int(total_len),
+                                    'layout_version': -1,  # generic
+                                }
+                                if not self.config.get('store_full_input', True):
+                                    try:
+                                        del state['full_input']
+                                    except Exception:
+                                        pass
                         except Exception:
                             pass
         except Exception:
@@ -1909,7 +2252,17 @@ class AlphaZeroAgent:
             return sample  # Queue 送信は finalize_phase で行う
         if self._use_shared and hasattr(self.replay_buffer, 'append'):
             # 共有リプレイ (ReplayBuffer.append 内でエビクション処理)
-            self.replay_buffer.append(sample)
+            try:
+                if bool(self.config.get('replay_async_enabled', False)) and hasattr(self.replay_buffer, 'append_async'):
+                    drop_oldest = bool(self.config.get('replay_async_drop_oldest', True))
+                    self.replay_buffer.append_async(sample, drop_oldest=drop_oldest)
+                else:
+                    self.replay_buffer.append(sample)
+            except Exception:
+                try:
+                    self.replay_buffer.append(sample)
+                except Exception:
+                    pass
             return sample
         # ローカル deque: maxlen による自動 FIFO なのでそのまま append
         if isinstance(self.replay_buffer, deque):
@@ -1950,6 +2303,62 @@ class AlphaZeroAgent:
                     rec['split'] = 'val' if (_r.random() < ratio) else 'train'
             except Exception:
                 pass
+
+        # ---------------- 動的 pos_weight 調整 ----------------
+        # 目的: クラス不均衡 (陽性率 pos_rate) の変動に応じて BCE の正例重みを (1-pos_rate)/pos_rate へ近づける。
+        # 段階的に更新して過剰振動を防ぐ。
+        try:
+            dyn_enable = self.config.get('dynamic_pos_weight_enable', True)
+            if dyn_enable and self.total_value_samples >= int(self.config.get('dynamic_pos_weight_warmup_samples', 1500)):
+                pos_rate = self.total_positive / max(1, self.total_value_samples)
+                # 逆出現率 (inverse prevalence) をターゲットとする
+                target = (1.0 - pos_rate) / max(pos_rate, 1e-6)
+                # クリップ範囲
+                min_w = float(self.config.get('dynamic_pos_weight_min', 1.0))
+                max_w = float(self.config.get('dynamic_pos_weight_max', 3.0))
+                target = max(min_w, min(max_w, target))
+                old = self.pos_weight
+                # 更新間隔（サンプル数ベース）
+                interval = int(self.config.get('dynamic_pos_weight_update_every_samples', 1000))
+                if interval <= 0 or (self.total_value_samples % interval) == 0:
+                    # 最大ステップ幅 (一度に跳ね上げない)
+                    step_max = float(self.config.get('dynamic_pos_weight_step_max', 0.2))
+                    delta = target - old
+                    if abs(delta) >= 1e-3:  # 有意差のみ更新
+                        adj = old + max(-step_max, min(step_max, delta))
+                        self.pos_weight = adj
+                        # config にも書き戻し (train_step 側が参照するケースに備え)
+                        try:
+                            self.config['value_pos_weight'] = self.pos_weight
+                        except Exception:
+                            pass
+                        # ログ（スロットリング対応）
+                        try:
+                            log_enable = bool(self.config.get('dynamic_pos_weight_log_enable', True))
+                            log_every = int(self.config.get('dynamic_pos_weight_log_every_samples', 10000) or 0)
+                            delta_min = float(self.config.get('dynamic_pos_weight_log_delta_min', 0.3) or 0.0)
+                            last_s = getattr(self, '_posw_last_log_samples', 0)
+                            last_v = getattr(self, '_posw_last_log_value', float('nan'))
+                            samples_ok = (log_every <= 0) or ((self.total_value_samples - int(last_s)) >= log_every)
+                            delta_ok = (not (last_v != last_v)) or (abs(self.pos_weight - float(last_v)) >= delta_min)  # last_v!=last_v is NaN check
+                            if log_enable and (samples_ok or delta_ok):
+                                if self.logger:
+                                    self.logger.log_text(
+                                        f"[pos-weight-adjust] samples={self.total_value_samples} pos_rate={pos_rate:.3f} old={old:.3f} target={target:.3f} new={self.pos_weight:.3f}")
+                                else:
+                                    import os, datetime
+                                    log_dir = self.config.get('log_dir', 'logs')
+                                    os.makedirs(log_dir, exist_ok=True)
+                                    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                    with open(os.path.join(log_dir, 'events.log'), 'a', encoding='utf-8') as f:
+                                        f.write(f"[{ts}] [pos-weight-adjust] samples={self.total_value_samples} pos_rate={pos_rate:.3f} old={old:.3f} target={target:.3f} new={self.pos_weight:.3f}\n")
+                                # 更新
+                                self._posw_last_log_samples = int(self.total_value_samples)
+                                self._posw_last_log_value = float(self.pos_weight)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
     def finalize_phase(self, winner_player_id: int, was_active: bool):
         """フェーズ終端処理: 勝者IDに基づき 0/1 ラベル付与 + 予測精度集計."""
@@ -2345,22 +2754,195 @@ class AlphaZeroAgent:
             params = [p for p in self.model.parameters() if p.requires_grad]
             self._optimizer = torch.optim.Adam(params, lr=self.lr, weight_decay=self.weight_decay)
 
-        batch = batch_pool if len(batch_pool) <= batch_size else random.sample(batch_pool, batch_size)
+        # --- Prioritized sampling (lightweight, conservative) ---
+        uid2weight = None
+        prioritized_uids = None
+        if (self._use_shared and hasattr(self.replay_buffer, 'sample_prioritized')
+                and bool(self.config.get('prioritized_replay', True))):
+            try:
+                alpha = float(self.config.get('prioritized_replay_alpha', 0.6) or 0.6)
+                eps = float(self.config.get('prioritized_replay_eps', 1e-6) or 1e-6)
+                fast_full_input_np = None
+                if hasattr(self.replay_buffer, 'sample_prioritized_fast'):
+                    try:
+                        fast_res = self.replay_buffer.sample_prioritized_fast(
+                            batch_size, owner_pid=self.player_id, alpha=alpha, eps=eps,
+                            return_weights=True, return_full_input=True)
+                    except Exception:
+                        fast_res = None
+                else:
+                    fast_res = None
+                if isinstance(fast_res, dict) and fast_res.get('samples') is not None:
+                    sampled = fast_res['samples']
+                    sampled_uids = fast_res.get('uids', [])
+                    is_weights = fast_res.get('is_weights', [])
+                    fast_full_input_np = fast_res.get('full_input')
+                else:
+                    sampled, sampled_uids, is_weights = self.replay_buffer.sample_prioritized(
+                        batch_size, owner_pid=self.player_id, alpha=alpha, eps=eps, return_weights=True)
+                # map uid -> importance weight (normalized to max=1 by buffer)
+                uid2weight = {int(u): float(w) for u, w in zip(sampled_uids, is_weights)}
+                prioritized_uids = list(sampled_uids)
+                batch = sampled
+            except Exception:
+                batch = batch_pool if len(batch_pool) <= batch_size else random.sample(batch_pool, batch_size)
+                fast_full_input_np = None
+        else:
+            batch = batch_pool if len(batch_pool) <= batch_size else random.sample(batch_pool, batch_size)
+            fast_full_input_np = None
         # フル特徴量モード時に旧フォーマット(feature_version=0)サンプルを除外
         if self.config.get('use_full_features'):
             filtered = [s for s in batch if s.get('feature_version', 0) >= 1]
             if not filtered:
                 return {"loss": None, "reason": "no_full_feature_samples"}
             batch = filtered
-
+        # --- クラス別ミックス (陽性率の最低保証) ---
+        try:
+            import math as _m
+            target_pos_rate = float(self.config.get('value_pos_min_rate', 0.2) or 0.2)
+        except Exception:
+            target_pos_rate = 0.0
+        if target_pos_rate > 0.0 and batch:
+            def _is_pos(sample):
+                v = sample.get('value', None)
+                if v is None:
+                    vu = sample.get('value_u8', None)
+                    if isinstance(vu, int) and vu != 255:
+                        v = vu / 255.0
+                try:
+                    return float(v) > 0.5
+                except Exception:
+                    return False
+            cur_pos = sum(1 for s in batch if _is_pos(s))
+            B = len(batch)
+            max_frac = float(self.config.get('value_pos_topup_max_frac', 0.35) or 0.35)
+            target_count = int(_m.ceil(min(max_frac, max(0.0, target_pos_rate)) * B))
+            need = max(0, target_count - cur_pos)
+            if need > 0:
+                # 候補プール: 同一オーナー/学習splitの全サンプルから陽性のみ抽出
+                try:
+                    # batch_pool は先に作成済みの学習候補プール
+                    candidates = [s for s in batch_pool if _is_pos(s)]
+                except Exception:
+                    candidates = []
+                # 過学習対策: 直近使用UIDの除外 / 現バッチのUID除外 / 新し過ぎるUID除外
+                in_batch_uids = set()
+                for s in batch:
+                    u = s.get('uid', None)
+                    if u is not None:
+                        try:
+                            in_batch_uids.add(int(u))
+                        except Exception:
+                            pass
+                recent_set = set(list(self._recent_pos_uids)) if isinstance(self._recent_pos_uids, (list, set)) else set(list(getattr(self, '_recent_pos_uids', [])))
+                try:
+                    max_uid_all = max(int(s.get('uid', -1)) for s in candidates if s.get('uid') is not None) if candidates else -1
+                except Exception:
+                    max_uid_all = -1
+                uid_age_margin = int(self.config.get('value_pos_uid_age_margin', 1000) or 1000)
+                filtered_cands = []
+                for s in candidates:
+                    uid = s.get('uid', None)
+                    try:
+                        uid_i = int(uid) if uid is not None else None
+                    except Exception:
+                        uid_i = None
+                    if uid_i is not None:
+                        if uid_i in in_batch_uids:
+                            continue
+                        if uid_i in recent_set:
+                            continue
+                        if (uid_age_margin > 0) and (max_uid_all >= 0) and (uid_i > (max_uid_all - uid_age_margin)):
+                            # 新規すぎるサンプルは避ける（多様性確保）
+                            continue
+                    filtered_cands.append(s)
+                # 最低候補数が小さい場合はスキップ（極端な再利用を避ける）
+                min_cands = int(self.config.get('value_pos_topup_min_candidates', 200) or 200)
+                if len(filtered_cands) >= max(min_cands, need):
+                    # ミックス: 一部は一様ランダム、残りは優先度重み付き
+                    import random as _r
+                    uni_ratio = float(self.config.get('value_pos_topup_uniform_mix', 0.3) or 0.3)
+                    take_uni = int(round(need * max(0.0, min(1.0, uni_ratio))))
+                    take_pri = max(0, need - take_uni)
+                    _r.shuffle(filtered_cands)
+                    top_uni = filtered_cands[:take_uni]
+                    remain_cands = filtered_cands[take_uni:]
+                    # 重み: priority^alpha（無ければ1.0）
+                    try:
+                        alpha = float(self.config.get('prioritized_replay_alpha', 0.6) or 0.6)
+                    except Exception:
+                        alpha = 0.6
+                    def _prio_w(s):
+                        try:
+                            p = float(s.get('priority', 1.0) or 1.0)
+                        except Exception:
+                            p = 1.0
+                        try:
+                            return max(1e-8, p) ** alpha
+                        except Exception:
+                            return 1.0
+                    weights = [_prio_w(s) for s in remain_cands]
+                    # 重み付きサンプル（置換なし）
+                    top_pri = []
+                    if take_pri > 0 and remain_cands:
+                        # 簡易: サンプリング毎に正規化して選択
+                        pool = list(remain_cands)
+                        w = list(weights)
+                        for _ in range(min(take_pri, len(pool))):
+                            s_w = sum(w)
+                            if s_w <= 0:
+                                idx = _r.randrange(len(pool))
+                            else:
+                                r = _r.random() * s_w
+                                acc = 0.0
+                                idx = 0
+                                for j, ww in enumerate(w):
+                                    acc += ww
+                                    if acc >= r:
+                                        idx = j
+                                        break
+                            top_pri.append(pool.pop(idx))
+                            _ = w.pop(idx)
+                    topups = top_uni + top_pri
+                    # 負例を置換して陽性率を引き上げる
+                    if topups:
+                        neg_indices = [i for i, s in enumerate(batch) if not _is_pos(s)]
+                        if neg_indices:
+                            # replace up to available slots
+                            replace_n = min(len(topups), len(neg_indices))
+                            # 置換でfast_full_inputは不整合になるので無効化
+                            fast_full_input_np = None
+                            for k in range(replace_n):
+                                idx = neg_indices[k]
+                                batch[idx] = topups[k]
+                                # IS重みがある場合は新規UIDを1.0で登録（保守的）
+                                try:
+                                    if uid2weight is not None:
+                                        uid_new = topups[k].get('uid')
+                                        if uid_new is not None:
+                                            uid2weight[int(uid_new)] = 1.0
+                                except Exception:
+                                    pass
+                                # 最近使用UIDとして登録
+                                try:
+                                    uid_reg = topups[k].get('uid')
+                                    if uid_reg is not None and hasattr(self, '_recent_pos_uids') and hasattr(self._recent_pos_uids, 'append'):
+                                        self._recent_pos_uids.append(int(uid_reg))
+                                except Exception:
+                                    pass
+        # --- ここまで: クラス別ミックス ---
+        # 損失集計用のコンテナ
         policy_losses = []
         value_losses = []
+        hand_losses = []
         entropies = []
         valid = 0
         collected_pi = []
         collected_model = []
         collected_v_pred = []
         collected_v_t = []
+        collected_hand_pos_rate = []
+        used_uids = []
         variable = getattr(self.model, 'supports_variable_actions', False) and hasattr(self.model, 'evaluate')
 
         vectorized_ok = False
@@ -2370,7 +2952,9 @@ class AlphaZeroAgent:
                 states = []
                 pi_arrays = []  # list[np.ndarray]
                 v_targets_list = []
+                is_weights_list = []
                 lengths = []
+                hand_label_list = []  # list[np.ndarray or None]
                 # 事前検証 / 復元フェーズ (最小限の Python ループ)
                 for sample in batch:
                     # legal 長さを pi ベースで判断 (legal_actions 復元コスト削減)
@@ -2417,11 +3001,46 @@ class AlphaZeroAgent:
                     states.append(sample['state'])
                     pi_arrays.append(pi_arr)
                     v_targets_list.append(float(v_target))
+                    # 手札ラベル（存在すれば収集）
+                    try:
+                        hl = None
+                        st = sample.get('state') or {}
+                        if isinstance(st, dict) and ('hand_labels' in st):
+                            hl_raw = st.get('hand_labels')
+                            if hl_raw is not None:
+                                hl = _np.asarray(list(hl_raw), dtype=_np.float32)
+                        hand_label_list.append(hl)
+                    except Exception:
+                        hand_label_list.append(None)
+                    # importance-sampling weight for this sample (default 1.0)
+                    try:
+                        uid = sample.get('uid')
+                        iw = float(uid2weight.get(int(uid), 1.0)) if uid2weight is not None else 1.0
+                    except Exception:
+                        iw = 1.0
+                    is_weights_list.append(iw)
+                    try:
+                        if uid is not None:
+                            used_uids.append(int(uid))
+                    except Exception:
+                        pass
                     lengths.append(int(pi_arr.shape[0]))
                 if states:
-                    # モデル一括 forward
-                    policy_logits_batch, value_logits_batch = self.model.forward_batch(states)
+                    # モデル一括 forward（belief ヘッド出力も取得）
                     import torch
+                    try:
+                        if fast_full_input_np is not None:
+                            import torch as _t
+                            xs = _t.from_numpy(fast_full_input_np).to(self.model.device).float()
+                        else:
+                            xs = torch.stack([self.model._encode_state(s) for s in states], dim=0)
+                    except Exception:
+                        xs = None
+                    if xs is not None and hasattr(self.model, 'forward_with_belief'):
+                        policy_logits_batch, value_logits_batch, hand_logits_batch = self.model.forward_with_belief(xs)
+                    else:
+                        policy_logits_batch, value_logits_batch = self.model.forward_batch(states)
+                        hand_logits_batch = None
                     device = policy_logits_batch.device
                     max_len = max(lengths)
                     B = len(states)
@@ -2449,6 +3068,7 @@ class AlphaZeroAgent:
                     else:
                         v_logits = value_logits_batch[:, 0]
                     v_targets_t = torch.tensor(v_targets_list, dtype=torch.float32, device=device)
+                    is_weights_t = torch.tensor(is_weights_list, dtype=torch.float32, device=device)
                     if 'bce_logits_loss_fn' not in self.__dict__:
                         import torch.nn as _nn
                         try:
@@ -2459,7 +3079,25 @@ class AlphaZeroAgent:
                         if pw != 1.0:
                             pos_w_tensor = torch.tensor([pw], dtype=torch.float32, device=device)
                         self.bce_logits_loss_fn = _nn.BCEWithLogitsLoss(pos_weight=pos_w_tensor) if pos_w_tensor is not None else _nn.BCEWithLogitsLoss()
-                    value_loss_all = self.bce_logits_loss_fn(v_logits.unsqueeze(1), v_targets_t.unsqueeze(1))  # mean over batch
+                    # Compute per-sample BCE (no reduction) then apply IS weights conservatively to value loss only
+                    try:
+                        import torch.nn as _nn
+                        # create a reduction='none' BCE with same pos_weight behavior
+                        pos_w = None
+                        try:
+                            pos_w = float(self.pos_weight)
+                        except Exception:
+                            pos_w = 1.0
+                        pos_w_tensor = None
+                        if pos_w != 1.0:
+                            pos_w_tensor = torch.tensor([pos_w], dtype=torch.float32, device=device)
+                        bce_none = _nn.BCEWithLogitsLoss(pos_weight=pos_w_tensor, reduction='none') if pos_w_tensor is not None else _nn.BCEWithLogitsLoss(reduction='none')
+                        value_loss_per = bce_none(v_logits.unsqueeze(1), v_targets_t.unsqueeze(1)).squeeze(1)
+                        # apply importance weights and average
+                        value_loss_all = (value_loss_per * is_weights_t).mean()
+                    except Exception:
+                        # fallback to previous mean if anything goes wrong
+                        value_loss_all = self.bce_logits_loss_fn(v_logits.unsqueeze(1), v_targets_t.unsqueeze(1))
                     # Entropy
                     entropy_all = - (probs * log_probs).sum(dim=1)
                     # 集約
@@ -2467,6 +3105,47 @@ class AlphaZeroAgent:
                     value_losses.append(value_loss_all)  # already mean
                     entropies.append(entropy_all.mean())
                     valid = len(states)
+                    # hand 予測損失（存在時のみ）
+                    try:
+                        hand_coef = float(self.config.get('hand_pred_loss_coef', 0.0) or 0.0)
+                    except Exception:
+                        hand_coef = 0.0
+                    if hand_coef > 0.0 and (hand_logits_batch is not None):
+                        # 対象サンプルのみ抽出
+                        idx_labeled = [i for i, hl in enumerate(hand_label_list) if hl is not None]
+                        if idx_labeled:
+                            # hand_head 出力次元（後方互換で belief_dim も参照）
+                            D = getattr(self.model, 'hand_pred_dim', None)
+                            if D is None:
+                                D = getattr(self.model, 'belief_dim', None)
+                            # テンソル化
+                            tgt_list = []
+                            for i in idx_labeled:
+                                hl = hand_label_list[i]
+                                if hl is None:
+                                    continue
+                                if D is not None and hl.shape[0] != int(D):
+                                    # 長さ不一致は切り詰め/パディング
+                                    import numpy as _np
+                                    if hl.shape[0] < int(D):
+                                        pad = _np.zeros(int(D), dtype=_np.float32)
+                                        pad[:hl.shape[0]] = hl
+                                        hl = pad
+                                    else:
+                                        hl = hl[:int(D)]
+                                tgt_list.append(torch.tensor(hl, dtype=torch.float32, device=device))
+                            if tgt_list:
+                                tgt = torch.stack(tgt_list, dim=0)
+                                pred_logits = hand_logits_batch[idx_labeled]
+                                import torch.nn as _nn
+                                hloss = _nn.BCEWithLogitsLoss(reduction='mean')(pred_logits, tgt)
+                                hand_losses.append(hloss)
+                                # 参考: 正例率（監視用）
+                                try:
+                                    pos_rate_h = float((tgt.mean().detach().cpu().item()))
+                                except Exception:
+                                    pos_rate_h = None
+                                collected_hand_pos_rate.append(pos_rate_h)
                     # メトリクス用個別保存
                     for i in range(len(states)):
                         n = lengths[i]
@@ -2578,35 +3257,164 @@ class AlphaZeroAgent:
                         import torch as _t
                         pos_w_tensor = _t.tensor([pw], dtype=_t.float32, device=v_logit.device)
                     self.bce_logits_loss_fn = _nn.BCEWithLogitsLoss(pos_weight=pos_w_tensor) if pos_w_tensor is not None else _nn.BCEWithLogitsLoss()
-                value_loss = self.bce_logits_loss_fn(v_logit.unsqueeze(0), v_t.unsqueeze(0))
+                # apply importance-sampling weight (if prioritized sampling was used)
+                try:
+                    uid = sample.get('uid')
+                    iw = float(uid2weight.get(int(uid), 1.0)) if uid2weight is not None else 1.0
+                except Exception:
+                    iw = 1.0
+                value_loss = self.bce_logits_loss_fn(v_logit.unsqueeze(0), v_t.unsqueeze(0)) * float(iw)
                 v_prob = torch.sigmoid(v_logit)
                 entropy = -(probs * log_probs).sum()
                 policy_losses.append(policy_loss)
                 value_losses.append(value_loss)
                 entropies.append(entropy)
+                # hand ヘッド（単体; 可能なら）簡素化: 例外は一括捕捉
+                hand_coef = 0.0
+                try:
+                    hand_coef = float(self.config.get('hand_pred_loss_coef', 0.0) or 0.0)
+                except Exception:
+                    hand_coef = 0.0
+                if hand_coef > 0.0 and hasattr(self.model, 'forward_with_belief'):
+                    hand_logits = None
+                    try:
+                        _, _, hand_logits = self.model.forward_with_belief(sample['state'])
+                    except Exception:
+                        hand_logits = None
+                    if hand_logits is not None:
+                        hl = None
+                        st = sample.get('state') or {}
+                        if isinstance(st, dict):
+                            hl = st.get('hand_labels')
+                        if hl is not None:
+                            try:
+                                import torch.nn as _nn, numpy as _np, torch
+                                D = getattr(self.model, 'belief_dim', None)
+                                hl_arr = _np.asarray(list(hl), dtype=_np.float32)
+                                if D is not None and hl_arr.shape[0] != int(D):
+                                    if hl_arr.shape[0] < int(D):
+                                        pad = _np.zeros(int(D), dtype=_np.float32)
+                                        pad[:hl_arr.shape[0]] = hl_arr
+                                        hl_arr = pad
+                                    else:
+                                        hl_arr = hl_arr[:int(D)]
+                                tgt = torch.tensor(hl_arr, dtype=torch.float32, device=hand_logits.device)
+                                hloss = _nn.BCEWithLogitsLoss(reduction='mean')(hand_logits.float(), tgt)
+                                hand_losses.append(hloss)
+                                try:
+                                    collected_hand_pos_rate.append(float(tgt.mean().detach().cpu().item()))
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                
                 valid += 1
                 collected_pi.append(pi_t.detach())
                 collected_model.append(probs.detach())
                 collected_v_pred.append(v_prob.detach())
                 collected_v_t.append(v_t.detach())
+                try:
+                    uid = sample.get('uid')
+                    if uid is not None:
+                        used_uids.append(int(uid))
+                except Exception:
+                    pass
 
         if valid == 0:
             return {"loss": None, "reason": "no_valid_samples"}
 
         policy_loss_mean = torch.stack(policy_losses).mean()
         value_loss_mean = torch.stack(value_losses).mean()
+        hand_loss_mean = (torch.stack(hand_losses).mean() if hand_losses else None)
         entropy_mean = torch.stack(entropies).mean()
         total_loss = (self.policy_loss_coef * policy_loss_mean +
                       self.value_loss_coef * value_loss_mean -
                       self.entropy_coef * entropy_mean)
-        self._optimizer.zero_grad()
-        total_loss.backward()
-        if self.grad_clip and self.grad_clip > 0:
+        try:
+            hand_coef = float(self.config.get('hand_pred_loss_coef', 0.0) or 0.0)
+        except Exception:
+            hand_coef = 0.0
+        if hand_coef > 0.0 and hand_loss_mean is not None:
+            total_loss = total_loss + hand_coef * hand_loss_mean
+        # --- Mixed precision training (GradScaler) ---
+        try:
             import torch as _t
-            _t.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+        except Exception:
+            _t = None
+
+        # decide whether to use AMP: require CUDA device on the model
+        _use_amp = False
+        try:
+            _dev = getattr(self.model, 'device', None)
+            _use_amp = bool(getattr(_dev, 'type', None) == 'cuda') and (_t is not None and _t.cuda.is_available())
+        except Exception:
+            _use_amp = False
+
+        # delayed GradScaler init (store on agent)
+        if _use_amp:
+            try:
+                if not hasattr(self, '_amp_scaler') or self._amp_scaler is None:
+                    self._amp_scaler = _t.cuda.amp.GradScaler()
+            except Exception:
+                # fallback to no AMP
+                try:
+                    self._amp_scaler = None
+                except Exception:
+                    pass
+
+        self._optimizer.zero_grad()
         did_update = False
-        self._optimizer.step()
-        did_update = True
+        if _use_amp and getattr(self, '_amp_scaler', None) is not None:
+            try:
+                # scale the loss, backward, then unscale for clipping
+                self._amp_scaler.scale(total_loss).backward()
+                try:
+                    # unscale before clip
+                    self._amp_scaler.unscale_(self._optimizer)
+                except Exception:
+                    pass
+                if self.grad_clip and self.grad_clip > 0:
+                    try:
+                        _t.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    except Exception:
+                        pass
+                try:
+                    self._amp_scaler.step(self._optimizer)
+                    self._amp_scaler.update()
+                    did_update = True
+                except Exception:
+                    # If step failed (e.g. inf/overflow), update scaler and skip this step
+                    try:
+                        self._amp_scaler.update()
+                    except Exception:
+                        pass
+                    did_update = False
+            except Exception:
+                # fallback to FP32 path on unexpected errors
+                try:
+                    total_loss.backward()
+                    if self.grad_clip and self.grad_clip > 0:
+                        try:
+                            _t.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                        except Exception:
+                            pass
+                    self._optimizer.step()
+                    did_update = True
+                except Exception:
+                    did_update = False
+        else:
+            # FP32 update path
+            try:
+                total_loss.backward()
+                if self.grad_clip and self.grad_clip > 0:
+                    try:
+                        _t.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    except Exception:
+                        pass
+                self._optimizer.step()
+                did_update = True
+            except Exception:
+                did_update = False
         # Scheduler step (warmup+cosine) — optimizer 実ステップがあった時のみ実行
         try:
             if did_update:
@@ -2659,11 +3467,60 @@ class AlphaZeroAgent:
             "cum_pos_rate": (self.total_positive / self.total_value_samples) if self.total_value_samples > 0 else None,
             "tt_hit_rate": (self.tt_hits / max(1, (self.tt_hits + self.tt_misses))) if (self.tt_hits + self.tt_misses) > 0 else None,
         }
+        # 追加: hand ヘッド関連メトリクス
+        try:
+            if hand_coef > 0.0:
+                metrics["hand_pred_loss"] = (float(hand_loss_mean.item()) if hand_loss_mean is not None else None)
+                # ラベルの正例率（監視用）
+                if collected_hand_pos_rate:
+                    # None を除外して平均
+                    vals = [v for v in collected_hand_pos_rate if v is not None]
+                    metrics["hand_label_pos_rate"] = (sum(vals) / len(vals)) if vals else None
+                else:
+                    metrics["hand_label_pos_rate"] = None
+        except Exception:
+            pass
         # pos_rate 警告
         try:
             warn_th = float(self.config.get('pos_rate_warn_threshold', 0.02))
             if pos_rate is not None and pos_rate < warn_th:
                 print(f"[WARN] value positive sample rate low ({pos_rate:.2%}) < {warn_th:.2%}")
+        except Exception:
+            pass
+
+# --- Update priorities for prioritized replay (conservative: abs(pred-target) + eps) ---
+        try:
+            if bool(self.config.get('prioritized_replay', False)) and hasattr(self.replay_buffer, 'update_priorities') and used_uids:
+                uid_to_p = {}
+                eps = float(self.config.get('prioritized_replay_eps', 1e-6) or 1e-6)
+                for i, uid in enumerate(used_uids):
+                    try:
+                        pred = collected_v_pred[i]
+                        targ = collected_v_t[i]
+                        # convert tensors to float safely
+                        try:
+                            pred_f = float(pred.detach().cpu().item()) if hasattr(pred, 'detach') else float(pred)
+                        except Exception:
+                            try:
+                                pred_f = float(pred.item())
+                            except Exception:
+                                pred_f = float(pred)
+                        try:
+                            targ_f = float(targ.detach().cpu().item()) if hasattr(targ, 'detach') else float(targ)
+                        except Exception:
+                            try:
+                                targ_f = float(targ.item())
+                            except Exception:
+                                targ_f = float(targ)
+                        p = abs(pred_f - targ_f) + eps
+                        uid_to_p[int(uid)] = float(p)
+                    except Exception:
+                        continue
+                if uid_to_p:
+                    try:
+                        self.replay_buffer.update_priorities(uid_to_p)
+                    except Exception:
+                        pass
         except Exception:
             pass
         if self.logger:
@@ -2698,12 +3555,14 @@ class AlphaZeroAgent:
                             f"loss={metrics.get('loss'):.4f}" if metrics.get('loss') is not None else None,
                             f"pl={metrics.get('policy_loss'):.4f}" if metrics.get('policy_loss') is not None else None,
                             f"vl={metrics.get('value_loss'):.4f}" if metrics.get('value_loss') is not None else None,
+                            f"hand={metrics.get('hand_pred_loss'):.4f}" if metrics.get('hand_pred_loss') is not None else None,
                             f"ent={metrics.get('entropy'):.3f}" if metrics.get('entropy') is not None else None,
                             f"kl={metrics.get('policy_kl'):.4f}" if metrics.get('policy_kl') is not None else None,
                             f"top1={metrics.get('policy_top1_match'):.3f}" if metrics.get('policy_top1_match') is not None else None,
                             f"v_acc={metrics.get('value_acc'):.3f}" if metrics.get('value_acc') is not None else None,
                             f"v_brier={metrics.get('value_brier'):.4f}" if metrics.get('value_brier') is not None else None,
                             f"pos={metrics.get('pos_rate'):.3f}" if metrics.get('pos_rate') is not None else None,
+                            f"hand_pos={metrics.get('hand_label_pos_rate'):.3f}" if metrics.get('hand_label_pos_rate') is not None else None,
                             f"cum_pos={metrics.get('cum_pos_rate'):.3f}" if metrics.get('cum_pos_rate') is not None else None,
                             f"samples={metrics.get('samples')}" if metrics.get('samples') is not None else None,
                         ]
@@ -2712,6 +3571,154 @@ class AlphaZeroAgent:
             except Exception:
                 pass
         return metrics
+
+    # ------------------ Measurement helpers ------------------
+    def measure_select_action_time(self, env_or_obs, iterations: int = 10, warmup: int = 2, training: bool = True, **kwargs):
+        """エージェントの select_action を複数回呼んで所要時間統計を返すユーティリティ。
+
+        戻り値: dict(count, total_s, mean_s, std_s, min_s, max_s)
+        注意: MCTS を含むため実行は重い。必要に応じて iterations を調整してください。
+        """
+        import time as _time
+        try:
+            import statistics as _stats
+        except Exception:
+            _stats = None
+
+        # warmup
+        for _ in range(max(0, int(warmup or 0))):
+            try:
+                self.select_action(env_or_obs, training=training, **kwargs)
+            except Exception:
+                # warmup 中の例外は無視して続行
+                pass
+
+        times = []
+        for _ in range(max(0, int(iterations or 0))):
+            t0 = _time.time()
+            try:
+                self.select_action(env_or_obs, training=training, **kwargs)
+            except Exception:
+                # 計測中の例外は時間計測は継続しつつ記録しない
+                continue
+            times.append(_time.time() - t0)
+
+        if not times:
+            return {"count": 0, "total_s": 0.0, "mean_s": None, "std_s": None, "min_s": None, "max_s": None}
+
+        total = sum(times)
+        mean = total / len(times)
+        mn = min(times)
+        mx = max(times)
+        std = None
+        if _stats is not None and len(times) > 1:
+            try:
+                std = float(_stats.pstdev(times))
+            except Exception:
+                try:
+                    std = float(_stats.stdev(times))
+                except Exception:
+                    std = None
+
+        out = {
+            "count": len(times),
+            "total_s": float(total),
+            "mean_s": float(mean),
+            "std_s": float(std) if std is not None else None,
+            "min_s": float(mn),
+            "max_s": float(mx),
+        }
+        # Log to events.log (use agent.logger if available)
+        try:
+            line = (f"[MEASURE][select_action] pid={self.player_id} count={out['count']} "
+                    f"total_s={out['total_s']:.6f} mean_s={out['mean_s']:.6f} std_s={out['std_s'] if out['std_s'] is not None else 'n/a'} "
+                    f"min_s={out['min_s']:.6f} max_s={out['max_s']:.6f}")
+            if self.logger and hasattr(self.logger, 'log_text'):
+                try:
+                    self.logger.log_text(line, also_print=False)
+                except Exception:
+                    pass
+            else:
+                try:
+                    import os, datetime
+                    log_dir = self.config.get('log_dir', 'logs')
+                    os.makedirs(log_dir, exist_ok=True)
+                    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    with open(os.path.join(log_dir, 'events.log'), 'a', encoding='utf-8') as f:
+                        f.write(f"[{ts}] {line}\n")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return out
+
+    def measure_train_step_time(self, batch_size: int = 64, iterations: int = 10, warmup: int = 2):
+        """train_step を複数回実行して所要時間統計を返すユーティリティ。
+
+        事前にデータが無い場合は reason を含む辞書を返します。
+        戻り値: dict(count, total_s, mean_s, std_s, min_s, max_s, last_result)
+        """
+        import time as _time
+        try:
+            import statistics as _stats
+        except Exception:
+            _stats = None
+
+        # 簡易チェック: データやモデルが無い場合は早期リターン
+        try:
+            check = self.train_step(batch_size=batch_size)
+            if isinstance(check, dict) and check.get('reason') is not None:
+                return {"count": 0, "total_s": 0.0, "mean_s": None, "std_s": None, "min_s": None, "max_s": None, "reason": check.get('reason')}
+        except Exception:
+            # 例外は無視して計測を試みる
+            pass
+
+        # warmup
+        for _ in range(max(0, int(warmup or 0))):
+            try:
+                self.train_step(batch_size=batch_size)
+            except Exception:
+                pass
+
+        times = []
+        last_result = None
+        for _ in range(max(0, int(iterations or 0))):
+            t0 = _time.time()
+            try:
+                last_result = self.train_step(batch_size=batch_size)
+            except Exception:
+                # 実行エラーが起きても計測は継続
+                last_result = {"loss": None, "reason": "exception"}
+            times.append(_time.time() - t0)
+
+        if not times:
+            return {"count": 0, "total_s": 0.0, "mean_s": None, "std_s": None, "min_s": None, "max_s": None, "last_result": last_result}
+
+        total = sum(times)
+        mean = total / len(times)
+        mn = min(times)
+        mx = max(times)
+        std = None
+        if _stats is not None and len(times) > 1:
+            try:
+                std = float(_stats.pstdev(times))
+            except Exception:
+                try:
+                    std = float(_stats.stdev(times))
+                except Exception:
+                    std = None
+
+        out = {
+            "count": len(times),
+            "total_s": float(total),
+            "mean_s": float(mean),
+            "std_s": float(std) if std is not None else None,
+            "min_s": float(mn),
+            "max_s": float(mx),
+            "last_result": last_result,
+        }
+        # 計測ログ出力はユーザ要望により無効化（結果のみ返す）
+        return out
 
     def validate_step(self, batch_size: Optional[int] = None):
         """検証用: 検証splitのサンプルで損失を計算して返す（勾配・更新なし）。
@@ -2763,6 +3770,12 @@ class AlphaZeroAgent:
         try:
             if self.config.get('reset_det_pool_each_game', True):
                 self.shutdown_det_pool()
+        except Exception:
+            pass
+        # per-episode perf counters
+        try:
+            self._perf_infer_ms_accum = 0.0
+            self._perf_infer_calls = 0
         except Exception:
             pass
 
