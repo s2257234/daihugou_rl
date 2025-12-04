@@ -20,11 +20,11 @@ ALPHA_ZERO_CONFIG = {
     # ---------------------------
     "buffer_size": 250000,            # リプレイバッファ最大サイズ 
     "batch_size": 256,               # 学習バッチサイズ (train_step 実装時に利用)
-    "lr": 2e-4,                      # 学習率　初期値0.0001
-    "weight_decay": 7e-5,          # L2 正則化　初期値1e-4
-    "value_loss_coef": 1.2,          # 価値損失係数
+    "lr": 1e-4,                      # 学習率　初期値0.0001
+    "weight_decay": 1e-3,          # L2 正則化　初期値1e-4
+    "value_loss_coef": 1.0,          # 価値損失係数
     "policy_loss_coef": 1.0,         # 方策損失係数
-    "entropy_coef": 5e-3,             # エントロピー正則化
+    "entropy_coef": 1e-3,             # エントロピー正則化
     "epochs_per_update": 1,          # 1回の train 呼び出しで何エポック回すか
 
     # --- 学習率スケジューラ ---
@@ -32,7 +32,7 @@ ALPHA_ZERO_CONFIG = {
     # none | warmup_cosine
     "lr_scheduler": "warmup_cosine",
     "lr_warmup_steps": 1000,
-    "lr_min": 3e-6,
+    "lr_min": 5e-5,
     # ウォームアップ後、ここまでの更新ステップで lr_min へ到達
     "lr_cosine_T_max_updates": 500000, #目標ステップ数に応じて変更する
     # 再開直後に一度だけウォームアップをやり直す（プロセス内一回限り）
@@ -47,7 +47,7 @@ ALPHA_ZERO_CONFIG = {
     # 学習時: 真の相手手札を one-hot (複数カード保持は複数1) ベクトル化し BCE 損失で学習
     "enable_hand_prediction_head": True,
     # 手札予測損失の係数 (総損失へ hand_pred_loss_coef * BCE を加算)。0 で無効化
-    "hand_pred_loss_coef": 0.3,
+    "hand_pred_loss_coef": 1.0,
     # デターミニゼーション時に予測確率を用いて割当サンプリングするか (False なら従来ランダム)
     "hand_pred_use_in_determinization": True,
     # リモート推論結果(hand_probs)のキャッシュ有効TTL(秒)。古い予測は無視してローカル再計算。
@@ -58,29 +58,29 @@ ALPHA_ZERO_CONFIG = {
     # MCTS / 探索
     # ---------------------------
     # MCTS シミュレーション回数 (96で速度重視、tau=0.3の強力シャープ化でカバー) 
-    "num_simulations": 96,       # 1手あたりのシミュレーション回数 (速度とバランス)　初期値96
+    "num_simulations": 128,       # 1手あたりのシミュレーション回数 (速度とバランス)　初期値96
     "puct_c": 1.3,                  # PUCT 探索定数 (1.4→1.2で探索を抑制、訪問集中を促進) 初期値1.0
-    "dirichlet_alpha": 0.3,          # Dirichlet ノイズ α (ルート) 初期値0.3
-    "dirichlet_epsilon": 0.2,       # ノイズ混合率 ε (0.15→0.10でノイズを削減、評価に基づく集中) 
+    "dirichlet_alpha": 0.35,          # Dirichlet ノイズ α (ルート) 初期値0.3
+    "dirichlet_epsilon": 0.30,       # ノイズ混合率 ε (0.15→0.10でノイズを削減、評価に基づく集中) 
     "temperature": 1.0,              # 方策サンプリング温度 (序盤高く終盤低くする調整可) 初期値1.0
     "temperature_decay_moves": 20,   # この手数以降は温度を 0 (argmax) にする等のスケジューリング用目安
     # 温度スケジュール（序盤高温→後半低温、自己対戦エピソード進行で高温手数を短縮）
     # デフォルト: 最初の10手は τ=0.6、それ以降は τ=0.1。エピソードが進むと高温手数を段階的に短縮（最低2手を維持）
     "temp_high_value": 1.0,            # 高温 τ (0.8→0.6に下げて過度なランダム性を抑制)
     "temp_low_value": 0.1,              # 低温 τ
-    "temp_high_moves_initial": 10,      # 高温適用の初期手数
+    "temp_high_moves_initial": 16,      # 高温適用の初期手数
     "temp_high_moves_min": 4,           # 高温適用の最低手数
-    "temp_high_moves_decay_every": 500, # 何エピソードごとに高温手数を1手短縮するか
+    "temp_high_moves_decay_every": 1000, # 何エピソードごとに高温手数を1手短縮するか
     # 序盤ランダム化: 指定手数までは完全ランダムに行動 (探索温度の代替オプション)
     "opening_random_enable": True,    # True で有効化
-    "opening_random_moves": 7,          # >0 で有効。例: 3 なら最初の3手をランダム行動
+    "opening_random_moves": 2,          # >0 で有効。例: 3 なら最初の3手をランダム行動
     "opening_random_include_pass": False,  # True なら pass もランダム候補に含める
     # 学習ターゲットπの温度（行動サンプリングとは分離）
     # 行動選択は高温（多様性確保）でも、学習用πは強力にシャープ化してエントロピーを劇的に下げる
     # 0.3でv^(1/0.3)=v^3.33正規化 → 訪問数格差を大幅に強調、低エントロピー教師信号を生成
     "policy_target_tau": 0.4,           # 学習ターゲット用温度 (1.0→0.3で強力シャープ化、高entropy問題に対処)
     # 追加: MCTS 高速化オプション（デフォルト有効化）
-    "mcts_batch_eval_size": 64,      # 葉ノードのバッチ評価サイズ（1で無効同等）
+    "mcts_batch_eval_size": 32,      # 葉ノードのバッチ評価サイズ（1で無効同等）
     "enable_mcts_tt": True,          # トランスポジションテーブル有効化（品質不変で再計算を削減）
     "mcts_tt_capacity": 10000,       # キャッシュ上限を削減（簡易LRUでエビクション）
 
@@ -160,7 +160,7 @@ ALPHA_ZERO_CONFIG = {
     # サンプルが確定(value 付与)したタイミングで一度だけ split を付与します。
     "val_split_ratio": 0.1,
     # 学習更新に対して何回に1回、検証損失を計算するか (0/None で検証無効)
-    "val_eval_every_updates": 500,
+    "val_eval_every_updates": 200,
     # 検証時に使用する最大サンプル数 (過大計算防止)。0/None で全件。
     "val_max_samples": 4096,
     # 検証時のバッチサイズ (未指定で学習バッチと同一)
@@ -196,18 +196,30 @@ ALPHA_ZERO_CONFIG = {
     "checkpoint_path": "checkpoints/policy_value_latest.pt",  # 直近モデル
     # 周期保存: 大量エピソード実行時にエピソード間隔で世代チェックポイントを残す
     # 例) 100000 エピソードで 2000 間隔 -> 50 個保存
-    "checkpoint_interval_episodes": 5000,       # 0 / None なら無効
+    "checkpoint_interval_episodes": 10000,       # 0 / None なら無効
     "keep_previous_model_opponent": True,       # 直前世代モデルを一部プレイヤーに割当てて多様性確保
     "previous_model_mix_players": 2,            # 学習プレイヤー以外から2人を過去モデル化
     "past_model_pool_size": 1,             # メモリ削減: 過去1世代のみ保持
     "opponent_mix_interval_episodes": 500, # 500エピソードごとに再割当
     "replay_path": "replay_buffer.joblib",     # リプレイバッファ保存先
     "strict_lossless": False,        # True なら 圧縮しない
+    # 非並列トレーナーの取り込み制限（全ファイルではなく最新のみ使用）
+    # ingest_max_files: 1以上で最新Nファイルのみ学習対象に選択（None/0で全件）
+    # ingest_pick_newest: Trueなら新しい順（推奨）、Falseなら古い順
+    # ingest_max_samples_per_file: 各joblibから取り込む最大サンプル数（train/val それぞれに適用）。None/0で無制限
+    "ingest_max_files": 40,
+    "ingest_pick_newest": True,
+    "ingest_max_samples_per_file": 5000,
+    "active_file_pool_size": 40,  # メモリ削減: アクティブに監視するファイル数
+    "active_file_refresh_every_updates": 1000,  # 何更新ごとにアクティブファイルリストを更新するか
+    "active_file_pool_refresh_fraction": 0.3,  # プール内の何割を更新するか
+    "active_file_newest_bias": 0.1,  # 新しいファイルを選ぶバイアス (0.0-1.0)
+
     # full_input をリプレイサンプルに保持するか。
-    #   True  : raw full_input をそのまま保持（解析/デバッグ向き）
-    #   False : raw full_input を破棄し、圧縮表現 full_compact のみ保持して学習可能な軽量化を行う
-    #           (従来は両方破棄して学習停止する問題があったため修正済み)
-    "store_full_input": True,
+    #   True/"v7" : raw full_input を保持（解析/デバッグ向き）。文字列は格納フォーマットのメモ用途。
+    #   False     : raw full_input を破棄し、圧縮表現 full_compact のみ保持して学習可能な軽量化を行う
+    #               (従来は両方破棄して学習停止する問題があったため修正済み)
+    "store_full_input": "v7",
 
     # ---------------------------
     # ログ / デバッグ
@@ -238,7 +250,7 @@ ALPHA_ZERO_CONFIG = {
     "measure_forward_time": True,
     "measure_game_time": True,
     # エピソードN件毎にメトリクスをログ出力
-    "measure_log_every_episodes": 30,
+    "measure_log_every_episodes": 100,
     # 平滑化(EMA)係数 (0<alpha<=1, 大きいほど最新値に寄る)
     "measure_ema_alpha": 0.3,
     # ETA 表示調整
@@ -325,6 +337,10 @@ ALPHA_ZERO_CONFIG = {
     # ---------------------------
     # setup() 直後に初期モデル/空リプレイを checkpoint_path へ保存するか
     "initial_checkpoint_on_setup": True,
+    # True にするとチェックポイント保存を完全に無効化する (テスト/評価用途)
+    "disable_checkpoint_saving": False,
+    # True にすると data/ 下への自己対局ファイルや replay 保存を無効化する
+    "disable_data_writes": False,
     # 並行モード train_concurrent で一定秒ごとに events.log へ進捗とバッファ統計を出す間隔 (0/None で無効)
     "concurrent_status_log_sec": 300,
     # 追加ステータスログにメモリスナップショットも含めるか
@@ -385,13 +401,13 @@ ALPHA_ZERO_CONFIG = {
     # 物理メモリ(RAM)に対する RSS 高水位比率。0<high<1。
     "replay_memory_high_ratio": 0.85,
     # 低水位ターゲット比率。削減後はおおむねこの比率以下になるまで削る。
-    "replay_memory_low_ratio": 0.45,
+    "replay_memory_low_ratio": 0.35,
     
     # 親+子RSS合計が15GBを超えたら必ず purge したい要求に合わせ、デフォルトを 15360 MB に設定。
     # 0 のままにしたい場合はユーザ側で override してください。
     # ※ 既存キーを上書きしないため、新たに high_abs_mb_override を用意し trainer 側で優先する実装でも可。
     # ここではシンプルに既存値を直接 15360 に変更する。
-    "replay_memory_high_abs_mb": 4000,   # メモリ削減: 14GB→6GB で発火
+    "replay_memory_high_abs_mb": 5000,   # メモリ削減: 14GB→6GB で発火
     # 低水位を絶対MBで指定したい場合のオプション (0/None で無効)。
     # high_abs_mb 発火時、low_abs_mb > 0 なら ratio計算の代わりに low_abs_mb へ近づくよう target_size を計算。
     "replay_memory_low_abs_mb": 1500,    # メモリ削減: 5GB→3GB
@@ -441,16 +457,6 @@ ALPHA_ZERO_CONFIG = {
     "replay_async_queue_maxsize": 50000,
     # キュー満杯時に古い未処理を1件捨てて新規を入れるか (True) / 新規を捨てるか (False)
     "replay_async_drop_oldest": True,
-
-    # ---------------------------
-    # 満杯トリガのリプレイサイズサイクル
-    # ---------------------------
-    # True で、len(buffer)==maxlen になった瞬間に high<->low を交互に切替
-    # 例: 初期 maxlen=250000 (high)、満杯になったら 100000 (low) に縮小し古い分布を除去、
-    #     その後 low が満杯になったら再び 250000 に拡張して再蓄積フェーズへ。
-    "replay_cycle_on_full_enabled": True,
-    "replay_cycle_on_full_high_size": 250000,
-    "replay_cycle_on_full_low_size": 100000,
     # 緊急全体RSS閾値 (MB)。0/None で無効。超過時は最大RSSワーカー即 graceful 要求 (将来kill拡張余地)。
     "worker_restart_emergency_total_mb": 20000,
     # graceful 再起動でエピソード終了待ちする最大秒数
@@ -495,6 +501,16 @@ ALPHA_ZERO_CONFIG = {
     # True: 保存前に既存ファイルを .bak へコピーし、破損時ロード復旧に利用
     # False: .bak を生成せず単一ファイル運用 (ディスク節約 / ファイル散乱防止)
     "replay_backup_enable": False,
+
+    # ---------------------------
+    # 満杯トリガのリプレイサイズサイクル
+    # ---------------------------
+    # True で、len(buffer)==maxlen になった瞬間に high<->low を交互に切替
+    # 例: 初期 maxlen=250000 (high)、満杯になったら 100000 (low) に縮小し古い分布を除去、
+    #     その後 low が満杯になったら再び 250000 に拡張して再蓄積フェーズへ。
+    "replay_cycle_on_full_enabled": False,
+    "replay_cycle_on_full_high_size": 250000,
+    "replay_cycle_on_full_low_size": 100000,
 }
 
 __all__ = ["ALPHA_ZERO_CONFIG"]

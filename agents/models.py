@@ -71,11 +71,51 @@
 """
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 import warnings
 
 import torch
 import torch.nn as nn
+from torch import autograd
+
+
+class SignalAugmentFunction(autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, x: torch.Tensor, std: float, dims: int = 1) -> torch.Tensor:
+        # ノイズは forward 時のみ乗せる。backward ではノイズを無かったものとして扱う。
+        if std != 0:
+            size = list(x.shape[:dims]) + [1] * (len(x.shape) - dims)
+            noise = torch.randn(size, device=x.device, requires_grad=False) * float(std) + 1.0
+            # ノイズを乗せたテンソルを返すが、勾配はノイズ無視で伝播させる（see backward）
+            return x * noise
+        else:
+            return x
+
+    @staticmethod
+    def backward(ctx: Any, *gs: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[None], Optional[None]]:
+        # 誤差逆伝播時はノイズが無かったものとして扱うため、入力に対する勾配はそのまま返す
+        g_x = gs[0] if len(gs) > 0 else None
+        return g_x, None, None
+
+
+signal_augment = SignalAugmentFunction.apply
+
+
+class SignalAugmentation(nn.Module):
+    def __init__(self, std: float, dims: int = 1) -> None:
+        super().__init__()
+        self.std = float(std)
+        self.dims = int(dims)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training and self.std != 0:
+            return signal_augment(x, float(self.std), int(self.dims))
+        else:
+            return x
+
+    def extra_repr(self) -> str:
+        return 'std={}, dim={}'.format(self.std, self.dims)
+
 
 
 class PolicyValueNet(nn.Module):
@@ -87,7 +127,8 @@ class PolicyValueNet(nn.Module):
                  use_full_features: bool = True,
                  full_feature_dim: Optional[int] = None,
                  enable_hand_prediction_head: bool = True,
-                 context_out_dim: int = 256):
+                 context_out_dim: int = 256,
+                 signal_noise_std: float = 0.2):
         """Policy-Value Net (フル特徴専用)
 
         簡易入力 (hand_size/field_size/turn_onehot) のフォールバックを廃止し、常に
@@ -107,26 +148,45 @@ class PolicyValueNet(nn.Module):
         # ---- Feature partition (v5 layout: no PlayHistory, Belief removed, with OpponentDiscards/PassMatrix) ----
         # Self: 55
         self.self_dim = 55
-        # Context (v5 base): OppSummary 5*(N-1) + Field 22 + FieldCards 53 + Turn N
+        # Context (v6 base): OppSummary 5*(N-1) + Field 22 + FieldCards 53 + Turn N
         base_context_dim = 5 * (num_players - 1) + 22 + 53 + num_players
         # New extensions:
         #   OpponentDiscards: 53*(N-1)
         #   PassMatrix: 13*(N-1)
+        #   RankRemain: 13 (各ランク残枚数の正規化 (4-occ)/4)
+        #   JokerRemain: 1 (ジョーカー残枚数の正規化 (1-occ))
         self.opponent_discards_dim = 53 * (num_players - 1)
         self.pass_matrix_dim = 13 * (num_players - 1)
-        self.context_dim = base_context_dim + self.opponent_discards_dim + self.pass_matrix_dim
-        # Expected full feature dimension (v5): 55 + [5*(N-1) + 22 + 53 + N + 53*(N-1) + 13*(N-1)] = 72N + 59
+        self.rank_remain_dim = 13
+        self.joker_remain_dim = 1
+        self.context_dim = base_context_dim + self.opponent_discards_dim + self.pass_matrix_dim + self.rank_remain_dim + self.joker_remain_dim
+        # Expected full feature dimension (v6):
+        # 55 + [5*(N-1) + 22 + 53 + N + 53*(N-1) + 13*(N-1) + 13 + 1] = 72N + 73
         self.full_feature_dim = int(self.self_dim + self.context_dim)
-        # 互換: 引数の full_feature_dim が与えられ、計算値と異なる場合は警告の上で採用
+        # 先に context_out_dim を確定させておく（旧 ckpt 分岐で利用するため）
+        self.context_out_dim = int(context_out_dim)
+        # Signal augmentation strength: 0.0 disables augmentation
+        self.signal_noise_std = float(signal_noise_std)
+        # Prepare augmentation module (dims=1 for (N, HiddenSize) style tensors)
+        self.signal_augmentation = SignalAugmentation(self.signal_noise_std, dims=1)
+        # 互換: 旧 ckpt などで full_feature_dim が異なる場合は context 部分長を動的再計算
         if full_feature_dim is not None and int(full_feature_dim) != int(self.full_feature_dim):
-            # 最終防衛線として、明示指定を優先して各セクションの配分は既定値のままにし、パディング/切り詰めで吸収する
-            # ここでは metadata 用に保持のみ行う
-            self.full_feature_dim = int(full_feature_dim)
+            legacy_dim = int(full_feature_dim)
+            new_context_dim = legacy_dim - self.self_dim
+            if new_context_dim <= 0:
+                raise ValueError(f"invalid full_feature_dim {legacy_dim}: must be > self_dim({self.self_dim})")
+            self.full_feature_dim = legacy_dim
+            self.context_dim = new_context_dim
+            # context_encoder を再構築
+            self.context_encoder = nn.Sequential(
+                nn.Linear(self.context_dim, self.context_out_dim),
+                nn.ReLU(),
+            )
+            # legacy ckpt branch: no runtime prints here
 
         # ---- Small encoders for each component ----
         # 出力次元: Self=32, Context=可変 (デフォルト256)。旧 ckpt 互換のため可変化。
         self.self_out_dim = 32
-        self.context_out_dim = int(context_out_dim)
         self.self_encoder = nn.Sequential(
             nn.Linear(self.self_dim, self.self_out_dim),
             nn.ReLU(),
@@ -140,11 +200,35 @@ class PolicyValueNet(nn.Module):
         h = hidden_size
         self.hidden_size = h  # メタ保存用
         self.backbone_in_dim = self.self_out_dim + self.context_out_dim  # encoders' output dims (self + context)
+        # ---- Residual Blocks (MLP ResNet style) ----
+        # 要望: backbone 内に ResBlock x2 (Norm→ReLU→Linear→Norm→ReLU→Linear + Skip)
+        # 互換のため旧重み (backbone.0, backbone.2) は load() 時に投影へ移植。
+
+        class ResBlock(nn.Module):
+            def __init__(self, dim: int, aug: Optional[nn.Module] = None):
+                super().__init__()
+                self.norm1 = nn.LayerNorm(dim)
+                self.lin1 = nn.Linear(dim, dim)
+                self.norm2 = nn.LayerNorm(dim)
+                self.lin2 = nn.Linear(dim, dim)
+                self.aug = aug
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                residual = x
+                out = self.norm1(x)
+                out = torch.relu(out)
+                out = self.lin1(out)
+                out = self.norm2(out)
+                out = torch.relu(out)
+                out = self.lin2(out)
+                # Apply signal augmentation (only during training)
+                out = self.aug(out)
+                return residual + out
+
+        self.backbone_proj = nn.Linear(self.backbone_in_dim, h)
         self.backbone = nn.Sequential(
-            nn.Linear(self.backbone_in_dim, h),
-            nn.ReLU(),
-            nn.Linear(h, h),
-            nn.ReLU(),
+            ResBlock(h, self.signal_augmentation),
+            ResBlock(h, self.signal_augmentation),
         )
         # Policy head: 旧 Linear(h->max_policy_size) から MLP 化 (Linear->ReLU->Linear)
         # 旧 ckpt 互換: load() 側で 'policy_head.weight' が存在する場合は最終層へ移植
@@ -216,10 +300,14 @@ class PolicyValueNet(nn.Module):
                         vec = padded
                     else:
                         vec = vec[:expected_dim]
-                    if not hasattr(self, '_warned_full_dim_mismatch'):
-                        print(f"[WARN] full_input dim mismatch (got={len(seq_like)}, expected={expected_dim}) -> auto pad/truncate")
-                        self._warned_full_dim_mismatch = True  # type: ignore[attr-defined]
-                return torch.tensor(vec, dtype=torch.float32, device=self.device)
+                # Ensure tensor is created on the same device as model parameters
+                try:
+                    dev = getattr(self, 'device', None)
+                    if dev is None:
+                        dev = next(self.parameters()).device
+                except Exception:
+                    dev = torch.device('cpu')
+                return torch.tensor(vec, dtype=torch.float32, device=dev)
 
             if isinstance(arr, (list, tuple)):
                 return _finalize_vec(arr)
@@ -238,16 +326,19 @@ class PolicyValueNet(nn.Module):
                         t = padded
                     else:
                         t = t[:expected_dim]
-                    if not hasattr(self, '_warned_full_dim_mismatch'):
-                        print(f"[WARN] full_input tensor dim mismatch (got={t.numel()}, expected={expected_dim}) -> auto pad/truncate")
-                        self._warned_full_dim_mismatch = True  # type: ignore[attr-defined]
                 return t
 
         raise ValueError("state に full_input / full_compact が存在しません (簡易入力廃止)。")
 
     def _ensure_2d(self, x: torch.Tensor) -> torch.Tensor:
         """1D ベクトルを (1, D) に整形し、デバイス/型を合わせる補助。"""
-        x = x.to(self.device).float()
+        try:
+            dev = getattr(self, 'device', None)
+            if dev is None:
+                dev = next(self.parameters()).device
+        except Exception:
+            dev = torch.device('cpu')
+        x = x.to(dev).float()
         if x.dim() == 1:
             x = x.unsqueeze(0)
         return x
@@ -258,7 +349,13 @@ class PolicyValueNet(nn.Module):
         if cur == dim:
             return x
         if cur < dim:
-            pad = torch.zeros(x.size(0), dim - cur, device=self.device, dtype=x.dtype)
+            try:
+                dev = getattr(self, 'device', None)
+                if dev is None:
+                    dev = next(self.parameters()).device
+            except Exception:
+                dev = torch.device('cpu')
+            pad = torch.zeros(x.size(0), dim - cur, device=dev, dtype=x.dtype)
             return torch.cat([x, pad], dim=1)
         # truncate
         return x[:, :dim]
@@ -271,15 +368,32 @@ class PolicyValueNet(nn.Module):
         """
         x = self._ensure_2d(x)
         x = self._pad_or_truncate(x, self.full_feature_dim)
+        # Ensure input tensor is on the same device as model parameters to avoid cpu/cuda mix
+        try:
+            dev = getattr(self, 'device', None)
+            if dev is None:
+                dev = next(self.parameters()).device
+        except Exception:
+            dev = torch.device('cpu')
+        x = x.to(dev)
         parts = torch.split(x, [self.self_dim, self.context_dim], dim=1)
         if len(parts) != 2:
             h = self.backbone(x.new_zeros(x.size(0), self.backbone_in_dim))
             return self.policy_head(h), self.value_head(h)
         self_feat, context_feat = parts
+        # Defensive: ensure each part is on model device
+        # ensure parts are on model device
+        try:
+            self_feat = self_feat.to(dev)
+            context_feat = context_feat.to(dev)
+        except Exception:
+            # best-effort move; if it fails, let subsequent ops raise
+            pass
         self_emb = self.self_encoder(self_feat)
         context_emb = self.context_encoder(context_feat)
         combined = torch.cat([self_emb, context_emb], dim=1)
-        h = self.backbone(combined)
+        h0 = self.backbone_proj(combined)
+        h = self.backbone(h0)
         policy_logits = self.policy_head(h)
         value_vec = self.value_head(h)
         return policy_logits, value_vec
@@ -332,7 +446,8 @@ class PolicyValueNet(nn.Module):
             self_emb = self.self_encoder(self_feat)
             context_emb = self.context_encoder(context_feat)
             combined = torch.cat([self_emb, context_emb], dim=1)
-            h = self.backbone(combined)
+            h0 = self.backbone_proj(combined)
+            h = self.backbone(h0)
             policy_logits = self.policy_head(h)
             value_vec = self.value_head(h)
             if self.enable_hand_prediction_head and self.hand_head is not None:
@@ -434,6 +549,22 @@ class PolicyValueNet(nn.Module):
             from agents.config import ALPHA_ZERO_CONFIG as _CFG
         except Exception:
             _CFG = {}
+        # Respect config override: skip actual disk writes when disabled
+        try:
+            if bool(_CFG.get("disable_checkpoint_saving", False)):
+                try:
+                    # best-effort event log entry for visibility
+                    import datetime, os
+                    log_dir = _CFG.get("log_dir", "logs")
+                    os.makedirs(log_dir, exist_ok=True)
+                    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    with open(os.path.join(log_dir, 'events.log'), 'a', encoding='utf-8') as f:
+                        f.write(f"[{ts}] [save] checkpoint saving disabled by config -> {path}\n")
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
         enable_async = bool(_CFG.get("enable_async_io", False))
         # 原子的保存 (tmp -> replace) の際は同期保存が必要。
         # path が .tmp で終わる場合や force_sync=True の場合は async を無効化。
@@ -523,7 +654,7 @@ class PolicyValueNet(nn.Module):
         except Exception:
             pass
         try:
-            model.load_state_dict(state_dict, strict=False)  # 追加ヘッド後互換
+            model.load_state_dict(state_dict, strict=True)  # 追加ヘッド後互換
         except TypeError:
             model.load_state_dict(state_dict)
         # map_location を指定していた場合はモデル本体をそのデバイスへ移動し device 属性を同期
