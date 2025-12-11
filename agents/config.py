@@ -212,8 +212,25 @@ ALPHA_ZERO_CONFIG = {
     "ingest_max_samples_per_file": 5000,
     "active_file_pool_size": 40,  # メモリ削減: アクティブに監視するファイル数
     "active_file_refresh_every_updates": 1000,  # 何更新ごとにアクティブファイルリストを更新するか
-    "active_file_pool_refresh_fraction": 0.3,  # プール内の何割を更新するか
+    "active_file_pool_refresh_fraction": 0.2,  # プール内の何割を更新するか
     "active_file_newest_bias": 0.1,  # 新しいファイルを選ぶバイアス (0.0-1.0)
+    # resume_defer_preload有効時の初期ロードファイル数（デフォルトはingest_max_filesと同じ）
+    "resume_initial_load_files": None,  # None時はingest_max_filesを使用
+    
+    # 動的サンプルサイジング: total_updates の累乗に基づいてサンプル数を調整
+    # enable_dynamic_sample_sizing が True の場合、以下の式でサンプル数を計算:
+    #   target_samples = dynamic_sample_base * (total_updates ** dynamic_sample_exponent)
+    # ファイル数とサンプル数を両方動的に調整
+    "enable_dynamic_sample_sizing": True,
+    "dynamic_sample_exponent": 0.75,  # total_updates の指数（0.75乗）
+    "dynamic_sample_base": 1.0,  # 基準係数（調整用）
+    "dynamic_sample_min_per_file": 500,  # ファイルあたりの最小サンプル数
+    "dynamic_sample_max_per_file": 2500,  # ファイルあたりの最大サンプル数
+    # ファイル数の動的調整
+    "enable_dynamic_file_count": True,  # ファイル数も動的に調整
+    "dynamic_samples_per_file_target": 2000,  # 1ファイルあたりの目標サンプル数
+    "dynamic_min_files": 5,  # 最小ファイル数
+    "dynamic_max_files": 150,  # 最大ファイル数
 
     # full_input をリプレイサンプルに保持するか。
     #   True/"v7" : raw full_input を保持（解析/デバッグ向き）。文字列は格納フォーマットのメモ用途。
