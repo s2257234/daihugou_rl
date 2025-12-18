@@ -19,7 +19,7 @@ def atomic_write_joblib(obj: Any, path: str, compress: int = 3) -> None:
 def list_shards(dir_path: str, ext: str) -> List[str]:
     if not os.path.isdir(dir_path):
         return []
-    files = [os.path.join(dir_path, f) for f in os.listdir(dir_path) if f.endswith(ext)]
+    files = [os.path.join(dir_path, f) for f in os.listdir(dir_path) if f.endswith(ext) and '.tmp.' not in f]
     # sort by mtime then name for stability
     files.sort(key=lambda p: (os.path.getmtime(p), p))
     return files

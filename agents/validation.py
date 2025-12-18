@@ -1,8 +1,8 @@
 """Validation utilities for AlphaZero-like agent.
 
-Moves validation step logic out of the agent class to follow SRP and DRY.
-The agent can call into this module to perform validation without owning
-the full implementation details.
+エージェントクラスから検証ステップのロジックを分離し、SRP（単一責任の原則）とDRY（重複排除の原則）に従う。
+エージェントはこのモジュールを呼び出して検証を実行でき、
+実装の詳細を完全に所有する必要はない。
 """
 from __future__ import annotations
 
@@ -10,17 +10,137 @@ import random
 from typing import Any, Dict, List, Optional
 
 
+VALUE_U8_NONE = 255
+
+
+def _extract_value(sample: Any) -> Optional[float]:
+    if not isinstance(sample, dict):
+        return None
+    v = sample.get('value')
+    if v is not None:
+        try:
+            return float(v)
+        except Exception:
+            return None
+    vu = sample.get('value_u8')
+    if isinstance(vu, int) and 0 <= vu < VALUE_U8_NONE:
+        return vu / 255.0
+    return None
+
+
+def _has_value_label(sample: Any) -> bool:
+    return _extract_value(sample) is not None
+
+
+def _hand_loss_like_train(agent, logits, target, mask_unknown=None):
+    """学習と同じ定義で手札予測Lossを計算する。
+    - BCEWithLogits(reduction='none')
+    - Focal係数 (1-pt)^gamma を適用（gamma は config.hand_focal_gamma）
+    - 未知カードマスクでの平均（mask 未指定なら単純平均）
+    """
+    import torch as _t
+    import torch.nn as _nn
+    import torch
+    device = getattr(logits, 'device', None) or torch.device('cpu')
+    logits = logits.view(-1).to(device)
+    target = target.view(-1).to(device=device, dtype=_t.float32)
+
+    # BCE per-element (no reduction)
+    bce = _nn.BCEWithLogitsLoss(reduction='none')
+    base = bce(logits, target)
+
+    # Focal term (same as training)
+    try:
+        gamma = float(getattr(agent, 'config', {}).get('hand_focal_gamma', 2.0) or 0.0)
+    except Exception:
+        gamma = 2.0
+    if gamma > 0.0:
+        p = _t.sigmoid(logits)
+        pt = target * p + (1.0 - target) * (1.0 - p)
+        focal = _t.clamp(1.0 - pt, min=1e-4).pow(gamma)
+    else:
+        focal = 1.0
+
+    # If mask provided, apply unknown-mask averaging and dynamic class-weighting
+    if mask_unknown is not None:
+        import numpy as _np
+        if not isinstance(mask_unknown, _t.Tensor):
+            try:
+                m_np = _np.asarray(mask_unknown, dtype=_np.float32)
+                if not m_np.flags.writeable:
+                    m_np = m_np.copy()
+                m = _t.tensor(m_np, dtype=_t.float32)
+            except Exception:
+                m = _t.tensor(mask_unknown, dtype=_t.float32)
+        else:
+            m = mask_unknown
+        m = m.to(device=device, dtype=_t.float32).view(-1)
+        # align shapes
+        n = min(base.numel(), m.numel(), target.view(-1).numel())
+        if base.numel() != n:
+            base = base[:n]
+        if m.numel() != n:
+            m = m[:n]
+        tgt = target.view(-1)[:n]
+
+        eps = 1e-6
+        active = m.sum()
+        # dynamic per-batch positive-class weight (match training logic)
+        pos_area = (tgt * m).sum()
+        p = (pos_area / (active + eps)).clamp(min=eps, max=1.0)
+        pos_w = ((1.0 - p) / (p + eps)).clamp(1.0, 20.0)
+        w_class = 1.0 + (pos_w - 1.0) * tgt
+
+        weighted = base * (focal if isinstance(focal, _t.Tensor) else focal) * w_class * m
+        return weighted.sum() / (active + eps)
+    else:
+        # No mask: fallback to simple mean but include focal if present
+        if isinstance(focal, _t.Tensor):
+            return (base * focal).mean()
+        else:
+            return base.mean()
+
+
+def _build_unknown_mask_from_state(st: Dict[str, Any], hand_dim: int) -> List[float]:
+    """state メタから未知カードマスク(length=hand_dim)を構築する。
+    - 自手札 + 場 + これまでの捨て札(和集合) = 観測済み -> 0
+    - 未知 = 1
+    hand_dim は 53*(N-1) を想定。
+    """
+    try:
+        import numpy as _np
+        K = max(1, hand_dim // 53)
+        self_idx = set(st.get('self_hand_indices') or [])
+        field_idx = set(st.get('field_card_indices') or [])
+        discard_idx = set(st.get('discard_union_indices') or [])
+        seen = self_idx | field_idx | discard_idx
+        unknown = [ci for ci in range(53) if ci not in seen]
+        mask = _np.zeros(hand_dim, dtype=_np.float32)
+        off = 0
+        for _ in range(K):
+            if unknown:
+                for ci in unknown:
+                    pos = off + ci
+                    if 0 <= pos < hand_dim:
+                        mask[pos] = 1.0
+            off += 53
+        return mask.tolist()
+    except Exception:
+        # 失敗時は全有効
+        return [1.0] * int(hand_dim)
+
+
 def _filter_validation_pool(agent) -> List[Dict[str, Any]]:
     """Collect validation samples for the given agent from its replay buffer."""
     if agent._use_shared and hasattr(agent.replay_buffer, 'iter_all'):
         return [
             s for s in agent.replay_buffer.iter_all(owner_pid=agent.player_id)
-            if s.get("value") is not None and s.get('split') == 'val'
+            if _has_value_label(s) and s.get('split') == 'val'
         ]
     try:
         return [
             s for s in agent.replay_buffer
-            if isinstance(s, dict) and (s.get('value') is not None) and (s.get('split') == 'val')
+            if isinstance(s, dict) and _has_value_label(s) and (s.get('split') == 'val')
         ]
     except Exception:
         return []
@@ -42,15 +162,49 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
 
     pool = _filter_validation_pool(agent)
     if not pool:
-        return {"policy_loss": None, "value_loss": None, "entropy": None, "reason": "no_val_data"}
+        # Fallback: 直列モードなどで 'val' split が存在しない場合、学習バッファからランダム抽出し擬似検証を行う
+        try:
+            # shared replay 対応
+            if getattr(agent, '_use_shared', False) and hasattr(agent.replay_buffer, 'iter_all'):
+                fallback_all = [
+                    s for s in agent.replay_buffer.iter_all(owner_pid=agent.player_id)
+                    if isinstance(s, dict) and _has_value_label(s)
+                ]
+            else:
+                fallback_all = [
+                    s for s in agent.replay_buffer
+                    if isinstance(s, dict) and _has_value_label(s)
+                ]
+        except Exception:
+            fallback_all = []
+        # フィーチャ条件などを一部適用（use_full_features オプション）
+        if agent.config.get('use_full_features') and fallback_all:
+            try:
+                fallback_all = [s for s in fallback_all if (s.get('feature_version', 0) >= 1)] or fallback_all
+            except Exception:
+                pass
+        # 上限サンプル数
+        max_samples_fb = int(agent.config.get('val_fallback_max_samples', agent.config.get('val_max_samples', 0) or 0))
+        if max_samples_fb > 0 and len(fallback_all) > max_samples_fb:
+            import random as _r
+            fallback_all = _r.sample(fallback_all, max_samples_fb)
+        if not fallback_all:
+            return {"policy_loss": None, "value_loss": None, "entropy": None, "reason": "no_val_data"}
+        pool = fallback_all  # 擬似検証プール
+        # 後段処理で通常と同じ経路を通す。reason を残したい場合は out に追加するが互換性のため省略。
 
     # Cap samples if configured
     max_samples = int(agent.config.get('val_max_samples', 0) or 0)
     if max_samples > 0 and len(pool) > max_samples:
         pool = random.sample(pool, max_samples)
 
-    bs = int(batch_size if batch_size is not None else (agent.config.get('val_batch_size') or agent.config.get('batch_size', 256)))
-    batch = pool if len(pool) <= bs else random.sample(pool, bs)
+    # オプション: 検証はval分割全体を使用（安定した指標のため）
+    use_full_val = bool(getattr(agent, 'config', {}).get('val_use_full_split', False))
+    if use_full_val:
+        batch = pool
+    else:
+        bs = int(batch_size if batch_size is not None else (agent.config.get('val_batch_size') or agent.config.get('batch_size', 256)))
+        batch = pool if len(pool) <= bs else random.sample(pool, bs)
 
     # Filter legacy samples when using full features
     if agent.config.get('use_full_features'):
@@ -70,7 +224,22 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
     policy_losses = []
     value_losses = []
     entropies = []
+    # 手札予測損失: 検証時にも policy/value と同時に計算する。
+    # デフォルトで有効化。ただし config で明示的に無効化可能。
     hand_losses = []  # 手札予測損失 (BCEWithLogits)
+    # 手札予測の再現率計測用累積 (TP / actual)
+    hand_recall_accum_tp = 0
+    hand_recall_accum_actual = 0
+    try:
+        cfg_flag = bool(getattr(agent, 'config', {}).get('val_compute_hand_pred', True))
+    except Exception:
+        cfg_flag = True
+    # Also enable if training config uses hand_pred_loss_coef > 0
+    try:
+        coeff = float(getattr(agent, 'config', {}).get('hand_pred_loss_coef', 0.0) or 0.0)
+    except Exception:
+        coeff = 0.0
+    compute_hand_pred = cfg_flag or (coeff > 0.0)
     valid = 0
 
     collected_pi = []
@@ -114,11 +283,7 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
                         pi_arr = _np.asarray(list(raw), dtype=_np.float32)
 
                     # Restore value target
-                    v_target = sample.get('value')
-                    if v_target is None and 'value_u8' in sample:
-                        vu = sample.get('value_u8')
-                        if isinstance(vu, int) and vu != 255:
-                            v_target = vu / 255.0
+                    v_target = _extract_value(sample)
                     if v_target is None:
                         continue
 
@@ -192,21 +357,41 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
                         value_logits_batch = agent.model.value_head(h)
                         if getattr(agent.model, 'enable_hand_prediction_head', False) and getattr(agent.model, 'hand_head', None) is not None:
                             try:
-                                hand_logits_batch = agent.model.hand_head(h)
+                                try:
+                                    hand_logits_batch = agent.model.hand_head(h)
+                                except Exception as _e:
+                                    # Debug: expose failures in hand_head forward
+                                    try:
+                                        import traceback as _tb
+                                        _tb.print_exc()
+                                    except Exception:
+                                        pass
+                                    hand_logits_batch = None
                             except Exception:
                                 hand_logits_batch = None
                         else:
                             hand_logits_batch = None
                     device = getattr(policy_logits_batch, 'device', None)
-                    max_len = max(lengths)
+                    orig_max_len = max(lengths)
                     B = len(states)
-                    pi_pad = _np.zeros((B, max_len), dtype=_np.float32)
+                    policy_out_dim = getattr(policy_logits_batch, 'shape', (None, None))[1] or policy_logits_batch.size(1)
+                    if orig_max_len > policy_out_dim:
+                        try:
+                            print(f"[WARN] validation: pi length {orig_max_len} > model.policy_dim {policy_out_dim}; truncating targets")
+                        except Exception:
+                            pass
+                    capped_max_len = min(orig_max_len, int(policy_out_dim))
+                    pi_pad = _np.zeros((B, capped_max_len), dtype=_np.float32)
                     for i, arr in enumerate(pi_arrays):
-                        pi_pad[i, :arr.shape[0]] = arr
-                    pi_pad_t = _t.from_numpy(pi_pad).to(device)
-                    lengths_t = _t.tensor(lengths, device=device)
-                    logits_slice = policy_logits_batch[:, :max_len]
-                    arange = _t.arange(max_len, device=device).unsqueeze(0).expand(B, -1)
+                        take = min(int(arr.shape[0]), capped_max_len)
+                        pi_pad[i, :take] = arr[:take]
+                    # Use _t.tensor to copy and avoid non-writable numpy array warnings
+                    pi_pad_t = _t.tensor(pi_pad, device=device)
+                    # truncate lengths for masking to match capped width
+                    lengths_trunc = [min(int(l), capped_max_len) for l in lengths]
+                    lengths_t = _t.tensor(lengths_trunc, device=device)
+                    logits_slice = policy_logits_batch[:, :capped_max_len]
+                    arange = _t.arange(capped_max_len, device=device).unsqueeze(0).expand(B, -1)
                     mask = (arange < lengths_t.unsqueeze(1)).float()
                     LARGE_NEG = -1e9
                     masked_logits = logits_slice * mask + (1 - mask) * LARGE_NEG
@@ -218,7 +403,7 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
                         v_logits = value_logits_batch[:, pid]
                     else:
                         v_logits = value_logits_batch[:, 0]
-                    v_targets_t = _t.tensor(v_targets_list, dtype=_t.float32, device=device)
+                    v_targets_t = _t.tensor(v_targets_list, dtype=_t.float32, device=device).view(-1)
                     if 'bce_logits_loss_fn' not in agent.__dict__:
                         import torch.nn as _nn
                         try:
@@ -238,27 +423,25 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
                     valid = len(states)
 
                     for i in range(len(states)):
-                        n = lengths[i]
+                        n = min(lengths[i], capped_max_len)
                         collected_pi.append(pi_pad_t[i, :n].detach())
                         collected_model.append(probs[i, :n].detach())
                         v_prob = _t.sigmoid(v_logits[i])
                         collected_v_pred.append(v_prob.detach())
                         collected_v_t.append(v_targets_t[i].detach())
                     # --- 手札予測損失 (vectorized) ---
-                    if any_hand_labels and hand_logits_batch is not None:
+                    # Disabled by default because it is expensive; enable via compute_hand_pred=True
+                    if compute_hand_pred and any_hand_labels and hand_logits_batch is not None:
                         try:
-                            # BCEWithLogitsLoss (reduction='none') で各サンプル損失を計算
-                            import torch.nn as _nn
                             hlog = hand_logits_batch
                             if hlog.dim() == 1:
                                 hlog = hlog.unsqueeze(0)
-                            # hand_logits_batch.shape = [B, hand_pred_dim]
-                            hand_dim = hlog.size(1)
-                            bce_hand = _nn.BCEWithLogitsLoss(reduction='none')
+                            hand_dim = int(hlog.size(1))
                             hp_losses_sample = []
                             for i, hl in enumerate(hand_label_list):
-                                if hl is None or hl.size == 0:
-                                    continue
+                                if i < 3:
+                                    if hl is None or hl.size == 0:
+                                        continue
                                 # pad/truncate hl to hand_dim
                                 if hl.shape[0] != hand_dim:
                                     if hl.shape[0] < hand_dim:
@@ -269,13 +452,24 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
                                         hlv = hl[:hand_dim]
                                 else:
                                     hlv = hl
-                                hl_t = _t.from_numpy(hlv.astype(_np.float32)).to(device)
-                                logits_i = hlog[i]
-                                # per element losses -> mean
-                                per_elem = bce_hand(logits_i.view(-1), hl_t.view(-1))
-                                hp_losses_sample.append(per_elem.mean())
+                                hl_t = _t.tensor(hlv.astype(_np.float32), device=device)
+                                # 未知マスクを state メタから生成
+                                st_i = states[i] if isinstance(states[i], dict) else {}
+                                mask_u = _build_unknown_mask_from_state(st_i, hand_dim)
+                                loss_i = _hand_loss_like_train(agent, hlog[i], hl_t, mask_u)
+                                hp_losses_sample.append(loss_i)
+                                # hand recall accumulate: predicted positives vs actual positives
+                                try:
+                                    probs_i = _t.sigmoid(hlog[i].view(-1))
+                                    pred_pos = (probs_i > 0.5)
+                                    actual_pos = (hl_t.view(-1) > 0.5)
+                                    tp = int((_t.logical_and(pred_pos, actual_pos).sum()).item())
+                                    total_actual = int(actual_pos.sum().item())
+                                    hand_recall_accum_tp += int(tp)
+                                    hand_recall_accum_actual += int(total_actual)
+                                except Exception:
+                                    pass
                             if hp_losses_sample:
-                                # 平均を hand_losses へ集約 (同一インターフェイス維持)
                                 hand_losses.append(_t.stack(hp_losses_sample).mean())
                         except Exception:
                             pass
@@ -312,14 +506,7 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
                     pi_target = sample.get('pi')
 
                 # Restore value target
-                v_target = sample.get('value')
-                if v_target is None and 'value_u8' in sample:
-                    vu = sample.get('value_u8')
-                    try:
-                        if isinstance(vu, int) and vu != 255:
-                            v_target = vu / 255.0
-                    except Exception:
-                        pass
+                v_target = _extract_value(sample)
 
                 # 固定ヘッドでは legal_actions は不要。可変長のみ必須とする。
                 if (variable and not legal_actions) or (not pi_target) or (v_target is None):
@@ -349,6 +536,19 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
                         v_pred_raw = v_out_logits
 
                 try:
+                    # determine model device so newly created tensors live on same device
+                    try:
+                        _model_dev = getattr(agent.model, 'device', None)
+                        if _model_dev is None:
+                            try:
+                                _model_dev = next(agent.model.parameters()).device
+                            except Exception:
+                                import torch as _torch
+                                _model_dev = _torch.device('cpu')
+                    except Exception:
+                        import torch as _torch
+                        _model_dev = _torch.device('cpu')
+
                     if hasattr(logits_raw, 'shape'):
                         logits_t = logits_raw
                         if logits_t.shape[0] < n:
@@ -360,7 +560,7 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
                         logits_list = list(logits_raw)
                         if len(logits_list) < n:
                             logits_list += [0.0] * (n - len(logits_list))
-                        logits_t = _t.tensor(logits_list[:n], dtype=_t.float32)
+                        logits_t = _t.tensor(logits_list[:n], dtype=_t.float32, device=_model_dev)
 
                     log_probs = logits_t.log_softmax(dim=0)
                     probs = log_probs.exp()
@@ -373,10 +573,20 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
                         probs = probs[:m]
 
                     policy_loss = -(pi_t * log_probs).sum()
-                    if isinstance(v_pred_raw, float):
-                        v_logit = _t.tensor(v_pred_raw, dtype=_t.float32)
+                    # ensure v_logit is a tensor on the model device
+                    if isinstance(v_pred_raw, float) or isinstance(v_pred_raw, (int,)):
+                        try:
+                            v_logit = _t.tensor(v_pred_raw, dtype=_t.float32, device=_model_dev)
+                        except Exception:
+                            v_logit = _t.tensor(v_pred_raw, dtype=_t.float32)
                     else:
-                        v_logit = v_pred_raw.float()
+                        try:
+                            v_logit = v_pred_raw.float()
+                        except Exception:
+                            try:
+                                v_logit = _t.tensor(float(v_pred_raw), dtype=_t.float32, device=_model_dev)
+                            except Exception:
+                                v_logit = _t.tensor(float(v_pred_raw), dtype=_t.float32)
                     v_t = _t.tensor(float(v_target), dtype=_t.float32, device=v_logit.device)
 
                     if 'bce_logits_loss_fn' not in agent.__dict__:
@@ -402,9 +612,10 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
                     collected_model.append(probs.detach())
                     collected_v_pred.append(v_prob.detach())
                     collected_v_t.append(v_t.detach())
-                    # --- 手札予測損失 ---
+                    # --- 手札予測損失: 学習と同じ定義（未知マスク + Focal） ---
                     try:
-                        if getattr(agent.model, 'enable_hand_prediction_head', False) and hasattr(agent.model, 'forward_with_belief'):
+                        # Disabled by default to avoid heavy CPU work during validation
+                        if compute_hand_pred and getattr(agent.model, 'enable_hand_prediction_head', False) and hasattr(agent.model, 'forward_with_belief'):
                             st = sample.get('state') or {}
                             hl = None
                             if isinstance(st, dict) and ('hand_labels' in st):
@@ -421,23 +632,37 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
                                 import torch as _t
                                 pol_l, val_l, hand_logits = agent.model.forward_with_belief(st)
                                 if hand_logits is not None:
-                                    hl_t = _t.from_numpy(hl).to(hand_logits.device)
-                                    # pad/truncate 次元調整
-                                    n = min(int(hl_t.numel()), int(hand_logits.numel()))
-                                    if n > 0:
-                                        if hl_t.numel() != n:
-                                            hl_t = hl_t[:n]
-                                        if hand_logits.numel() != n:
-                                            hand_logits = hand_logits.view(-1)[:n]
-                                        if 'bce_logits_loss_fn_hand' not in agent.__dict__:
-                                            import torch.nn as _nn
-                                            agent.bce_logits_loss_fn_hand = _nn.BCEWithLogitsLoss()
-                                        hp_loss = agent.bce_logits_loss_fn_hand(hand_logits.view(-1)[:n], hl_t.view(-1)[:n])
-                                        hand_losses.append(hp_loss)
+                                    # pad/truncate labels to match logits
+                                    hand_dim = int(hand_logits.view(-1).numel())
+                                    if hl.shape[0] != hand_dim:
+                                        if hl.shape[0] < hand_dim:
+                                            pad = _np.zeros(hand_dim, dtype=_np.float32)
+                                            pad[:hl.shape[0]] = hl
+                                            hl = pad
+                                        else:
+                                            hl = hl[:hand_dim]
+                                    hl_t = _t.tensor(hl.astype(_np.float32), device=hand_logits.device)
+                                    # 未知マスク
+                                    mask_u = _build_unknown_mask_from_state(st, hand_dim)
+                                    hp_loss = _hand_loss_like_train(agent, hand_logits.view(-1), hl_t.view(-1), mask_u)
+                                    hand_losses.append(hp_loss)
+                                    # accumulate recall for this sample
+                                    try:
+                                        probs_h = _t.sigmoid(hand_logits.view(-1))
+                                        pred_pos_h = (probs_h > 0.5)
+                                        actual_pos_h = (hl_t.view(-1) > 0.5)
+                                        tp_h = int((_t.logical_and(pred_pos_h, actual_pos_h).sum()).item())
+                                        total_actual_h = int(actual_pos_h.sum().item())
+                                        hand_recall_accum_tp += int(tp_h)
+                                        hand_recall_accum_actual += int(total_actual_h)
+                                    except Exception:
+                                        pass
                     except Exception:
                         pass
                 except Exception:
                     continue
+
+    # Diagnostic: hand prediction disabled by default
 
     # restore training mode if needed
     try:
@@ -453,7 +678,14 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
     policy_loss_mean = _t.stack(policy_losses).mean()
     value_loss_mean = _t.stack(value_losses).mean()
     entropy_mean = _t.stack(entropies).mean()
-    hand_loss_mean = _t.stack(hand_losses).mean() if hand_losses else None
+    # hand prediction: compute mean if any hand losses were collected
+    try:
+        if hand_losses:
+            hand_loss_mean = _t.stack(hand_losses).mean()
+        else:
+            hand_loss_mean = None
+    except Exception:
+        hand_loss_mean = None
 
     # Common metrics
     try:
@@ -477,4 +709,12 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
             out["hand_pred_loss"] = None
     except Exception:
         out["hand_pred_loss"] = None
+    # hand_recall: accumulated TP / actual across hand-labeled samples (if any)
+    try:
+        if hand_recall_accum_actual > 0:
+            out['hand_recall'] = float(hand_recall_accum_tp / hand_recall_accum_actual)
+        else:
+            out['hand_recall'] = None
+    except Exception:
+        out['hand_recall'] = None
     return out

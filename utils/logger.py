@@ -19,6 +19,8 @@ class TrainingLogger:
             try:
                 import shutil
                 for name in os.listdir(log_dir):
+                    if '.tmp.' in name:
+                        continue
                     p = os.path.join(log_dir, name)
                     if os.path.isdir(p):
                         shutil.rmtree(p, ignore_errors=True)
@@ -98,6 +100,8 @@ class TrainingLogger:
         self._last_val_pair = (None, None)
         # 検証手札予測損失（hand_pred_loss）最新値
         self._last_val_hand = None
+        # 検証手札予測再現率（recall）最新値
+        self._last_val_hand_recall = None
 
         # headers (既存挙動維持: ただし即時ファイル生成はバッファ有効時も保持)
         if not self.disable_csv and not self.csv_summary_only:
@@ -106,9 +110,9 @@ class TrainingLogger:
                     writer = csv.writer(f)
                     writer.writerow([
                         "update_step","policy_loss","value_loss","hand_pred_loss","entropy","train_count",
-                        "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","samples",
+                        "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","hand_label_pos_rate","samples",
                         # 検証ロス: policy/value/hand
-                        "val_policy_loss","val_value_loss","val_hand_pred_loss"
+                        "val_policy_loss","val_value_loss","val_hand_pred_loss","val_hand_recall"
                     ])
             # 既存行の有無を記録（初回1行は必ず出すための判定に利用）
             try:
@@ -260,8 +264,8 @@ class TrainingLogger:
                         writer = csv.writer(f)
                         writer.writerow([
                             "update_step","policy_loss","value_loss","hand_pred_loss","entropy","train_count",
-                            "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","samples",
-                            "val_policy_loss","val_value_loss","val_hand_pred_loss"
+                            "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","hand_label_pos_rate","samples",
+                            "val_policy_loss","val_value_loss","val_hand_pred_loss","val_hand_recall"
                         ])
             except Exception:
                 pass
@@ -327,6 +331,9 @@ class TrainingLogger:
                 # 新規列: hand_pred_loss / val_hand_pred_loss が無ければ再生成
                 if ('hand_pred_loss' not in header_line) or ('val_hand_pred_loss' not in header_line):
                     needs_rebuild = True
+                # 新規列: hand_label_pos_rate が無ければ再生成
+                if ('hand_label_pos_rate' not in header_line):
+                    needs_rebuild = True
                 if needs_rebuild:
                     # バックアップして新ヘッダで再生成
                     bak = self.train_csv + '.bak'
@@ -335,9 +342,9 @@ class TrainingLogger:
                         with open(self.train_csv, 'w', newline='', encoding='utf-8') as wf:
                             writer = csv.writer(wf)
                             writer.writerow([
-                                "update_step","policy_loss","value_loss","hand_pred_loss","entropy","train_count",
-                                "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","samples",
-                                "val_policy_loss","val_value_loss","val_hand_pred_loss"
+                                  "update_step","policy_loss","value_loss","hand_pred_loss","entropy","train_count",
+                                "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","hand_label_pos_rate","samples",
+                                "val_policy_loss","val_value_loss","val_hand_pred_loss","val_hand_recall"
                             ])
         except Exception:
             pass
@@ -360,22 +367,25 @@ class TrainingLogger:
             # 毎トレイン行に直近の検証ロスを必ず同梱（検証が未実施なら None）
             vpl, vvl = self._last_val_pair
             vhl = self._last_val_hand
+            vhr = self._last_val_hand_recall
 
+            # train_count を常に update_step と一致させる（直列モードでの二重カウント差異解消）
             row = [
-                self.update_step,
+                self.update_step,                    # update_step (cumulative)
                 metrics.get("policy_loss"),
                 metrics.get("value_loss"),
                 metrics.get("hand_pred_loss"),
                 metrics.get("entropy"),
-                metrics.get("train_count", self.update_step),
+                self.update_step,                    # train_count forced to update_step
                 metrics.get("value_acc"),
                 metrics.get("value_brier"),
                 metrics.get("policy_kl"),
                 metrics.get("policy_top1_match"),
                 metrics.get("pos_rate"),
                 metrics.get("cum_pos_rate"),
+                metrics.get("hand_label_pos_rate"),
                 metrics.get("samples"),
-                vpl, vvl, vhl,
+                vpl, vvl, vhl, vhr,
             ]
             # 直接追記 (頻度1や小間隔で確実に行が出るようにする) + バッファは補助的に使用
             try:
@@ -430,13 +440,15 @@ class TrainingLogger:
             vp = metrics.get("policy_loss")
             vv = metrics.get("value_loss")
             vh = metrics.get("hand_pred_loss")
+            vhr = metrics.get("hand_recall")
             self._val_losses_by_step[step] = (vp, vv)
             # 直近値を更新（毎トレイン行に同梱するため）
             self._last_val_pair = (vp, vv)
             self._last_val_hand = vh
+            self._last_val_hand_recall = vhr
         except Exception:
             pass
-        # ここではCSVへ即時追記せず、次の学習行に同梱する（重複行を防ぐ）
+        # 分離した検証専用行は廃止し、次回以降の train 行に同梱するのみ
         # TensorBoard
         if self.tb and not self._disk_full:
             try:
@@ -454,6 +466,33 @@ class TrainingLogger:
                 self._disable_tensorboard(f"OSError:{e}")
             except Exception as e:
                 print(f"[TrainingLogger] TensorBoard書き込み失敗 (validation): {e}")
+
+        # Fallback: If no train rows exist yet (e.g. resume_skip_prevalidation=True was used and
+        # pre-train validation was skipped), emit a placeholder train CSV row now so that the
+        # validation columns are present in the CSV file. This preserves the previous behaviour
+        # where one validation result is always visible in `train_updates.csv` even before any
+        # training rows are written.
+        try:
+            if (not self._disk_full) and (not self.disable_csv) and (not self.csv_summary_only) and getattr(self, '_train_rows_written', 0) == 0:
+                # Build a row with train-related columns set to None and val columns filled.
+                # Header layout: update_step,policy_loss,value_loss,hand_pred_loss,entropy,train_count,
+                # value_acc,value_brier,policy_kl,policy_top1_match,pos_rate,cum_pos_rate,hand_label_pos_rate,samples,
+                # val_policy_loss,val_value_loss,val_hand_pred_loss,val_hand_recall
+                vpl = metrics.get('policy_loss')
+                vvl = metrics.get('value_loss')
+                vhl = metrics.get('hand_pred_loss')
+                vhr = metrics.get('hand_recall')
+                row = [self.update_step] + [None] * 13 + [vpl, vvl, vhl, vhr]
+                try:
+                    with open(self.train_csv, 'a', newline='', encoding='utf-8') as f:
+                        csv.writer(f).writerow(row)
+                    self._train_rows_written = getattr(self, '_train_rows_written', 0) + 1
+                except OSError as e:
+                    self._mark_disk_full(e, 'train_csv')
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # ---------------- Episode metrics ----------------
     def log_episode(self, metrics: Dict[str, Any]):
@@ -630,18 +669,19 @@ class TrainingLogger:
                         writer = csv.writer(f)
                         writer.writerow([
                             "update_step","policy_loss","value_loss","hand_pred_loss","entropy","train_count",
-                            "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","samples",
-                            "val_policy_loss","val_value_loss","val_hand_pred_loss"
+                            "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","hand_label_pos_rate","samples",
+                            "val_policy_loss","val_value_loss","val_hand_pred_loss","val_hand_recall"
                         ])
                 with open(self.train_csv, 'a', newline='', encoding='utf-8') as f:
                     m = self._last_train_metrics
                     writer = csv.writer(f)
                     # summary モードでも current → prev の順で検証ロスを拾う
-                    vpl, vvl, vhl = None, None, None
+                    vpl, vvl, vhl, vhr = None, None, None, None
                     try:
                         vp, vv = self._val_losses_by_step.get(self.update_step, (None, None))
                         # hand は pair とは別に保持しているので最新属性から取得
-                        vh = self._last_val_hand if self.update_step == self.update_step else self._last_val_hand
+                        vh = self._last_val_hand
+                        vhr = self._last_val_hand_recall
                         if (vp is None and vv is None) and self.update_step > 0:
                             vp_prev, vv_prev = self._val_losses_by_step.get(self.update_step - 1, (None, None))
                             if vp_prev is not None or vv_prev is not None:
@@ -655,15 +695,15 @@ class TrainingLogger:
                                 self._val_losses_by_step.pop(self.update_step, None)
                             except Exception:
                                 pass
-                        vpl, vvl, vhl = vp, vv, vh
+                        vpl, vvl, vhl, vhr = vp, vv, vh, vhr
                     except Exception:
                         pass
                     writer.writerow([
                         self.update_step,
                         m.get("policy_loss"), m.get("value_loss"), m.get("hand_pred_loss"), m.get("entropy"), m.get("train_count", self.update_step),
                         m.get("value_acc"), m.get("value_brier"), m.get("policy_kl"), m.get("policy_top1_match"),
-                        m.get("pos_rate"), m.get("cum_pos_rate"), m.get("samples"),
-                        vpl, vvl, vhl
+                        m.get("pos_rate"), m.get("cum_pos_rate"), m.get("hand_label_pos_rate"), m.get("samples"),
+                        vpl, vvl, vhl, vhr
                     ])
             if self._last_episode_metrics:
                 if self._buffer_enabled and self._episode_buf:

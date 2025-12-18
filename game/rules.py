@@ -40,6 +40,13 @@ def _classify_combo_cached(revo_flag: bool, cards_key: tuple):
 
     # 階段: あるスートに対し、連続ランク列をジョーカーで補完して成立するか
     def _is_straight_and_ranks():
+        """階段判定とランク列生成。
+
+        方針:
+          - まず非ジョーカーの最小ランク以上を始点とする階段を優先的に探索する。
+            例: {8,9,JOKER} は 7-8-9 ではなく 8-9-10 を優先。
+          - それで成立しない場合のみ、従来通り全ての始点を探索する（A-2-Joker などの特殊形維持）。
+        """
         if n < 3:
             return None
         # スート候補: 非ジョーカーのスート集合（非ジョーカーが無いときは全スート）
@@ -50,8 +57,15 @@ def _classify_combo_cached(revo_flag: bool, cards_key: tuple):
         # 非ジョーカーの指定スートのランクリスト
         for suit in suit_candidates:
             hand_ranks = [c[2] for c in non_jokers if c[1] == suit and c[2] is not None]
-            for start in range(1, 14):
+            # 探索順を決定: 非ジョーカーの最小ランク以上 → それ以外
+            if hand_ranks:
+                min_non = min(hand_ranks)
+                starts_pref = list(range(min_non, 14)) + list(range(1, min_non))
+            else:
+                starts_pref = list(range(1, 14))
+            for start in starts_pref:
                 expected = [((start + i - 1) % 13) + 1 for i in range(n)]
+                # 2が含まれる場合は2が末尾でなければ不可（K,A,2 のみ許容）
                 if 2 in expected and expected[-1] != 2:
                     continue
                 temp = hand_ranks[:]
@@ -333,7 +347,13 @@ class RuleChecker:
         for suit in suit_candidates:
             # 手札のランクリスト
             hand_ranks = [card.rank for card in non_jokers if card.suit == suit]
-            for start in range(1, 14):
+            # 探索順: 非ジョーカーの最小ランク以上を優先
+            if hand_ranks:
+                min_non = min(hand_ranks)
+                starts_pref = list(range(min_non, 14)) + list(range(1, min_non))
+            else:
+                starts_pref = list(range(1, 14))
+            for start in starts_pref:
                 expected = [(start + i - 1) % 13 + 1 for i in range(n)]
                 # 2が含まれる場合は2が末尾でなければ不可
                 if 2 in expected and expected[-1] != 2:
@@ -382,7 +402,13 @@ class RuleChecker:
         suit_candidates = set([c.suit for c in non_jokers]) if non_jokers else set(['♠', '♥', '♦', '♣'])
         for suit in suit_candidates:
             hand_ranks = [c.rank for c in non_jokers if c.suit == suit]
-            for start in range(1, 14):
+            # 探索順: 非ジョーカーの最小ランク以上を優先
+            if hand_ranks:
+                min_non = min(hand_ranks)
+                starts_pref = list(range(min_non, 14)) + list(range(1, min_non))
+            else:
+                starts_pref = list(range(1, 14))
+            for start in starts_pref:
                 expected = [(start + i - 1) % 13 + 1 for i in range(n)]
                 if 2 in expected and expected[-1] != 2:
                     continue

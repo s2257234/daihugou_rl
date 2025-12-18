@@ -24,6 +24,8 @@ class DaifugoSimpleEnv:
         self.already_won_players = set()  # 区間開始時点ですでに上がっていたプレイヤー
         self.stage_id = 0  # 区間ID
         self.turn_idx = 0  # ゲーム全体の手番番号
+        # デバッグ用: env.step 内の合法手/選択手のミスマッチを詳細ログするフラグ
+        self.debug_action_mismatch = True
 
     def _is_pair(self, cards):
         """
@@ -148,6 +150,28 @@ class DaifugoSimpleEnv:
             return (None,)
         try:
             return tuple(sorted(str(c) for c in action_cards))
+        except Exception:
+            return (None,)
+
+    def _joker_fuzzy_key(self, action_cards):
+        """Joker の表記ゆれを吸収した順序非依存キーを生成する。
+
+        - 'JOKER', 'JOKER(♥7)', 'JOKER(♦2)' などをすべて 'JOKER' とみなす
+        - それ以外のカードは str(c) をそのまま使う
+        - sorted してタプル化することで、ペア/スリーカード/階段などの
+          枚数と組み合わせを厳密に一致判定できる
+        """
+        if action_cards is None:
+            return (None,)
+        tokens = []
+        try:
+            for c in action_cards:
+                s = str(c)
+                if s.startswith("JOKER"):
+                    tokens.append("JOKER")
+                else:
+                    tokens.append(s)
+            return tuple(sorted(tokens))
         except Exception:
             return (None,)
 
@@ -282,11 +306,14 @@ class DaifugoSimpleEnv:
         obs = {'hand': hand, 'field': field}
 
         # --- 行動選択 ---
+        corrected_external = False
+        corrected_from = None
         if force_action is not None:
             action_cards = self._normalize_action_input(force_action)
             mcts_result = None
         elif external_action is not None:
             action_cards = self._normalize_action_input(external_action)
+            corrected_from = action_cards
         else:
             is_field_straight = rule_checker.is_straight(field) if field else False
             is_field_pair = False
@@ -310,19 +337,152 @@ class DaifugoSimpleEnv:
                 filtered_actions = legal_actions
 
             if simulate and isinstance(self.agents[current_player_id], (MCTSAgent, AlphaZeroAgent)):
+                # simulate=True (MCTS内部シミュレーション) ではランダムに行動を選ぶ。
+                # ただし、pass(None) は合法手に含まれる場合のみ候補に入れる。
                 legal_actions_filtered = [a for a in legal_actions if a is not None]
-                action_cards = np.random.choice(legal_actions_filtered + [None])
+                allow_pass = any(a is None for a in legal_actions)
+                pool = legal_actions_filtered + ([None] if allow_pass else [])
+                action_cards = random.choice(pool) if pool else None
             else:
-                action_cards = self.agents[current_player_id].select_action(obs, legal_actions=filtered_actions)
+                # Try to obtain model policy/value for the current state (best-effort)
+                agent = self.agents[current_player_id]
+                try:
+                    pol, val = None, None
+                    if hasattr(agent, '_policy_value'):
+                                try:
+                                    pol_raw, val_raw = agent._policy_value(self)
+                                    pol = {}
+                                    # normalize keys to strings for JSON logging
+                                    for a, p in (pol_raw or {}).items():
+                                        try:
+                                            if a is None:
+                                                key = 'pass'
+                                            elif isinstance(a, (list, tuple)):
+                                                key = '|'.join(str(x) for x in a)
+                                            else:
+                                                key = str(a)
+                                            pol[key] = float(p)
+                                        except Exception:
+                                            continue
+                                    # convert val_raw to scalar for current player if possible
+                                    val = None
+                                    try:
+                                        if val_raw is None:
+                                            val = None
+                                        elif isinstance(val_raw, dict):
+                                            # try integer key or string key
+                                            val = val_raw.get(current_player_id, val_raw.get(str(current_player_id)))
+                                        elif isinstance(val_raw, (list, tuple)):
+                                            if 0 <= current_player_id < len(val_raw):
+                                                val = val_raw[current_player_id]
+                                            else:
+                                                val = None
+                                        else:
+                                            # scalar
+                                            val = float(val_raw)
+                                    except Exception:
+                                        val = None
+                                except Exception:
+                                    pol, val = None, None
+                except Exception:
+                    pol, val = None, None
+
+                # select action (may use MCTS)
+                # AlphaZeroAgent needs the env to enforce final legality gates reliably.
+                if isinstance(agent, AlphaZeroAgent):
+                    action_cards = agent.select_action(self, training=True, legal_actions=filtered_actions)
+                else:
+                    action_cards = agent.select_action(obs, legal_actions=filtered_actions)
 
         # 入力正規化（A-1）
+        raw_action_cards = action_cards
         action_cards = self._normalize_action_input(action_cards)
 
-        # 合法手チェック（A-4）: 生成済み合法手に含まれない出しはパスへ降格
-        if action_cards is not None:
+        # 合法手チェック（A-4）: 生成済み合法手に含まれない出しはパス or 合法手へ矯正
+        try:
+            pass_only = (legal_actions is not None and all(a is None for a in legal_actions))
+        except Exception:
+            pass_only = False
+
+        # pass-only の局面では、常にパスへクランプ
+        # external_action で非パスが来た場合はデバッグ用にミスマッチを記録する
+        # simulate=True (MCTS内部シミュレーション) の場合はログをスキップ
+        if pass_only:
+            if external_action is not None and getattr(self, "debug_action_mismatch", False) and not simulate:
+                try:
+                    if action_cards is not None:
+                        _revo_state = bool(getattr(rule_checker, 'revolution', False))
+                        print(
+                            "[ACTION-MISMATCH] pid=", current_player_id,
+                            " field=", [str(c) for c in field],
+                            " revo=", _revo_state,
+                            " raw_action=", raw_action_cards,
+                            " norm_action=", [str(c) for c in action_cards] if action_cards is not None else None,
+                            " legal_actions=", [None],
+                            " act_key=", self._action_key(action_cards),
+                            " legal_keys=", [],
+                        )
+                except Exception:
+                    pass
+            action_cards = None
+        elif action_cards is not None:
             legal_keys = set(self._action_key(a) for a in legal_actions if a is not None)
-            if self._action_key(action_cards) not in legal_keys:
-                action_cards = None
+            act_key = self._action_key(action_cards)
+            if act_key not in legal_keys:
+                # --- Joker の曖昧マッチ（Fuzzy Match） ---
+                # str 表現だけ異なる JOKER(X) 同士を同一視して、
+                # 枚数・組み合わせが一致する合法手があればそれを採用する
+                fuzzy_act_key = self._joker_fuzzy_key(action_cards)
+                chosen_action = None
+                for cand in legal_actions:
+                    if cand is None:
+                        continue
+                    if fuzzy_act_key == self._joker_fuzzy_key(cand):
+                        # env 側の表現（str(card)）に合わせて正規化
+                        chosen_action = [str(c) for c in cand]
+                        break
+
+                if chosen_action is not None:
+                    # Joker の表記ゆれだけで合法手に対応がある場合はそれを採用
+                    action_cards = chosen_action
+                else:
+                    # Joker 曖昧マッチでも対応が見つからなかった場合:
+                    #   1) デバッグ時は詳細をログ
+                    #   2) 合法手集合からフォールバックを選択
+                    #      - 非 None の合法手があればその1つ目を採用
+                    #      - 合法手がパス(None)のみならパスのまま
+
+                    # 1) デバッグオプション有効時はミスマッチの詳細を1行ログに出す
+                    # simulate=True (MCTS内部シミュレーション) の場合はログをスキップ
+                    if getattr(self, "debug_action_mismatch", False) and force_action is None and not simulate:
+                        try:
+                            la_str = [[str(c) for c in a] if a is not None else None for a in legal_actions]
+                            # 革命状態を取得して出力
+                            _revo_state = bool(getattr(rule_checker, 'revolution', False))
+                            print("[ACTION-MISMATCH] pid=", current_player_id,
+                                  " field=", [str(c) for c in field],
+                                  " revo=", _revo_state,
+                                  " raw_action=", raw_action_cards,
+                                  " norm_action=", [str(c) for c in action_cards] if action_cards is not None else None,
+                                  " legal_actions=", la_str,
+                                  " act_key=", act_key,
+                                  " legal_keys=", list(legal_keys))
+                        except Exception:
+                            pass
+
+                    # 2) フォールバック: 合法手が存在するならパスではなく何かを出す
+                    non_pass_candidates = [a for a in legal_actions if a is not None]
+                    if non_pass_candidates:
+                        # env 側表現に合わせて文字列化して渡す
+                        fallback = non_pass_candidates[0]
+                        action_cards = [str(c) for c in fallback]
+                    else:
+                        # 出せるカードが本当に無い場合のみパスにする
+                        action_cards = None
+
+                    # external_action の場合、矯正が発生したことを記録
+                    if external_action is not None:
+                        corrected_external = True
 
         # --- [REAL LOG] ---
         if force_action is None and external_action is None:
@@ -422,13 +582,29 @@ class DaifugoSimpleEnv:
             self.stage_history = []
 
         if return_info:
-            return obs, reward, self.done, {
+            info = {
                 "player_id": player.player_id,
                 "played_cards": action_cards,
                 "reset_happened": reset_happened,
                 "reset_reason": reset_reason,
                 "field_after_play": [str(c) for c in new_field]
             }
+            # expose correction info for external_action strict checking
+            try:
+                info['corrected_external_action'] = bool(corrected_external)
+                info['external_action_before'] = corrected_from
+            except Exception:
+                pass
+            # attach model outputs if available (best-effort)
+            try:
+                if 'pol' in locals() and pol is not None:
+                    info['policy'] = pol
+                if 'val' in locals() and val is not None:
+                    # value may be scalar/list/dict; try to coerce to float when scalar
+                    info['value'] = val
+            except Exception:
+                pass
+            return obs, reward, self.done, info
         else:
             return obs, reward, self.done
         

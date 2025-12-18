@@ -64,6 +64,7 @@ import multiprocessing as mp
 from typing import Any, Dict, List
 import threading as _th
 import queue as _q
+import torch
 
 import joblib
 
@@ -91,10 +92,6 @@ def _load_config(base: Dict[str, Any], path: str | None) -> Dict[str, Any]:
 
 
 def _resolve_device(dev: str | None) -> str:
-	try:
-		import torch  # type: ignore
-	except Exception:
-		return 'cpu'
 	if not dev or dev == 'auto':
 		return 'cuda' if (torch.cuda.is_available() and getattr(torch.version, 'cuda', None)) else 'cpu'
 	if isinstance(dev, str) and dev.startswith('cuda'):

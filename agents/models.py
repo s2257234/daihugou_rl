@@ -145,23 +145,29 @@ class PolicyValueNet(nn.Module):
         self.device = torch.device(device) if device else torch.device("cpu")
         self.use_full_features = True
 
-        # ---- Feature partition (v5 layout: no PlayHistory, Belief removed, with OpponentDiscards/PassMatrix) ----
+        # ---- Feature partition (v8 layout: added is_leader + last_actor_onehot) ----
         # Self: 55
         self.self_dim = 55
         # Context (v6 base): OppSummary 5*(N-1) + Field 22 + FieldCards 53 + Turn N
         base_context_dim = 5 * (num_players - 1) + 22 + 53 + num_players
-        # New extensions:
+        # Extensions:
         #   OpponentDiscards: 53*(N-1)
         #   PassMatrix: 13*(N-1)
         #   RankRemain: 13 (各ランク残枚数の正規化 (4-occ)/4)
         #   JokerRemain: 1 (ジョーカー残枚数の正規化 (1-occ))
+        #   is_leader: 1 (場が空なら 1.0)
+        #   last_actor_onehot: N (直前に出したプレイヤーの one-hot)
         self.opponent_discards_dim = 53 * (num_players - 1)
         self.pass_matrix_dim = 13 * (num_players - 1)
         self.rank_remain_dim = 13
         self.joker_remain_dim = 1
-        self.context_dim = base_context_dim + self.opponent_discards_dim + self.pass_matrix_dim + self.rank_remain_dim + self.joker_remain_dim
-        # Expected full feature dimension (v6):
-        # 55 + [5*(N-1) + 22 + 53 + N + 53*(N-1) + 13*(N-1) + 13 + 1] = 72N + 73
+        self.is_leader_dim = 1
+        self.last_actor_dim = num_players
+        self.context_dim = (base_context_dim + self.opponent_discards_dim + self.pass_matrix_dim
+                            + self.rank_remain_dim + self.joker_remain_dim
+                            + self.is_leader_dim + self.last_actor_dim)
+        # Expected full feature dimension (v8):
+        # 55 + [5*(N-1) + 22 + 53 + N + 53*(N-1) + 13*(N-1) + 13 + 1 + 1 + N] = 73N + 74
         self.full_feature_dim = int(self.self_dim + self.context_dim)
         # 先に context_out_dim を確定させておく（旧 ckpt 分岐で利用するため）
         self.context_out_dim = int(context_out_dim)

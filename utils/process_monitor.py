@@ -407,7 +407,7 @@ def auto_replay_water_purge(
                                 break
                     except Exception:
                         oldest_list = []
-                allow_keys = {"player_id","state","value","model_version","feature_version","value_pred","uid","pi_q","pi_format","legal_ids","actions_format","value_u8","value_pred_u8"}
+                allow_keys = {"player_id","state","model_version","feature_version","uid","pi_q","pi_format","legal_ids","actions_format","value_u8"}
                 processed = []
                 for s in oldest_list:
                     if not isinstance(s, dict):

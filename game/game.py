@@ -20,6 +20,9 @@ class Game:
         self.done = False  # ゲーム終了フラグ
         self.last_player = None # 最後にカードを出したプレイヤー
         self.rankings = []  # 上がった順に記録するリスト
+        # 行動履歴（特徴量・determinization 用）
+        # 各要素は dict で、最低限 {'pid': int, 'action': list[str] | 'pass', ...} を持つ。
+        self._action_history = []
         self._deal_cards()  # カードを配る
         # 革命デバッグ用フラグ: True の場合 REV_EVENT 行を出力
         self.debug_revolution_trace = True
@@ -56,6 +59,11 @@ class Game:
         self.passed = [False] * self.num_players
         self.done = False
         self.last_player = None
+        # 行動履歴をクリア
+        try:
+            self._action_history.clear()
+        except Exception:
+            self._action_history = []
         # 前回の順位情報を一時保存
         prev_rankings = self.rankings[:] if hasattr(self, 'rankings') else []
         self.rankings = []
@@ -149,6 +157,7 @@ class Game:
                 'field': field,
                 'hands': hands,
                 'revo': bool(getattr(getattr(self, 'rule_checker', None), 'revolution', False)),
+                'action_history': list(getattr(self, '_action_history', []) or []),
             }
             return data
         except Exception:
@@ -164,6 +173,7 @@ class Game:
                 'field': [],
                 'hands': [[] for _ in range(len(getattr(self, 'players', [])))],
                 'revo': bool(getattr(getattr(self, 'rule_checker', None), 'revolution', False)),
+                'action_history': list(getattr(self, '_action_history', []) or []),
             }
 
     def set_state_data(self, data, card_lookup=None):
@@ -253,6 +263,15 @@ class Game:
                 self.rule_checker.revolution = bool(data.get('revo', bool(self.rule_checker.revolution)))
         except Exception:
             pass
+        # 行動履歴
+        try:
+            ah = data.get('action_history', [])
+            if isinstance(ah, (list, tuple)):
+                self._action_history = list(ah)
+            else:
+                self._action_history = []
+        except Exception:
+            self._action_history = []
         # Zobrist: 外部復元後は再計算要求（次回取得時にO(N)一度だけ）
         try:
             self._zkey_dirty = True
@@ -300,6 +319,25 @@ class Game:
         is_first_turn = empty_field and (self.turn_count == 0 and self.last_player is None)
         card_objs = self._find_hand_cards(player, action_cards) if action_cards else None
 
+        # 行動履歴用: この手番開始時点の情報を先にスナップショット
+        try:
+            _field_before = [str(c) for c in getattr(self, 'current_field', [])]
+        except Exception:
+            _field_before = []
+        try:
+            _revo_before = bool(getattr(getattr(self, 'rule_checker', None), 'revolution', False))
+        except Exception:
+            _revo_before = False
+        _combo_type = None
+        try:
+            rc = getattr(self, 'rule_checker', None)
+            if rc and hasattr(rc, 'classify_combo') and getattr(self, 'current_field', None):
+                cinfo = rc.classify_combo(self.current_field)
+                if cinfo:
+                    _combo_type = cinfo.get('type')
+        except Exception:
+            _combo_type = None
+
         # 出すカードの検証・ルール判定
         if card_objs is not None and len(card_objs) > 0:
             if empty_field:
@@ -312,6 +350,18 @@ class Game:
             # classify_combo は必要に応じて joker_as_* を設定するが、場出しが確定してから行うので副作用は許容範囲
             try:
                 _ = self.rule_checker.classify_combo(card_objs)
+            except Exception:
+                pass
+            # 行動履歴へ記録（実際に出した手）
+            try:
+                hist_entry = {
+                    'pid': int(getattr(self, 'turn', player_id)),
+                    'action': [str(c) for c in (card_objs or [])],
+                    'field_before': _field_before,
+                    'revo': _revo_before,
+                    'combo_type': _combo_type,
+                }
+                self._action_history.append(hist_entry)
             except Exception:
                 pass
             # ゲーム中の出力を「Player X played: ...」形式に（解決済みの card_objs を使用）
@@ -368,17 +418,33 @@ class Game:
                 #self.log(f"8切り発動 by Player {self.turn}!")
                 self.last_player = self.turn
                 self._reset_field()
-                return self.get_state(self.turn), False, True, "eight_cut"
+                # 8 切りで上がった場合も正しく順位付けする
+                done_now = self._check_agari(player, player_id)
+                return self.get_state(self.turn), done_now, True, "eight_cut"
             # ジョーカー流し
             if len(card_objs) == 1 and card_objs[0].is_joker:
                 self.last_player = self.turn
                 self._reset_field()
-                return self.get_state(self.turn), False, True, "joker_cut"
+                # ジョーカー単出しで上がった場合も正しく順位付けする
+                done_now = self._check_agari(player, player_id)
+                return self.get_state(self.turn), done_now, True, "joker_cut"
         else:
             # ゲーム中の出力を「Player X passed.」形式に
             rev_flag = ' (REV)' if self.rule_checker.revolution else ''
             #self.log(f"Player {self.turn} passed.{rev_flag}")
             action_cards = None
+            # 行動履歴へ記録（パス）
+            try:
+                hist_entry = {
+                    'pid': int(getattr(self, 'turn', player_id)),
+                    'action': 'pass',
+                    'field_before': _field_before,
+                    'revo': _revo_before,
+                    'combo_type': _combo_type,
+                }
+                self._action_history.append(hist_entry)
+            except Exception:
+                pass
             if not self.passed[self.turn]:
                 # Zobrist: pass フラグを立てる
                 self._zkey ^= self._zobrist['PASSED'][self.turn]
@@ -387,7 +453,6 @@ class Game:
             if self._all_others_passed():
                 self._reset_field()
                 reset_happened = True
-                self.turn = self.last_player
                 return self.get_state(self.turn), False, reset_happened, "all_pass"
         if valid:
             self.last_player = self.turn
@@ -399,8 +464,6 @@ class Game:
         if not empty_field and self._all_others_passed():
             self._reset_field()
             reset_happened = True
-            if self.last_player is not None:
-                self.turn = self.last_player
             return self.get_state(self.turn), False, reset_happened, "all_pass"
 
         # リセット直後は再度 same player に戻る
@@ -634,6 +697,26 @@ class Game:
                 except Exception:
                     pass
             self.turn = self.last_player
+
+        # 追加: リセット後の手番が「手札0」なら即スキップ
+        # NOTE: _reset_field() 自体で turn_count を加算しているため、ここでは turn_count を増やさない。
+        try:
+            skip_count = 0
+            while self.turn is not None and len(self.players[self.turn].hand) == 0:
+                old_turn = self.turn
+                next_turn = (old_turn + 1) % self.num_players
+                # Zobrist: turn 切替
+                try:
+                    self._zkey ^= self._zobrist['TURN'][old_turn]
+                    self._zkey ^= self._zobrist['TURN'][next_turn]
+                except Exception:
+                    pass
+                self.turn = next_turn
+                skip_count += 1
+                if skip_count > self.num_players:
+                    break
+        except Exception:
+            pass
         #self.log("--- 場がリセットされました ---")
 
     # --- Zobrist Hash 実装 ----------------------------------

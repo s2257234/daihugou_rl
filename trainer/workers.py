@@ -9,6 +9,19 @@ from agents.factory import create_env_and_agents
 from agents.drl_agent import AlphaZeroAgent
 
 
+VALUE_U8_NONE = 0xFF
+
+
+def _has_value_label(sample: Dict[str, Any]) -> bool:
+    """Returns True when the sample includes either float or quantized value."""
+    if not isinstance(sample, dict):
+        return False
+    if sample.get('value') is not None:
+        return True
+    value_u8 = sample.get('value_u8')
+    return isinstance(value_u8, int) and 0 <= value_u8 < VALUE_U8_NONE
+
+
 class SelfplayDaemonWorker:
     def __init__(
         self,
@@ -93,7 +106,6 @@ class SelfplayDaemonWorker:
                 try:
                     _intra = _t.get_num_threads()
                     _interop = _t.get_num_interop_threads() if hasattr(_t, "get_num_interop_threads") else -1
-                    print(f"[threads][daemon {self.worker_id}] intra={_intra} interop={_interop} OMP={os.environ.get('OMP_NUM_THREADS')} MKL={os.environ.get('MKL_NUM_THREADS')}")
                 except Exception:
                     pass
         except Exception:
@@ -109,7 +121,7 @@ class SelfplayDaemonWorker:
         try:
             if not os.path.isdir(self.pool_dir):
                 return []
-            files = [os.path.join(self.pool_dir, f) for f in os.listdir(self.pool_dir) if f.endswith('.pt')]
+            files = [os.path.join(self.pool_dir, f) for f in os.listdir(self.pool_dir) if f.endswith('.pt') and '.tmp.' not in f]
             files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
             return files
         except Exception:
@@ -156,15 +168,77 @@ class SelfplayDaemonWorker:
 
     def _flush_local_buffers_to_queue(self):
         try:
+            # Debug hook: when enabled, probe agent._extract_state(self.env)
+            # and emit a concise log about the returned full_input/self indices.
+            do_debug = bool(self.config.get('debug_log_extract_state', False))
+            if do_debug:
+                try:
+                    # Env-level summary: per-player hand counts (avoid heavy prints)
+                    try:
+                        g = getattr(self.env, 'game', None)
+                        if g is not None:
+                            hand_counts = []
+                            hand_samples = []
+                            for p in getattr(g, 'players', []) or []:
+                                try:
+                                    h = getattr(p, 'hand', []) or []
+                                    hand_counts.append(len(h))
+                                    # sample up to 3 cards as str
+                                    sample_cards = [str(c) for c in (h[:3] if len(h) > 0 else [])]
+                                    hand_samples.append(sample_cards)
+                                except Exception:
+                                    hand_counts.append(None)
+                                    hand_samples.append([])
+                            print(f"[DEBUG-env] worker={self.worker_id} player_hand_counts={hand_counts} player_hand_samples={hand_samples}")
+                    except Exception:
+                        pass
+                    for ia, az in enumerate(self.agents):
+                        if hasattr(az, '_extract_state') and self.env is not None:
+                            try:
+                                probe = az._extract_state(self.env)
+                                fi = probe.get('full_input') if isinstance(probe, dict) else None
+                                fc = probe.get('full_compact') if isinstance(probe, dict) else None
+                                sidx = probe.get('self_hand_indices') if isinstance(probe, dict) else None
+                                # compute quick summaries
+                                fi_sum = None
+                                fi_len = None
+                                if fi is not None:
+                                    try:
+                                        fi_sum = float(sum(fi))
+                                        fi_len = len(fi)
+                                    except Exception:
+                                        fi_sum = None
+                                # full_compact packed bits quick inspect
+                                packed_info = None
+                                try:
+                                    if isinstance(fc, dict) and isinstance(fc.get('packed_bits'), (bytes, bytearray)):
+                                        pb = fc.get('packed_bits')
+                                        packed_info = f"len={len(pb)} first_bytes={[b for b in pb[:4]]}"
+                                except Exception:
+                                    packed_info = None
+                                turn_v = probe.get('turn') if isinstance(probe, dict) else None
+                                hand_size_v = probe.get('hand_size') if isinstance(probe, dict) else None
+                                self_pid_v = probe.get('self_player_id') if isinstance(probe, dict) else None
+                                print(f"[DEBUG-extract_state] worker={self.worker_id} agent={ia} view_turn={turn_v} view_self_player_id={self_pid_v} hand_size={hand_size_v} full_input_len={fi_len} full_input_sum={fi_sum} full_compact={packed_info} self_hand_indices={'present' if sidx else 'absent'}")
+                            except Exception as _e:
+                                print(f"[DEBUG-extract_state] worker={self.worker_id} agent={ia} probe failed: {_e}")
+                except Exception:
+                    pass
+            def _try_put(s) -> bool:
+                try:
+                    # avoid blocking indefinitely when parent isn't draining
+                    self.sample_queue.put(s, block=False)
+                    return True
+                except Exception:
+                    return False
             for az in self.agents:
                 buf = getattr(az, 'replay_buffer', [] if False else [])
                 if buf is None:
                     episode_samples = getattr(az, '_episode_confirmed_samples', [])
                     for s in episode_samples:
-                        if isinstance(s, dict) and s.get('value') is not None:
-                            try:
-                                self.sample_queue.put(s, block=True)
-                            except Exception:
+                        if _has_value_label(s):
+                            if not _try_put(s):
+                                # queue full: stop flushing to avoid deadlock
                                 break
                     if hasattr(az, '_episode_confirmed_samples'):
                         try:
@@ -175,10 +249,9 @@ class SelfplayDaemonWorker:
                 if not buf:
                     continue
                 for s in list(buf):
-                    if isinstance(s, dict) and s.get('value') is not None:
-                        try:
-                            self.sample_queue.put(s, block=True)
-                        except Exception:
+                    if _has_value_label(s):
+                        if not _try_put(s):
+                            # queue full: stop flushing to avoid deadlock
                             break
                 try:
                     buf.clear()
@@ -254,7 +327,19 @@ class SelfplayDaemonWorker:
             ag = self.agents[cur_pid]
             action = ag.select_action(self.env, training=True)
             try:
-                self.env.step(external_action=action)
+                # Use return_info=True so the environment can report the actually played action
+                # (useful when env clamps illegal external_action).
+                _, _, _, info = self.env.step(return_info=True, external_action=action)
+                # Strict mode: do not allow env-side correction of agent actions.
+                try:
+                    strict = bool(self.config.get('strict_no_action_correction', True))
+                except Exception:
+                    strict = True
+                if strict and isinstance(info, dict) and info.get('corrected_external_action'):
+                    raise RuntimeError(
+                        f"external_action was corrected by env (wid={self.worker_id} pid={cur_pid}) "
+                        f"before={info.get('external_action_before')} after={info.get('played_cards')}"
+                    )
             except TypeError:
                 self.env.step(action)
             step_count += 1
@@ -348,7 +433,8 @@ class SelfplayDaemonWorker:
         if flush:
             self._flush_local_buffers_to_queue()
             try:
-                self.event_queue.put(("ep_done", 1), block=True)
+                # do not block on event queue either
+                self.event_queue.put(("ep_done", 1), block=False)
             except Exception:
                 pass
         # パフォーマンスイベント（簡略）
@@ -403,7 +489,7 @@ class SelfplayDaemonWorker:
 
 def selfplay_daemon_worker_entry(
     worker_id: int,
-    config: Dict[str, Any],
+    config: Dict[str, Any] | str,
     model_path: str,
     sample_queue,
     event_queue,
@@ -412,6 +498,13 @@ def selfplay_daemon_worker_entry(
     request_q=None,
     response_q=None,
 ):
+    # 受け取った設定が JSON 文字列なら辞書へ復元（Windows spawn のpickle安定化）
+    if isinstance(config, str):
+        try:
+            import json as _json
+            config = _json.loads(config)
+        except Exception:
+            config = {}
     SelfplayDaemonWorker(
         worker_id=worker_id,
         config=config,

@@ -44,14 +44,22 @@ def _load_or_build_model(config: Dict[str, Any], *, device: str, model_path: Opt
             pass
     # 新規作成
     if use_full:
+        # 新仕様に合わせたデフォルト full_feature_dim を使う。
+        # models.py のレイアウトに基づく期待式: full_feature_dim = 72*N + 73
+        try:
+            N = int(config.get("num_players", 4))
+            # New layout: full_feature_dim = 73*N + 74
+            default_full_dim = 73 * N + 74
+        except Exception:
+            default_full_dim = 366
         model = PolicyValueNet(
             max_policy_size=config.get("max_policy_size", 128),
             hidden_size=config.get("hidden_size", 128),
             num_players=config.get("num_players", 4),
             device=device,
             use_full_features=True,
-            # 初期は推定次元、後で実寸に合わせて再構築（必要なら）
-            full_feature_dim=56 * int(config.get("num_players", 4)) + 22,
+            # 初期は新仕様に合わせた次元、後でプローブで再構築（必要なら）
+            full_feature_dim=default_full_dim,
         )
     else:
         model = PolicyValueNet(
@@ -115,18 +123,18 @@ def _maybe_rebuild_full_model(config: Dict[str, Any], model: PolicyValueNet, age
         probe = agents[0]._extract_state(env)
         full_dim = probe.get("full_input_dim")
         cur_full = bool(getattr(model, "use_full_features", False))
-        in_features = getattr(getattr(model, "backbone", None), "0", None)
-        if isinstance(in_features, type(getattr(model, "backbone", [None])[0])):
-            try:
-                in_features = model.backbone[0].in_features  # type: ignore[attr-defined]
-            except Exception:
-                in_features = None
-        # 再構築が必要か
+        # 既存モデルが持つ full_feature_dim を直接参照する（models.PolicyValueNet は属性を持つ）
+        model_full = getattr(model, "full_feature_dim", None)
+        # 再構築が必要か: probe に次元があり、モデル側が未フル or 次元が一致しない場合は再構築
         need_rebuild = False
-        if full_dim and (not cur_full):
-            need_rebuild = True
-        if full_dim and in_features is not None and in_features != full_dim:
-            need_rebuild = True
+        if full_dim is not None:
+            try:
+                full_dim_i = int(full_dim)
+            except Exception:
+                full_dim_i = None
+            if full_dim_i is not None:
+                if (not cur_full) or (model_full is None) or (int(model_full) != full_dim_i):
+                    need_rebuild = True
         if need_rebuild:
             device = next(model.parameters()).device if hasattr(model, "parameters") else None
             device_str = str(device) if device is not None else resolve_device(config, context="main")
@@ -136,7 +144,7 @@ def _maybe_rebuild_full_model(config: Dict[str, Any], model: PolicyValueNet, age
                 num_players=config.get("num_players", 4),
                 device=device_str,
                 use_full_features=True,
-                full_feature_dim=int(full_dim),
+                full_feature_dim=int(full_dim_i),
             )
             for ag in agents:
                 try:
@@ -175,6 +183,9 @@ def create_env_and_agents(
         agents.append(ag)
     # 環境作成
     env = DaifugoSimpleEnv(num_players=num_players, agent_classes=None)
+    # デバッグオプション設定
+    if bool(config.get("debug_action_mismatch", False)):
+        env.debug_action_mismatch = True
     # 文脈に応じて接続
     _attach_agent_context(
         agents,
@@ -189,6 +200,29 @@ def create_env_and_agents(
     )
     # フル特徴量時、必要なら入力次元に合わせて再構築
     model = _maybe_rebuild_full_model(config, model, agents, env)
+    # Optional: force model full feature dim override from config (useful when model expects legacy dim)
+    try:
+        forced = config.get('force_full_input_dim', None)
+        if forced is not None:
+            try:
+                fd = int(forced)
+                # apply to model attribute (best-effort)
+                try:
+                    model.full_feature_dim = fd
+                except Exception:
+                    pass
+                # also update existing agents' model references if they hold the model
+                for ag in agents:
+                    try:
+                        if getattr(ag, 'model', None) is not None:
+                            ag.model.full_feature_dim = fd
+                    except Exception:
+                        pass
+                print(f"[INFO] forced model.full_feature_dim to {fd} via config.force_full_input_dim")
+            except Exception:
+                pass
+    except Exception:
+        pass
     return AgentEnvBundle(model=model, agents=agents, env=env, device=device, loaded_from_checkpoint=loaded)
 
 

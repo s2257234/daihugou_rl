@@ -292,13 +292,15 @@ def run_puct_mcts(root_env_copy,
     policy_root, root_value = policy_value_fn(root_env_copy)
     # policy_root を合法手に合わせて補完・正規化
     if not policy_root:
-        policy_root = {a: 1.0 / len(legal_root) for a in legal_root}
+        # legal_root の要素を hashable に変換（list → tuple）
+        policy_root = {(tuple(a) if isinstance(a, list) else a): 1.0 / len(legal_root) for a in legal_root}
     else:
-        # 欠損を均等割当
-        missing = [a for a in legal_root if a not in policy_root]
+        # 欠損を均等割当（legal_root の要素を tuple に変換して比較）
+        missing = [(tuple(a) if isinstance(a, list) else a) for a in legal_root 
+                   if (tuple(a) if isinstance(a, list) else a) not in policy_root]
         total = sum(policy_root.values())
         if total <= 0:
-            policy_root = {a: 1.0 / len(legal_root) for a in legal_root}
+            policy_root = {(tuple(a) if isinstance(a, list) else a): 1.0 / len(legal_root) for a in legal_root}
         else:
             for k in list(policy_root.keys()):
                 policy_root[k] /= total
@@ -314,7 +316,9 @@ def run_puct_mcts(root_env_copy,
                     policy_root[k] /= s2
 
     root = PUCTNode(prior=1.0, to_play=root_player_id)
-    root.expand(root_player_id, {a: policy_root[a] for a in legal_root if a in policy_root})
+    # legal_root を tuple に変換して expand に渡す
+    legal_root_hashable = [(tuple(a) if isinstance(a, list) else a) for a in legal_root]
+    root.expand(root_player_id, {a: policy_root[a] for a in legal_root_hashable if a in policy_root})
     root.visit_count = 1
     # ルート初期値は「ルート手番プレイヤー視点」の成分を使用
     try:
@@ -388,7 +392,12 @@ def run_puct_mcts(root_env_copy,
                     p_new.hand = []
                     players_new.append(p_new)
                 g_new.players = players_new
-            g_new.current_field = []
+            # フィールドは常にルートと同じ状態からスタートさせる。
+            # これにより、スナップショット復元に失敗した場合でも「場が空」と誤認しない。
+            try:
+                g_new.current_field = list(getattr(g, 'current_field', []) or [])
+            except Exception:
+                g_new.current_field = []
             g_new.passed = list(getattr(g, 'passed', []))
             g_new.rankings = list(getattr(g, 'rankings', []))
             # RuleChecker は新規
@@ -730,19 +739,22 @@ def run_puct_mcts(root_env_copy,
                     # 合法手も併せて保存し、次回ヒット時の法生成を省略
                     TT[k] = (policy_leaf, leaf_value, leg)
             else:
-                # 安全側: 一様分布 + 0.0
-                policy_leaf, leaf_value = ({a: 1.0 / len(leg) for a in leg} if leg else {}), 0.0
+                # 安全側: 一様分布 + 0.0（leg の要素を tuple に変換）
+                policy_leaf, leaf_value = ({(tuple(a) if isinstance(a, list) else a): 1.0 / len(leg) for a in leg} if leg else {}), 0.0
 
             if not leg:
                 node.backup(leaf_value)
                 continue
             if not policy_leaf:
-                policy_leaf = {a: 1.0 / len(leg) for a in leg}
+                # leg の要素を hashable に変換（list → tuple）
+                policy_leaf = {(tuple(a) if isinstance(a, list) else a): 1.0 / len(leg) for a in leg}
             else:
-                missing_l = [a for a in leg if a not in policy_leaf]
+                # 欠損を均等割当（leg の要素を tuple に変換して比較）
+                missing_l = [(tuple(a) if isinstance(a, list) else a) for a in leg 
+                             if (tuple(a) if isinstance(a, list) else a) not in policy_leaf]
                 tot_l = sum(policy_leaf.values())
                 if tot_l <= 0:
-                    policy_leaf = {a: 1.0 / len(leg) for a in leg}
+                    policy_leaf = {(tuple(a) if isinstance(a, list) else a): 1.0 / len(leg) for a in leg}
                 else:
                     for k2 in list(policy_leaf.keys()):
                         policy_leaf[k2] /= tot_l
@@ -755,7 +767,9 @@ def run_puct_mcts(root_env_copy,
                     if s3 > 0:
                         for k2 in list(policy_leaf.keys()):
                             policy_leaf[k2] /= s3
-            node.expand(getattr(leaf_envs[i].game, 'turn', 0), {a: policy_leaf[a] for a in leg if a in policy_leaf})
+            # leg を tuple に変換して expand に渡す
+            leg_hashable = [(tuple(a) if isinstance(a, list) else a) for a in leg]
+            node.expand(getattr(leaf_envs[i].game, 'turn', 0), {a: policy_leaf[a] for a in leg_hashable if a in policy_leaf})
             node.backup(leaf_value)
 
         # 適用した仮想損失をリバート（正しい統計に戻す）

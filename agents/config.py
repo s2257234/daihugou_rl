@@ -22,6 +22,9 @@ ALPHA_ZERO_CONFIG = {
     "batch_size": 256,               # 学習バッチサイズ (train_step 実装時に利用)
     "lr": 1e-4,                      # 学習率　初期値0.0001
     "weight_decay": 1e-3,          # L2 正則化　初期値1e-4
+    # Value Head専用の正則化（過学習対策）
+    "value_head_weight_decay": 5e-3,  # Value Headに強めのWeight Decay (通常の5倍)
+    "value_head_lr_scale": 0.7,       # Value Headの学習率スケール (通常の半分)
     "value_loss_coef": 1.0,          # 価値損失係数
     "policy_loss_coef": 1.0,         # 方策損失係数
     "entropy_coef": 1e-3,             # エントロピー正則化
@@ -66,13 +69,13 @@ ALPHA_ZERO_CONFIG = {
     "temperature_decay_moves": 20,   # この手数以降は温度を 0 (argmax) にする等のスケジューリング用目安
     # 温度スケジュール（序盤高温→後半低温、自己対戦エピソード進行で高温手数を短縮）
     # デフォルト: 最初の10手は τ=0.6、それ以降は τ=0.1。エピソードが進むと高温手数を段階的に短縮（最低2手を維持）
-    "temp_high_value": 1.0,            # 高温 τ (0.8→0.6に下げて過度なランダム性を抑制)
+    "temp_high_value": 2.0,            # 高温 τ (0.8→0.6に下げて過度なランダム性を抑制)
     "temp_low_value": 0.1,              # 低温 τ
-    "temp_high_moves_initial": 16,      # 高温適用の初期手数
+    "temp_high_moves_initial": 10,      # 高温適用の初期手数
     "temp_high_moves_min": 4,           # 高温適用の最低手数
     "temp_high_moves_decay_every": 1000, # 何エピソードごとに高温手数を1手短縮するか
     # 序盤ランダム化: 指定手数までは完全ランダムに行動 (探索温度の代替オプション)
-    "opening_random_enable": True,    # True で有効化
+    "opening_random_enable": False,    # True で有効化
     "opening_random_moves": 2,          # >0 で有効。例: 3 なら最初の3手をランダム行動
     "opening_random_include_pass": False,  # True なら pass もランダム候補に含める
     # 学習ターゲットπの温度（行動サンプリングとは分離）
@@ -140,6 +143,13 @@ ALPHA_ZERO_CONFIG = {
     "opponent_sim_scale": 0.125,  # 約1/8
     "opponent_sim_min": 8,
 
+    # ---------------------------
+    # デバッグオプション
+    # ---------------------------
+    # 環境コピー時の状態検証を有効化（開発時のみ推奨）
+    "debug_copy_verification": False,
+    # MCTS children と実環境の合法手不一致を検出してログ出力
+    "debug_action_mismatch": False,
     
     "enable_root_parallelism": True,  # ルート並列処理の有効化
     "enable_central_batch_inference": False,  # 中央バッチ推論サーバの有効化
@@ -211,9 +221,9 @@ ALPHA_ZERO_CONFIG = {
     "ingest_pick_newest": True,
     "ingest_max_samples_per_file": 5000,
     "active_file_pool_size": 40,  # メモリ削減: アクティブに監視するファイル数
-    "active_file_refresh_every_updates": 1000,  # 何更新ごとにアクティブファイルリストを更新するか
-    "active_file_pool_refresh_fraction": 0.2,  # プール内の何割を更新するか
-    "active_file_newest_bias": 0.1,  # 新しいファイルを選ぶバイアス (0.0-1.0)
+    "active_file_refresh_every_updates": 600,  # 何更新ごとにアクティブファイルリストを更新するか
+    "active_file_pool_refresh_fraction": 0.3,  # プール内の何割を更新するか
+    "active_file_newest_bias": 0.05,  # 新しいファイルを選ぶバイアス (0.0-1.0)
     # resume_defer_preload有効時の初期ロードファイル数（デフォルトはingest_max_filesと同じ）
     "resume_initial_load_files": None,  # None時はingest_max_filesを使用
     
@@ -222,14 +232,14 @@ ALPHA_ZERO_CONFIG = {
     #   target_samples = dynamic_sample_base * (total_updates ** dynamic_sample_exponent)
     # ファイル数とサンプル数を両方動的に調整
     "enable_dynamic_sample_sizing": True,
-    "dynamic_sample_exponent": 0.75,  # total_updates の指数（0.75乗）
+    "dynamic_sample_exponent": 0.25,  # total_updates の指数（0.75乗）
     "dynamic_sample_base": 1.0,  # 基準係数（調整用）
-    "dynamic_sample_min_per_file": 500,  # ファイルあたりの最小サンプル数
+    "dynamic_sample_min_per_file": 200,  # ファイルあたりの最小サンプル数
     "dynamic_sample_max_per_file": 2500,  # ファイルあたりの最大サンプル数
     # ファイル数の動的調整
     "enable_dynamic_file_count": True,  # ファイル数も動的に調整
     "dynamic_samples_per_file_target": 2000,  # 1ファイルあたりの目標サンプル数
-    "dynamic_min_files": 5,  # 最小ファイル数
+    "dynamic_min_files": 10,  # 最小ファイル数
     "dynamic_max_files": 150,  # 最大ファイル数
 
     # full_input をリプレイサンプルに保持するか。

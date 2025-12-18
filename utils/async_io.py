@@ -58,6 +58,12 @@ class AsyncIOProcess:
     def enqueue_joblib_dump(self, obj: Any, path: str, **kwargs):
         self._enqueue({"op": "joblib_dump", "object": obj, "path": path, "kwargs": kwargs})
 
+    def enqueue_text_write(self, text: str, path: str, **kwargs):
+        """Enqueue a text write operation that will atomically write the provided
+        text to `path` (via tmp -> fsync -> replace) in the async process.
+        """
+        self._enqueue({"op": "text_write", "text": text, "path": path, "kwargs": kwargs})
+
     def _enqueue(self, job: Dict[str, Any]):
         if not self._started:
             self.start()
@@ -120,7 +126,62 @@ class AsyncIOProcess:
             elif op == "joblib_dump":
                 if joblib is None:
                     raise RuntimeError("joblib not available in async proc")
-                joblib.dump(job.get("object"), path, **kwargs)
+                # Atomic write: dump to a tmp file in same dir, fsync, then replace
+                try:
+                    dirp = os.path.dirname(path) or '.'
+                    os.makedirs(dirp, exist_ok=True)
+                    tmp = path + ".tmp"
+                    # joblib.dump will create/overwrite tmp
+                    joblib.dump(job.get("object"), tmp, **kwargs)
+                    # best-effort fsync the file to reduce partial-write visibility
+                    try:
+                        fd = os.open(tmp, os.O_RDONLY)
+                        try:
+                            os.fsync(fd)
+                        finally:
+                            os.close(fd)
+                    except Exception:
+                        pass
+                    # atomic replace
+                    try:
+                        os.replace(tmp, path)
+                    except Exception:
+                        # fallback: shutil.move
+                        import shutil
+                        shutil.move(tmp, path)
+                except Exception:
+                    # If atomic path fails, try a direct dump as last resort
+                    joblib.dump(job.get("object"), path, **kwargs)
+            elif op == "text_write":
+                # Atomic text write: write to tmp, fsync, then replace
+                try:
+                    dirp = os.path.dirname(path) or '.'
+                    os.makedirs(dirp, exist_ok=True)
+                    tmp = path + ".tmp"
+                    # write text file
+                    with open(tmp, 'w', encoding=kwargs.get('encoding', 'utf-8')) as f:
+                        f.write(job.get('text') or '')
+                    # best-effort fsync
+                    try:
+                        fd = os.open(tmp, os.O_RDONLY)
+                        try:
+                            os.fsync(fd)
+                        finally:
+                            os.close(fd)
+                    except Exception:
+                        pass
+                    try:
+                        os.replace(tmp, path)
+                    except Exception:
+                        import shutil
+                        shutil.move(tmp, path)
+                except Exception:
+                    # fallback: direct write
+                    try:
+                        with open(path, 'w', encoding=kwargs.get('encoding', 'utf-8')) as f:
+                            f.write(job.get('text') or '')
+                    except Exception:
+                        raise
             else:
                 ok = False
                 err_msg = f"unknown op {op}"
