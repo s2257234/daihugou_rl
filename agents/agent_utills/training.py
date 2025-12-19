@@ -4,8 +4,6 @@ Goal: keep AlphaZeroAgent lean by delegating the heavy `train_step` and related
 DataLoader helpers into a separate module (SRP).
 
 This module is intentionally agent-implementation-agnostic: it operates on the
-passed agent object and only assumes the agent exposes the attributes/methods
-used by the original implementation.
 """
 
 from __future__ import annotations
@@ -231,6 +229,31 @@ def _extract_value(sample: Any) -> Optional[float]:
     return _decode_value_u8(vu)
 
 
+def _iter_value_head_params(model: Any):
+    """Yield parameters belonging to the value head (best-effort).
+
+    Supports common patterns:
+    - model.value_head is an nn.Module
+    - model has named_parameters containing 'value_head'
+    """
+    # 1) Direct attribute
+    try:
+        vh = getattr(model, 'value_head', None)
+        if vh is not None and hasattr(vh, 'parameters'):
+            for p in vh.parameters():
+                yield p
+            return
+    except Exception:
+        pass
+    # 2) Fallback: name-based filter
+    try:
+        for name, p in getattr(model, 'named_parameters', lambda: [])():
+            if 'value_head' in str(name):
+                yield p
+    except Exception:
+        return
+
+
 def _has_value_label(sample: Any) -> bool:
     getter = None
     try:
@@ -300,7 +323,6 @@ class ReplaySnapshotDataset(Dataset):
         except Exception:
             is_w = 1.0
         return {
-            'state': s.get('state') or {},
             'pi_arr': pi_arr,
             'v_target': v_target,
             'uid': int(uid) if uid is not None else -1,
@@ -975,9 +997,9 @@ class TrainStepMixin:
                     # policy loss (各行で sum)
                     policy_loss_all = - (pi_pad_t * log_probs).sum(dim=1)
                     # value ロジット選択: 各サンプルに埋め込まれた視点(self_player_id)に対応する列を選ぶ
+                    # NOTE: ここは「学習グラフに含める必要がある」ため no_grad / detach を絶対に使わない。
                     # (保存時の player_id と学習エージェントの player_id が異なるバッチを許容するため)
                     try:
-                        import torch as _t
                         # states は現在バッチの state dict リスト
                         pids_list = []
                         for st in states:
@@ -989,29 +1011,20 @@ class TrainStepMixin:
                                     pids_list.append(int(getattr(self, 'player_id', 0)))
                             except Exception:
                                 pids_list.append(int(getattr(self, 'player_id', 0)))
-                        pids_t = _t.tensor(pids_list, device=device, dtype=_t.long)
+                        pids_t = torch.tensor(pids_list, device=device, dtype=torch.long)
                         # value_logits_batch: [B, num_players] (or variants)
                         if hasattr(value_logits_batch, 'dim') and value_logits_batch.dim() == 2:
-                            num_cols = value_logits_batch.size(1)
-                            # avoid out-of-range indices
-                            max_pid = int(pids_t.max().item()) if pids_t.numel() > 0 else 0
-                            # fast-path: if all pids are 0 (canonicalized), just take column 0
+                            num_cols = int(value_logits_batch.size(1))
                             if pids_t.numel() > 0 and int(pids_t.max().item()) == 0:
-                                try:
-                                    v_logits = value_logits_batch[:, 0]
-                                except Exception:
-                                    v_logits = value_logits_batch.gather(1, pids_t.unsqueeze(1).clamp(max=num_cols - 1)).squeeze(1)
+                                # fast-path: all indices are 0
+                                v_logits = value_logits_batch[:, 0]
                             else:
-                                if max_pid >= num_cols:
-                                    # clamp indices to available columns (fallback)
-                                    pids_norm = pids_t.clamp(max=num_cols - 1)
-                                else:
-                                    pids_norm = pids_t
+                                pids_norm = pids_t.clamp(min=0, max=num_cols - 1)
                                 v_logits = value_logits_batch.gather(1, pids_norm.unsqueeze(1)).squeeze(1)
                         elif hasattr(value_logits_batch, 'dim') and value_logits_batch.dim() == 1:
                             # rare: model returned (num_players,) for whole batch
                             sel = int(pids_list[0]) if pids_list else int(getattr(self, 'player_id', 0))
-                            sel = max(0, min(sel, value_logits_batch.numel() - 1))
+                            sel = max(0, min(sel, int(value_logits_batch.numel()) - 1))
                             v_logits = value_logits_batch[sel].unsqueeze(0)
                         else:
                             # fallback
@@ -1097,6 +1110,71 @@ class TrainStepMixin:
                                 print(f"[DEBUG_VALUE_STATS] mean_logit={mean_vl} std_logit={std_vl} mean_target={mean_vt} min_target={min_vt} max_target={max_vt} count={count} ones={count_ones} samples=[{', '.join(pairs)}]")
                             except Exception as _e:
                                 print(f"[DEBUG_VALUE_STATS] failed: {_e}")
+                    except Exception:
+                        pass
+                    # Extra debug: show predicted probability stats and near-0.5 rate
+                    try:
+                        if bool(self.config.get('debug_value_flow', True)):
+                            import numpy as _np
+                            import torch as _t
+                            with _t.no_grad():
+                                vp = _t.sigmoid(v_logits).detach().cpu().numpy()
+                                vt = v_targets_t.detach().cpu().numpy()
+                            mean_p = float(_np.mean(vp)) if vp.size else None
+                            std_p = float(_np.std(vp)) if vp.size else None
+                            min_p = float(_np.min(vp)) if vp.size else None
+                            max_p = float(_np.max(vp)) if vp.size else None
+                            try:
+                                near_half = int(_np.sum(_np.abs(vp - 0.5) < 0.02))
+                            except Exception:
+                                near_half = 0
+                            zeros = int(_np.sum(_np.isclose(vt, 0.0))) if vt.size else 0
+                            ones = int(_np.sum(_np.isclose(vt, 1.0))) if vt.size else 0
+                            print(
+                                f"[DEBUG_VALUE_FLOW] p_mean={mean_p} p_std={std_p} p_min={min_p} p_max={max_p} "
+                                f"near0.5(±0.02)={near_half}/{int(vp.size)} targets0/1={zeros}/{ones}"
+                            )
+                    except Exception:
+                        pass
+
+                    # Extra debug 2: verify value-head selection (multi-player) and weight norms
+                    try:
+                        if bool(self.config.get('debug_value_flow', True)):
+                            # 1) selection sanity: what sample_pid indices are used?
+                            try:
+                                from collections import Counter as _Counter
+                                pid_counts = _Counter()
+                                for st_i in states:
+                                    try:
+                                        if isinstance(st_i, dict) and ('self_player_id' in st_i):
+                                            spid = int(st_i.get('self_player_id'))
+                                        else:
+                                            spid = int(getattr(self, 'player_id', 0))
+                                        pid_counts[spid] += 1
+                                    except Exception:
+                                        pid_counts['err'] += 1
+                                pid_repr = ", ".join([f"{k}:{v}" for k, v in pid_counts.most_common(8)])
+                            except Exception:
+                                pid_repr = "n/a"
+
+                            # 2) value_head weight norm (grad norm is printed after backward)
+                            if not hasattr(self, '_dbg_vflow_once'):
+                                self._dbg_vflow_once = True  # type: ignore[attr-defined]
+                                import math as _math
+                                w_sq = 0.0
+                                n_w = 0
+                                for name, p in getattr(self.model, 'named_parameters', lambda: [])():
+                                    if 'value_head' not in str(name):
+                                        continue
+                                    try:
+                                        if p is not None:
+                                            w = p.detach()
+                                            w_sq += float((w * w).sum().item())
+                                            n_w += int(w.numel())
+                                    except Exception:
+                                        pass
+                                w_norm = _math.sqrt(w_sq) if w_sq >= 0 else None
+                                print(f"[DEBUG_VALUE_FLOW2] sample_pid_counts={pid_repr} value_head_w_norm={w_norm} n_w={n_w}")
                     except Exception:
                         pass
                     # Monitor terminal predictions: warn if terminal samples predicted low
@@ -1605,6 +1683,40 @@ class TrainStepMixin:
         # value_head specific grad norm (computed when grads exist)
         value_head_grad_norm = None
         weight_norm = None
+
+        def _iter_vh_params_local():
+            for _p in _iter_value_head_params(self.model):
+                yield _p
+
+        # Debug: capture a lightweight snapshot of value_head before update.
+        # Some model variants may not expose value_head early; keep explicit counts.
+        vh_norm_before = None
+        vh_param_count_before = 0
+        vh_numel_before = 0
+        vh_sample0_before = None
+        if bool(self.config.get('debug_value_flow', False)):
+            try:
+                import math as _m
+                s = 0.0
+                for _p in _iter_vh_params_local():
+                    try:
+                        w = _p.detach()
+                        s += float((w * w).sum().item())
+                        vh_param_count_before += 1
+                        try:
+                            vh_numel_before += int(w.numel())
+                        except Exception:
+                            pass
+                        if vh_sample0_before is None:
+                            try:
+                                vh_sample0_before = float(w.reshape(-1)[0].item())
+                            except Exception:
+                                vh_sample0_before = None
+                    except Exception:
+                        continue
+                vh_norm_before = float(_m.sqrt(s)) if vh_param_count_before > 0 else None
+            except Exception:
+                vh_norm_before = None
         if _use_amp and getattr(self, '_amp_scaler', None) is not None:
             try:
                 # scale the loss, backward, then unscale for clipping
@@ -1628,7 +1740,7 @@ class TrainStepMixin:
                                 continue
                     # value_head grad norm
                     try:
-                        for p in getattr(self.model, 'value_head', []).parameters():
+                        for p in _iter_vh_params_local():
                             if getattr(p, 'grad', None) is not None:
                                 try:
                                     gnorm = float(p.grad.detach().cpu().norm().item())
@@ -1675,7 +1787,7 @@ class TrainStepMixin:
                                     except Exception:
                                         continue
                             try:
-                                for p in getattr(self.model, 'value_head', []).parameters():
+                                for p in _iter_vh_params_local():
                                     if getattr(p, 'grad', None) is not None:
                                         try:
                                             gnorm = float(p.grad.detach().cpu().norm().item())
@@ -1714,7 +1826,7 @@ class TrainStepMixin:
                             except Exception:
                                 continue
                     try:
-                        for p in getattr(self.model, 'value_head', []).parameters():
+                        for p in _iter_vh_params_local():
                             if getattr(p, 'grad', None) is not None:
                                 try:
                                     gnorm = float(p.grad.detach().cpu().norm().item())
@@ -1737,6 +1849,19 @@ class TrainStepMixin:
                 did_update = True
             except Exception:
                 did_update = False
+
+        # Debug: after backward, report value_head grad norm if enabled
+        if bool(self.config.get('debug_value_flow', True)):
+            _msg = f"[DEBUG_VALUE_GRAD] value_head_grad_norm={value_head_grad_norm} total_grad_norm={grad_norm} did_update={did_update}"
+            try:
+                print(_msg)
+            except Exception:
+                pass
+            try:
+                if hasattr(self, 'logger') and getattr(self, 'logger', None) is not None and hasattr(self.logger, 'log_text'):
+                    self.logger.log_text(_msg)
+            except Exception:
+                pass
         # Scheduler step (warmup+cosine) — optimizer 実ステップがあった時のみ実行
         try:
             if did_update:
@@ -1783,9 +1908,152 @@ class TrainStepMixin:
         except Exception:
             weight_norm = None
 
+        # Debug: quantify value_head update magnitude (delta)
+        if bool(self.config.get('debug_value_flow', True)) and bool(self.config.get('debug_value_delta_in_train_step', False)):
+            try:
+                import math as _m
+
+                s = 0.0
+                vh_param_count_after = 0
+                vh_numel_after = 0
+                vh_sample0_after = None
+                for _p in _iter_vh_params_local():
+                    try:
+                        w = _p.detach()
+                        s += float((w * w).sum().item())
+                        vh_param_count_after += 1
+                        try:
+                            vh_numel_after += int(w.numel())
+                        except Exception:
+                            pass
+                        if vh_sample0_after is None:
+                            try:
+                                vh_sample0_after = float(w.reshape(-1)[0].item())
+                            except Exception:
+                                vh_sample0_after = None
+                    except Exception:
+                        continue
+
+                vh_norm_after = float(_m.sqrt(s)) if vh_param_count_after > 0 else None
+                vh_delta_norm = None
+                if (vh_norm_before is not None) and (vh_norm_after is not None):
+                    vh_delta_norm = float(abs(vh_norm_after - vh_norm_before))
+                vh_sample0_delta = None
+                if (vh_sample0_before is not None) and (vh_sample0_after is not None):
+                    try:
+                        vh_sample0_delta = float(vh_sample0_after - vh_sample0_before)
+                    except Exception:
+                        vh_sample0_delta = None
+
+                msg3 = (
+                    f"[DEBUG_VALUE_DELTA] w_norm_before={vh_norm_before} w_norm_after={vh_norm_after} abs_delta_norm={vh_delta_norm} "
+                    f"params_before={vh_param_count_before} params_after={vh_param_count_after} "
+                    f"numel_before={vh_numel_before} numel_after={vh_numel_after} "
+                    f"sample0_before={vh_sample0_before} sample0_after={vh_sample0_after} sample0_delta={vh_sample0_delta}"
+                )
+                try:
+                    print(msg3)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, 'logger') and getattr(self, 'logger', None) is not None and hasattr(self.logger, 'log_text'):
+                        self.logger.log_text(msg3)
+                except Exception:
+                    pass
+                if vh_param_count_before == 0 and vh_param_count_after > 0:
+                    try:
+                        print("[DEBUG_VALUE_DELTA_NOTE] value_head params not visible before step; delta_norm may be unavailable")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Debug: stable per-step delta using optimizer's value_head param group
+        # (works even if model.named_parameters() can't see value_head early)
+        try:
+            debug_delta_step = bool(self.config.get('debug_value_flow', True)) and bool(
+                self.config.get('debug_value_delta_in_step', True)
+            )
+        except Exception:
+            debug_delta_step = False
+
+        if debug_delta_step:
+            try:
+                import torch
+
+                def _get_vh_group_params(opt):
+                    try:
+                        for g in getattr(opt, 'param_groups', []) or []:
+                            try:
+                                if g.get('name', None) == 'value_head':
+                                    return list(g.get('params', []) or [])
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                    return []
+
+                vh_group_params = _get_vh_group_params(self._optimizer)
+                with torch.no_grad():
+                    if vh_group_params:
+                        flat = torch.cat([p.detach().reshape(-1).to('cpu') for p in vh_group_params])
+                        vh_numel_step = int(flat.numel())
+                        vh_norm_step = float(torch.linalg.vector_norm(flat).item()) if vh_numel_step > 0 else None
+                        vh_sample0_step = float(flat[0].item()) if vh_numel_step > 0 else None
+                    else:
+                        vh_numel_step = 0
+                        vh_norm_step = None
+                        vh_sample0_step = None
+
+                prev = getattr(self, '_debug_vh_step_snapshot', None)
+                if prev is None:
+                    msg = f"[DEBUG_VALUE_DELTA_STEP] init numel={vh_numel_step} norm={vh_norm_step} sample0={vh_sample0_step}"
+                else:
+                    dn = None
+                    ds0 = None
+                    try:
+                        if (vh_norm_step is not None) and (prev.get('norm') is not None):
+                            dn = float(abs(vh_norm_step - prev.get('norm')))
+                    except Exception:
+                        dn = None
+                    try:
+                        if (vh_sample0_step is not None) and (prev.get('sample0') is not None):
+                            ds0 = float(vh_sample0_step - prev.get('sample0'))
+                    except Exception:
+                        ds0 = None
+                    msg = (
+                        f"[DEBUG_VALUE_DELTA_STEP] numel={vh_numel_step} norm={vh_norm_step} sample0={vh_sample0_step} "
+                        f"abs_dnorm={dn} dsample0={ds0}"
+                    )
+                try:
+                    print(msg)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, 'logger') and getattr(self, 'logger', None) is not None and hasattr(self.logger, 'log_text'):
+                        self.logger.log_text(msg)
+                except Exception:
+                    pass
+                setattr(self, '_debug_vh_step_snapshot', {'numel': vh_numel_step, 'norm': vh_norm_step, 'sample0': vh_sample0_step})
+            except Exception:
+                pass
+
         # 追加メトリクス計算（共通ユーティリティに委譲, pos_rate はローカルで算出）
         policy_kl = None
         policy_top1 = None
+
+        # Debug (end of step): report grad norms once computed
+        if bool(self.config.get('debug_value_flow', True)):
+            _msg2 = f"[DEBUG_VALUE_GRAD_END] value_head_grad_norm={value_head_grad_norm} total_grad_norm={grad_norm} did_update={did_update}"
+            try:
+                print(_msg2)
+            except Exception:
+                pass
+            try:
+                if hasattr(self, 'logger') and getattr(self, 'logger', None) is not None and hasattr(self.logger, 'log_text'):
+                    self.logger.log_text(_msg2)
+            except Exception:
+                pass
         value_acc = None
         value_brier = None
         pos_rate = None

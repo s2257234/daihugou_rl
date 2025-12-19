@@ -1257,6 +1257,59 @@ class AlphaZeroAgent(TrainStepMixin):
                         value_head_params.append(param)
                     else:
                         other_params.append(param)
+
+                # Debug: value_head delta snapshot (ensure_optimizerはvalue_head可視な地点)
+                try:
+                    if bool(self.config.get('debug_value_flow', True)) and bool(self.config.get('debug_value_delta_in_optimizer', True)):
+                        vh_numel = 0
+                        vh_sample0 = None
+                        vh_norm = None
+                        if value_head_params:
+                            with torch.no_grad():
+                                flat = torch.cat([p.detach().reshape(-1).to('cpu') for p in value_head_params])
+                                vh_numel = int(flat.numel())
+                                vh_sample0 = float(flat[0].item()) if vh_numel > 0 else None
+                                vh_norm = float(torch.linalg.vector_norm(flat).item())
+
+                        prev = getattr(self, '_debug_vh_snapshot', None)
+                        if prev is None:
+                            print(
+                                f"[DEBUG_VALUE_DELTA_OPT] init numel={vh_numel} norm={vh_norm} sample0={vh_sample0}"
+                            )
+                        else:
+                            try:
+                                dn = None
+                                ds0 = None
+                                if vh_norm is not None and prev.get('norm') is not None:
+                                    dn = float(abs(vh_norm - prev.get('norm')))
+                                if vh_sample0 is not None and prev.get('sample0') is not None:
+                                    ds0 = float(vh_sample0 - prev.get('sample0'))
+                                print(
+                                    f"[DEBUG_VALUE_DELTA_OPT] numel={vh_numel} norm={vh_norm} sample0={vh_sample0} "
+                                    f"abs_dnorm={dn} dsample0={ds0}"
+                                )
+                            except Exception:
+                                print(
+                                    f"[DEBUG_VALUE_DELTA_OPT] numel={vh_numel} norm={vh_norm} sample0={vh_sample0}"
+                                )
+
+                        setattr(self, '_debug_vh_snapshot', {'numel': vh_numel, 'norm': vh_norm, 'sample0': vh_sample0})
+                except Exception:
+                    pass
+
+                # Debug: show whether value_head is trainable / included
+                try:
+                    if bool(self.config.get('debug_value_flow', True)):
+                        vh_all = 0
+                        vh_trainable = 0
+                        for name, param in self.model.named_parameters():
+                            if 'value_head' in name:
+                                vh_all += 1
+                                if bool(getattr(param, 'requires_grad', True)):
+                                    vh_trainable += 1
+                        print(f"[DEBUG_OPT] value_head_named_params={vh_all} trainable={vh_trainable} grouped={len(value_head_params)}")
+                except Exception:
+                    pass
                 
                 # パラメータグループを作成
                 param_groups = []
@@ -1276,6 +1329,31 @@ class AlphaZeroAgent(TrainStepMixin):
                 
                 if param_groups:
                     self._optimizer = torch.optim.Adam(param_groups)
+                    try:
+                        if bool(self.config.get('debug_value_flow', True)):
+                            # summarize param group sizes
+                            gsz = []
+                            for g in self._optimizer.param_groups:
+                                try:
+                                    nm = g.get('name', 'main')
+                                except Exception:
+                                    nm = 'main'
+                                try:
+                                    n = sum(int(p.numel()) for p in g.get('params', []) if p is not None)
+                                except Exception:
+                                    n = None
+                                try:
+                                    glr = g.get('lr', None)
+                                except Exception:
+                                    glr = None
+                                try:
+                                    gwd = g.get('weight_decay', None)
+                                except Exception:
+                                    gwd = None
+                                gsz.append(f"{nm}:n={n}:lr={glr}:wd={gwd}")
+                            print(f"[DEBUG_OPT] param_groups=" + ", ".join(gsz))
+                    except Exception:
+                        pass
                 else:
                     self._optimizer = None
             except Exception:
