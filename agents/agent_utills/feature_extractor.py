@@ -245,7 +245,8 @@ class StateComposer:
       # Self block
       self_bits = self._ce.encode_bits_53(getattr(me, 'hand', []))
       self_pass = 1.0 if (pid < len(getattr(g, 'passed', [])) and getattr(g, 'passed')[pid]) else 0.0
-      self_remain = len(getattr(me, 'hand', [])) / 53.0
+      # hand_size / 14.0 でスケール (max hand_size=14 基準で 0-1 範囲に正規化)
+      self_remain = len(getattr(me, 'hand', [])) / 14.0
       feat: List[float] = self_bits + [self_pass, self_remain]
 
       # Opponent summaries (+ optional hand_labels)
@@ -287,7 +288,8 @@ class StateComposer:
 
       for i in opponents:
         try:
-          opp_rem = len(g.players[i].hand) / 53.0
+          # hand_size / 14.0 でスケール (max hand_size=14 基準で 0-1 範囲に正規化)
+          opp_rem = len(g.players[i].hand) / 14.0
         except Exception:
           opp_rem = 0.0
         feat.append(opp_rem)
