@@ -15,6 +15,8 @@ from typing import List, Dict
 
 import matplotlib.pyplot as plt
 from matplotlib import rcParams
+import textwrap as _tw
+import re
 
 # 日本語フォント対応（Windows想定のフォントを優先）
 rcParams["axes.unicode_minus"] = False
@@ -175,9 +177,78 @@ def plot_eval(elo_dir: str, out_dir: str, show: bool = False):
         b2 = ax.bar(x, r2, bottom=r1, label="2位率", color="#1f77b4")
         b3 = ax.bar(x, r3, bottom=[a+b for a,b in zip(r1,r2)], label="3位率", color="#ff7f0e")
         b4 = ax.bar(x, r4, bottom=[a+b+c for a,b,c in zip(r1,r2,r3)], label="4位率", color="#d62728")
-        ax.set_xticks(x, agents, rotation=45, ha="right")
+        # エージェント名が長くなると斜め表示で切れるため、横向き(平行)にして2段に折り返す
+        def _two_line_label(s: str) -> str:
+            # 目安幅: 文字列長の半分以上を1行目にして、2行で表示する
+            if not s:
+                return s
+            # try to wrap into at most 2 lines
+            max_width = max(10, (len(s) + 1) // 2)
+            parts = _tw.wrap(s, width=max_width)
+            if len(parts) == 0:
+                return s
+            if len(parts) == 1:
+                # if still long, forcibly split in middle
+                if len(s) > max_width * 2:
+                    mid = len(s) // 2
+                    return s[:mid] + "\n" + s[mid:]
+                return parts[0]
+            # join remaining parts into second line to limit to 2 lines
+            first = parts[0]
+            second = " ".join(parts[1:])
+            return first + "\n" + second
+
+        # 各エージェント名は1行にまとめ、2行目に常に 'Agents' を表示する
+        def _one_line_label(s: str) -> str:
+            # 改行を除去し連続空白を単一スペースにし、長すぎる場合は末尾を '...' で切る
+            if not s:
+                return s
+            s1 = s.replace('\n', ' ')
+            s1 = ' '.join(s1.split())
+            # 制限長は元の幅目安の2行分
+            max_width = max(10, (len(s1) + 1) // 2)
+            max_len = max_width * 2
+            if len(s1) > max_len:
+                return s1[: max_len - 3] + '...'
+            return s1
+
+        labels = []
+        for a in agents:
+            # 過去チェックポイント形式 'AlphaZeroAgent@basename' の場合は
+            # 1行目に 'AlphaZero' を、2行目に basename を表示する。
+            try:
+                if '@' in a:
+                    left, right = a.split('@', 1)
+                    base = re.sub(r'(?i)agent', '', left).strip()
+                    # basename から先頭の 'policy_value_' を取り除き、例: policy_value_ep40000.pt -> ep40000.pt
+                    try:
+                        second = os.path.basename(right)
+                        second = re.sub(r'(?i)^policy_value_', '', second)
+                    except Exception:
+                        second = os.path.basename(right)
+                else:
+                    base = re.sub(r'(?i)agent', '', a).strip()
+                    second = 'Agents'
+            except Exception:
+                base = a
+                second = 'Agents'
+            base_oneline = _one_line_label(base)
+            if not base_oneline:
+                base_oneline = _one_line_label(a)
+            labels.append(f"{base_oneline}\n{second}")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=0, ha="center")
+        # x軸ラベルをティックラベルの下に来るように調整
+        ax.xaxis.set_label_position('bottom')
+        ax.xaxis.set_ticks_position('bottom')
+        ax.set_xlabel("エージェント", labelpad=12)
+        # 下側の余白を確保して 2 行ラベルが切れないようにする
+        try:
+            fig.subplots_adjust(bottom=0.28)
+        except Exception:
+            pass
         ax.set_ylim(0, 1.0)
-        ax.set_ylabel("割合")
+        ax.set_ylabel("割合(%)")
         ax.set_title("最終モデルの強さ: 順位分布（積み上げ）")
         ax.legend(loc="upper right", ncol=4)
         ax.grid(axis="y", alpha=0.3)

@@ -121,7 +121,7 @@ class SignalAugmentation(nn.Module):
 class PolicyValueNet(nn.Module):
     def __init__(self,
                  max_policy_size: int = 128,
-                 hidden_size: int = 256,
+                 hidden_size: int = 128,
                  num_players: int = 4,
                  device: Optional[str] = None,
                  use_full_features: bool = True,
@@ -207,7 +207,7 @@ class PolicyValueNet(nn.Module):
         self.hidden_size = h  # メタ保存用
         self.backbone_in_dim = self.self_out_dim + self.context_out_dim  # encoders' output dims (self + context)
         # ---- Residual Blocks (MLP ResNet style) ----
-        # 要望: backbone 内に ResBlock x2 (Norm→ReLU→Linear→Norm→ReLU→Linear + Skip)
+        # backbone 内に ResBlock x6 (Norm→ReLU→Linear→Norm→ReLU→Linear + Skip)
         # 互換のため旧重み (backbone.0, backbone.2) は load() 時に投影へ移植。
 
         class ResBlock(nn.Module):
@@ -235,6 +235,10 @@ class PolicyValueNet(nn.Module):
         self.backbone = nn.Sequential(
             ResBlock(h, self.signal_augmentation),
             ResBlock(h, self.signal_augmentation),
+            ResBlock(h, self.signal_augmentation),
+            ResBlock(h, self.signal_augmentation),
+            ResBlock(h, self.signal_augmentation),
+            ResBlock(h, self.signal_augmentation),
         )
         # Policy head: 旧 Linear(h->max_policy_size) から MLP 化 (Linear->ReLU->Linear)
         # 旧 ckpt 互換: load() 側で 'policy_head.weight' が存在する場合は最終層へ移植
@@ -244,10 +248,11 @@ class PolicyValueNet(nn.Module):
             nn.Linear(h, max_policy_size),
         )
         # value_head: ロジット出力 (Sigmoid は呼び出し側で適用 / BCEWithLogitsLoss 用)
+        # Value head: single scalar logit per sample (Sigmoid applied by caller when needed)
         self.value_head = nn.Sequential(
             nn.Linear(h, h),
             nn.ReLU(),
-            nn.Linear(h, num_players),
+            nn.Linear(h, 1),
         )
         # 追加ヘッド: 相手手札予測（belief）
         self.enable_hand_prediction_head = bool(enable_hand_prediction_head)
@@ -401,8 +406,13 @@ class PolicyValueNet(nn.Module):
         h0 = self.backbone_proj(combined)
         h = self.backbone(h0)
         policy_logits = self.policy_head(h)
-        value_vec = self.value_head(h)
-        return policy_logits, value_vec
+        # value_head now outputs shape [B, 1] -> convert to [B] (squeeze last dim)
+        value_logits = self.value_head(h)
+        try:
+            value = value_logits.squeeze(-1)
+        except Exception:
+            value = value_logits
+        return policy_logits, value
 
     def forward(self, state_or_x: Any):
         """互換維持のため、辞書(state) か 1D/2D テンソルの両方を受け付ける。
@@ -416,11 +426,15 @@ class PolicyValueNet(nn.Module):
         else:
             x = state_or_x  # assume tensor-like
         pol, val = self._forward_from_tensor(x)
-        # 旧 forward は単一サンプルで 1D を返していたため互換のため squeeze
-        if pol.dim() == 2 and pol.size(0) == 1:
+        # 互換性: 単一サンプル時はバッチ次元を取り除く
+        if hasattr(pol, 'dim') and pol.dim() == 2 and pol.size(0) == 1:
             pol = pol.squeeze(0)
-        if val.dim() == 2 and val.size(0) == 1:
-            val = val.squeeze(0)
+        # val について: _forward_from_tensor は [B] またはスカラを返す
+        try:
+            if hasattr(val, 'dim') and val.dim() == 1 and val.size(0) == 1:
+                val = val.squeeze(0)
+        except Exception:
+            pass
         return pol, val
 
     def forward_with_belief(self, state_or_x: Any):
@@ -445,7 +459,11 @@ class PolicyValueNet(nn.Module):
         if len(parts) != 2:
             h = self.backbone(x.new_zeros(x.size(0), self.backbone_in_dim))
             policy_logits = self.policy_head(h)
-            value_vec = self.value_head(h)
+            value_logits = self.value_head(h)
+            try:
+                value_vec = value_logits.squeeze(-1)
+            except Exception:
+                value_vec = value_logits
             hand_logits = None
         else:
             self_feat, context_feat = parts
@@ -462,8 +480,11 @@ class PolicyValueNet(nn.Module):
                 hand_logits = None
         if policy_logits.dim() == 2 and policy_logits.size(0) == 1:
             policy_logits = policy_logits.squeeze(0)
-        if value_vec.dim() == 2 and value_vec.size(0) == 1:
-            value_vec = value_vec.squeeze(0)
+        try:
+            if hasattr(value_vec, 'dim') and value_vec.dim() == 1 and value_vec.size(0) == 1:
+                value_vec = value_vec.squeeze(0)
+        except Exception:
+            pass
         if hand_logits is not None and hand_logits.dim() == 2 and hand_logits.size(0) == 1:
             hand_logits = hand_logits.squeeze(0)
         return policy_logits, value_vec, hand_logits
@@ -473,7 +494,7 @@ class PolicyValueNet(nn.Module):
             # 空バッチ互換
             return (
                 torch.empty(0, self.max_policy_size, device=self.device),
-                torch.empty(0, self.num_players, device=self.device),
+                torch.empty(0, device=self.device),
             )
         xs = torch.stack([self._encode_state(s) for s in states], dim=0)
         return self._forward_from_tensor(xs)
@@ -520,19 +541,29 @@ class PolicyValueNet(nn.Module):
             if len(policy_logits) < n:
                 policy_logits += [0.0] * (n - len(policy_logits))
 
-        # value を Sigmoid で確率化してベクター返却
+        # value を Sigmoid で確率化して単一スカラーを返却
         try:
-            v_probs = value_vec_logits.sigmoid().detach().cpu().tolist()
-        except Exception:
-            try:
+            import torch as _t
+            if isinstance(value_vec_logits, _t.Tensor):
+                v = value_vec_logits
+                if v.dim() == 0:
+                    v_prob = float(_t.sigmoid(v).detach().cpu().item())
+                elif v.dim() == 1:
+                    # 1D の場合は先頭要素を採用（バッチでの単一サンプル想定）
+                    v_prob = float(_t.sigmoid(v[0]).detach().cpu().item()) if v.numel() > 0 else float(_t.sigmoid(v).detach().cpu().item())
+                else:
+                    # 予期せぬ高次元は平均化して安全側に処理
+                    v_prob = float(_t.sigmoid(v.mean()).detach().cpu().item())
+            else:
                 raw = value_vec_logits.tolist() if hasattr(value_vec_logits, 'tolist') else list(value_vec_logits)
                 import math as _m
-                v_probs = [float(1.0/(1.0+_m.exp(-float(x)))) for x in raw]
-            except Exception:
-                # 予期せぬ型の場合は安全側に均一分布
-                v_probs = [1.0 / float(self.num_players)] * int(self.num_players)
+                first = raw[0] if isinstance(raw, (list, tuple)) and raw else raw
+                v_prob = float(1.0 / (1.0 + _m.exp(-float(first))))
+        except Exception:
+            # フォールバック: 中立値 0.5
+            v_prob = 0.5
 
-        return policy_logits, v_probs
+        return policy_logits, v_prob
 
     def save(self, path: str, *, force_sync: bool = False):
         ckpt = {
@@ -663,6 +694,42 @@ class PolicyValueNet(nn.Module):
             model.load_state_dict(state_dict, strict=True)  # 追加ヘッド後互換
         except TypeError:
             model.load_state_dict(state_dict)
+        except RuntimeError:
+            # Handle potential shape mismatch for value_head when migrating from
+            # multi-player value outputs to single-scalar output.
+            try:
+                sd = state_dict
+                ms = model.state_dict()
+                # possible keys for final linear: 'value_head.2.weight'/'value_head.weight'
+                old_w = sd.get('value_head.2.weight', None) or sd.get('value_head.weight', None)
+                old_b = sd.get('value_head.2.bias', None) or sd.get('value_head.bias', None)
+                # pick target keys present in model
+                if 'value_head.2.weight' in ms:
+                    new_w_key = 'value_head.2.weight'
+                    new_b_key = 'value_head.2.bias'
+                else:
+                    new_w_key = 'value_head.weight'
+                    new_b_key = 'value_head.bias'
+                if old_w is not None and new_w_key in ms:
+                    import torch as _t
+                    ow = _t.as_tensor(old_w) if not isinstance(old_w, _t.Tensor) else old_w
+                    target_shape = tuple(ms[new_w_key].shape)
+                    # If old had multiple outputs and new has single output, average rows
+                    if ow.dim() == 2 and target_shape[0] == 1:
+                        nw = ow.mean(dim=0, keepdim=True)
+                        sd[new_w_key] = nw.cpu().numpy() if not isinstance(old_w, _t.Tensor) else nw
+                        if old_b is not None and new_b_key in ms:
+                            ob = _t.as_tensor(old_b) if not isinstance(old_b, _t.Tensor) else old_b
+                            nb = _t.tensor([float(ob.mean())], dtype=ob.dtype)
+                            sd[new_b_key] = nb.cpu().numpy() if not isinstance(old_b, _t.Tensor) else nb
+                # try load again permissively
+                try:
+                    model.load_state_dict(sd, strict=False)
+                except Exception:
+                    model.load_state_dict(sd)
+            except Exception:
+                # fallback: re-raise original
+                raise
         # map_location を指定していた場合はモデル本体をそのデバイスへ移動し device 属性を同期
         if map_location:
             try:

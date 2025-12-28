@@ -262,7 +262,11 @@ def run_puct_mcts(root_env_copy,
                   # virtual loss options (for single-process batched MCTS)
                   enable_virtual_loss: bool = True,
                   virtual_loss_count: int = 1,
-                  virtual_loss_value: float = -100.0):
+                  virtual_loss_value: float = -100.0,
+                  # stage/phase terminal override debug
+                  stage_terminal_debug: bool = False,
+                  stage_terminal_log_sample_rate: float = 0.0,
+                  stage_terminal_logger=None):
     """AlphaZero 風 PUCT MCTS 実行 (正規化 & 欠損補完対応版)。"""
     import time as _time
 
@@ -281,6 +285,13 @@ def run_puct_mcts(root_env_copy,
     # timing counters for legal action computation
     legal_calls = 0
     legal_total_s = 0.0
+
+    # stage-terminal override debug counters
+    stage_term_overrides = 0
+    stage_term_nn_skips = 0
+    stage_term_legal_skips = 0
+    stage_term_max_depth = 0
+    stage_term_winner_sample = None
 
     # ルート合法手
     t0_lr = _time.perf_counter()
@@ -366,6 +377,21 @@ def run_puct_mcts(root_env_copy,
     _clone_pool = []
     _pool_size = max(1, int(batch_eval_size or 1))
     try:
+        # Capture stage tracking state (if present) so clones can be isolated.
+        try:
+            _root_stage_id = getattr(root_env_copy, 'stage_id', None)
+        except Exception:
+            _root_stage_id = None
+        try:
+            _root_turn_idx = getattr(root_env_copy, 'turn_idx', None)
+        except Exception:
+            _root_turn_idx = None
+        try:
+            _root_already_won = getattr(root_env_copy, 'already_won_players', None)
+            _root_already_won = set(_root_already_won) if _root_already_won is not None else None
+        except Exception:
+            _root_already_won = None
+
         for _ in range(_pool_size):
             base_env = copy.copy(root_env_copy)
             g = getattr(root_env_copy, 'game', None)
@@ -409,6 +435,22 @@ def run_puct_mcts(root_env_copy,
             except Exception:
                 pass
             base_env.game = g_new
+            # IMPORTANT: isolate stage/phase tracking containers so MCTS simulations
+            # do not mutate the root env or other clones.
+            try:
+                if _root_stage_id is not None:
+                    base_env.stage_id = int(_root_stage_id)
+                if _root_turn_idx is not None:
+                    base_env.turn_idx = int(_root_turn_idx)
+                if _root_already_won is not None:
+                    base_env.already_won_players = set(_root_already_won)
+                else:
+                    # best-effort fallback: treat current rankings as already-won
+                    base_env.already_won_players = set(getattr(g_new, 'rankings', []) or [])
+                # stage_history must be a fresh list per clone
+                base_env.stage_history = []
+            except Exception:
+                pass
             _clone_pool.append(base_env)
     except Exception:
         _clone_pool = []
@@ -420,13 +462,72 @@ def run_puct_mcts(root_env_copy,
             try:
                 if snapshot_root is not None and hasattr(env_new.game, 'set_state_data'):
                     env_new.game.set_state_data(snapshot_root, card_lookup)
-                else:
-                    # フォールバック: 旧軽量コピー
-                    raise RuntimeError('no-snapshot')
-                return env_new
+                    return env_new
             except Exception:
                 pass
-            # フォールバック: 旧軽量コピー
+            # Snapshot が使えない場合でも、プールの clone を使って手動で状態を復元する。
+            # （浅い copy フォールバックは already_won_players 等を共有して汚染するため不可）
+            try:
+                g_src = getattr(root_env_copy, 'game', None)
+                g_dst = getattr(env_new, 'game', None)
+                if g_src is not None and g_dst is not None:
+                    try:
+                        g_dst.turn = int(getattr(g_src, 'turn', 0) or 0)
+                    except Exception:
+                        pass
+                    try:
+                        g_dst.current_field = list(getattr(g_src, 'current_field', []) or [])
+                    except Exception:
+                        pass
+                    try:
+                        g_dst.passed = list(getattr(g_src, 'passed', []) or [])
+                    except Exception:
+                        pass
+                    try:
+                        g_dst.rankings = list(getattr(g_src, 'rankings', []) or [])
+                    except Exception:
+                        pass
+                    try:
+                        g_dst.done = bool(getattr(g_src, 'done', False))
+                    except Exception:
+                        pass
+                    # hands
+                    try:
+                        ps = getattr(g_src, 'players', []) or []
+                        pd = getattr(g_dst, 'players', []) or []
+                        for i in range(min(len(ps), len(pd))):
+                            pd[i].hand = list(getattr(ps[i], 'hand', []) or [])
+                    except Exception:
+                        pass
+
+                # stage/phase tracking isolation
+                try:
+                    env_new.stage_id = int(getattr(root_env_copy, 'stage_id', getattr(env_new, 'stage_id', 0)) or 0)
+                except Exception:
+                    pass
+                try:
+                    env_new.turn_idx = int(getattr(root_env_copy, 'turn_idx', getattr(env_new, 'turn_idx', 0)) or 0)
+                except Exception:
+                    pass
+                try:
+                    aw = getattr(root_env_copy, 'already_won_players', None)
+                    env_new.already_won_players = set(aw) if aw is not None else set()
+                except Exception:
+                    try:
+                        env_new.already_won_players = set()
+                    except Exception:
+                        pass
+                try:
+                    env_new.stage_history = []
+                except Exception:
+                    pass
+                return env_new
+            except Exception:
+                # If even manual restore fails, fall through to slow path.
+                try:
+                    _clone_pool.append(env_new)
+                except Exception:
+                    pass
         # ルートと同じ軽量コピー方針
         g = env.game
         g_new = copy.copy(g)
@@ -463,6 +564,12 @@ def run_puct_mcts(root_env_copy,
             g_new.deck = None
         env_new = copy.copy(env)
         env_new.game = g_new
+        # isolate stage tracking containers (best-effort)
+        try:
+            aw = getattr(env, 'already_won_players', None)
+            env_new.already_won_players = set(aw) if aw is not None else set()
+        except Exception:
+            pass
         return env_new
 
     # トランスポジションテーブル（None の場合はキャッシュ無効）
@@ -607,6 +714,7 @@ def run_puct_mcts(root_env_copy,
         leaf_envs = []
         leaf_keys = []
         leaf_legal = []
+        leaf_terminal_values = []
         virtual_counts = {}
         # min_sims を超えたらバッチサイズを縮小（より細かな early stop タイミング）
         cur_batch_size = batch_eval_size
@@ -628,11 +736,131 @@ def run_puct_mcts(root_env_copy,
                     pass  # フォールバックでそのまま
             node = root
             # 選択
+            terminal_value = None
+            depth = 0
             while node.children:
                 node = _puct_select(node, c_puct, virtual_counts)
                 # 同一バッチ中に同じ経路が過剰に選ばれないよう仮想訪問を加算
                 virtual_counts[id(node)] = virtual_counts.get(id(node), 0) + 1
+                # --- stage-terminal detection (phase ends when a new winner appears) ---
+                try:
+                    prev_already_won = set(getattr(env_copy, 'already_won_players', set()) or set())
+                except Exception:
+                    prev_already_won = set()
+
+                # NOTE: "Terminal" for Daihugou means: the acting (to-play) player
+                # has just emptied their hand (rank fixed) at the moment they play.
+                try:
+                    acting_pid = int(getattr(getattr(env_copy, 'game', None), 'turn', 0) or 0)
+                except Exception:
+                    acting_pid = 0
+
                 _step_env_fast(env_copy, node.action)
+                depth += 1
+                stage_ended = False
+                stage_end_reason = None
+
+                # Primary definition: acting player emptied their hand right after the action.
+                try:
+                    g_after = getattr(env_copy, 'game', None)
+                    players_after = getattr(g_after, 'players', []) or []
+                    if 0 <= acting_pid < len(players_after):
+                        hand_after = getattr(players_after[acting_pid], 'hand', []) or []
+                        if len(hand_after) == 0 and acting_pid not in prev_already_won:
+                            stage_ended = True
+                            stage_end_reason = 'acting_hand_empty'
+                except Exception:
+                    pass
+
+                if stage_ended:
+                    try:
+                        g2 = getattr(env_copy, 'game', None)
+                        winner_id = int(acting_pid)
+                        # Exact stage-terminal labels: winner=1, other not-yet-won players=0.
+                        try:
+                            n_players = int(getattr(g2, 'num_players', len(getattr(g2, 'players', []))))
+                        except Exception:
+                            n_players = 4
+                        tv = {}
+                        for pid in range(n_players):
+                            if pid == winner_id:
+                                tv[pid] = 1.0
+                            elif pid not in prev_already_won:
+                                tv[pid] = 0.0
+                        terminal_value = tv
+                        stage_term_overrides += 1
+                        stage_term_nn_skips += 1
+                        stage_term_legal_skips += 1
+                        if depth > stage_term_max_depth:
+                            stage_term_max_depth = depth
+                        if stage_term_winner_sample is None:
+                            stage_term_winner_sample = int(winner_id)
+                        # Mark this node as terminal so future selections stop here.
+                        try:
+                            node.children = {}
+                        except Exception:
+                            pass
+                        # --- 詳細デバッグ: depth==1 の場合にスナップショットを低頻度で出力 ---
+                        try:
+                            if depth == 1 and stage_terminal_debug:
+                                import random as _rdbg, json as _json
+                                sample_rate = float(stage_terminal_log_sample_rate or 0.0)
+                                if sample_rate <= 0.0 or _rdbg.random() < sample_rate:
+                                    g_dbg = getattr(env_copy, 'game', None)
+                                    try:
+                                        stage_after = getattr(env_copy, 'stage_id', None)
+                                    except Exception:
+                                        stage_after = None
+                                    try:
+                                        rankings_after = list(getattr(g_dbg, 'rankings', []) or [])
+                                    except Exception:
+                                        rankings_after = []
+                                    hands_sizes = []
+                                    try:
+                                        for p in getattr(g_dbg, 'players', []):
+                                            hands_sizes.append(len(getattr(p, 'hand', []) or []))
+                                    except Exception:
+                                        hands_sizes = []
+                                    # try to get legal actions snapshot
+                                    try:
+                                        leg_dbg = get_legal_actions_fn(env_copy) or []
+                                    except Exception:
+                                        leg_dbg = []
+                                    snap = {
+                                        'note': 'stage_terminal_detail',
+                                        'depth': depth,
+                                        'stage_after': stage_after,
+                                        'stage_end_reason': stage_end_reason,
+                                        'acting_pid': acting_pid,
+                                        'prev_already_won': list(prev_already_won),
+                                        'rankings_after': rankings_after,
+                                        'hands_sizes': hands_sizes,
+                                        'legal_actions_count': len(leg_dbg),
+                                        'legal_actions_sample': (leg_dbg[:3] if isinstance(leg_dbg, list) else []),
+                                        'root_player_id': root_player_id,
+                                        'num_simulations': int(num_simulations) if 'num_simulations' in locals() else None,
+                                    }
+                                    msg = f"[mcts-stage-terminal-detail] " + _json.dumps(snap, ensure_ascii=False)
+                                    try:
+                                        if stage_terminal_logger is not None and hasattr(stage_terminal_logger, 'log_text'):
+                                            stage_terminal_logger.log_text(msg)
+                                        else:
+                                            print(msg)
+                                    except Exception:
+                                        try:
+                                            print(msg)
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            pass
+                    except Exception:
+                        terminal_value = 0.0
+                        stage_term_overrides += 1
+                        stage_term_nn_skips += 1
+                        stage_term_legal_skips += 1
+                        if depth > stage_term_max_depth:
+                            stage_term_max_depth = depth
+                    break
                 # 仮想損失を適用して同一ノードがバッチに偏らないようにする
                 if enable_virtual_loss:
                     try:
@@ -645,6 +873,7 @@ def run_puct_mcts(root_env_copy,
                         pass
             leaf_nodes.append(node)
             leaf_envs.append(env_copy)
+            leaf_terminal_values.append(terminal_value)
             k = state_key_fn(env_copy)
             leaf_keys.append(k)
             # 可能なら TT またはラン内キャッシュから取得
@@ -662,12 +891,19 @@ def run_puct_mcts(root_env_copy,
                     # measure legal actions cost
                     try:
                         t0_leg = _time.perf_counter()
-                        leg = get_legal_actions_fn(env_copy) or []
+                        # If stage terminal happened, do not compute legal actions.
+                        if terminal_value is not None:
+                            leg = []
+                        else:
+                            leg = get_legal_actions_fn(env_copy) or []
                         legal_total_s += (_time.perf_counter() - t0_leg)
                         legal_calls += 1
                     except Exception:
                         # fall back
-                        leg = get_legal_actions_fn(env_copy) or []
+                        if terminal_value is not None:
+                            leg = []
+                        else:
+                            leg = get_legal_actions_fn(env_copy) or []
                     # キャッシュに保存 (キーが None の場合はキャッシュしない)
                     if _legal_cache is not None and k is not None:
                         try:
@@ -684,6 +920,11 @@ def run_puct_mcts(root_env_copy,
         eval_envs = []
         cached_results = {}
         for i, (k, leg) in enumerate(zip(leaf_keys, leaf_legal)):
+            # stage-terminal: force override and skip NN eval
+            if leaf_terminal_values[i] is not None:
+                cached_results[i] = ({}, leaf_terminal_values[i], [])
+                leaf_legal[i] = []
+                continue
             # TT ヒット時は保存済みの合法手を使えるよう (policy, value, legal) の形式を許容
             if TT is not None and k is not None and k in TT:
                 cached = TT[k]
@@ -741,13 +982,61 @@ def run_puct_mcts(root_env_copy,
             else:
                 # 安全側: 一様分布 + 0.0（leg の要素を tuple に変換）
                 policy_leaf, leaf_value = ({(tuple(a) if isinstance(a, list) else a): 1.0 / len(leg) for a in leg} if leg else {}), 0.0
+            # Normalize leaf_value into a player-indexed dict keyed by player id.
+            # If model returned a scalar, interpret it as the leaf player's value (p)
+            # and distribute the remainder (1-p) evenly among other players.
+            try:
+                leaf_pid = int(getattr(leaf_envs[i].game, 'turn', getattr(leaf_envs[i], 'to_play', 0)))
+            except Exception:
+                leaf_pid = 0
+            try:
+                # Try to infer number of players from game.players if available
+                n_players = int(getattr(leaf_envs[i].game, 'num_players',
+                                         (len(getattr(leaf_envs[i].game, 'players', [])) or 4)))
+                if n_players < 2:
+                    n_players = 2
+            except Exception:
+                n_players = 4
 
+            # Case: already a dict keyed by player id -> ensure float values
+            if isinstance(leaf_value, dict):
+                try:
+                    leaf_value = {int(k): float(v) for k, v in leaf_value.items()}
+                except Exception:
+                    # fallback: map missing players to 0.0
+                    leaf_value = {pid: float(leaf_value.get(pid, 0.0)) for pid in range(n_players)}
+            # Case: list/tuple -> treat as per-player vector
+            elif isinstance(leaf_value, (list, tuple)):
+                try:
+                    leaf_value = {pid: float(leaf_value[pid]) if 0 <= pid < len(leaf_value) else 0.0
+                                  for pid in range(n_players)}
+                except Exception:
+                    leaf_value = {pid: 0.0 for pid in range(n_players)}
+            else:
+                # Scalar: assign to leaf_pid and distribute remainder evenly
+                try:
+                    p = float(leaf_value)
+                except Exception:
+                    p = 0.0
+                p = max(0.0, min(1.0, p))
+                if n_players > 1:
+                    other_share = (1.0 - p) / float(max(1, n_players - 1))
+                else:
+                    other_share = 0.0
+                d = {pid: other_share for pid in range(n_players)}
+                if 0 <= leaf_pid < n_players:
+                    d[leaf_pid] = p
+                else:
+                    d[0] = p
+                leaf_value = d
             if not leg:
                 node.backup(leaf_value)
                 continue
             if not policy_leaf:
-                # leg の要素を hashable に変換（list → tuple）
-                policy_leaf = {(tuple(a) if isinstance(a, list) else a): 1.0 / len(leg) for a in leg}
+                # 空のpolicyが返ってきた場合: ランク確定などの理由で推論をスキップした終端ノード
+                # 展開をスキップしてそのままバックアップ（探索終了として扱う）
+                node.backup(leaf_value)
+                continue
             else:
                 # 欠損を均等割当（leg の要素を tuple に変換して比較）
                 missing_l = [(tuple(a) if isinstance(a, list) else a) for a in leg 
@@ -822,6 +1111,38 @@ def run_puct_mcts(root_env_copy,
                         break
             except Exception:
                 pass
+
+    # Attach debug counters to root (for inspection) and optionally log once.
+    try:
+        setattr(root, '_stage_terminal_overrides', int(stage_term_overrides))
+        setattr(root, '_stage_terminal_nn_skips', int(stage_term_nn_skips))
+        setattr(root, '_stage_terminal_legal_skips', int(stage_term_legal_skips))
+        setattr(root, '_stage_terminal_max_depth', int(stage_term_max_depth))
+        setattr(root, '_stage_terminal_winner_sample', stage_term_winner_sample)
+    except Exception:
+        pass
+
+    try:
+        do_log = bool(stage_terminal_debug)
+        if do_log and stage_terminal_log_sample_rate:
+            import random as _r
+            do_log = (_r.random() < float(stage_terminal_log_sample_rate))
+        if do_log and stage_term_overrides > 0:
+            msg = (
+                f"[mcts-stage-terminal] overrides={stage_term_overrides} nn_skips={stage_term_nn_skips} "
+                f"legal_skips={stage_term_legal_skips} max_depth={stage_term_max_depth} "
+                f"winner_sample={stage_term_winner_sample} root_pid={root_player_id} sims={sims_done}"
+            )
+            if stage_terminal_logger is not None and hasattr(stage_terminal_logger, 'log_text'):
+                try:
+                    stage_terminal_logger.log_text(msg)
+                except Exception:
+                    print(msg)
+            else:
+                print(msg)
+    except Exception:
+        pass
+
     # profile: dump / summary (SUPPRESSED: [PROFILE][mcts] line removed per request)
     # ここでは内部統計を保持したい場合に備え、値だけを root に埋め込む (ログ出力なし)
     try:

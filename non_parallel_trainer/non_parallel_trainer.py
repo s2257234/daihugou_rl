@@ -58,6 +58,229 @@ from agents.replay_buffer import ReplayBuffer
 from utils.logger import TrainingLogger
 
 # --------------------------------------------------
+# Buffer State 永続化（過学習防止のためのスライディングウィンドウ）
+# --------------------------------------------------
+def _load_buffer_state(data_dir: str) -> Dict[str, Any]:
+	"""buffer_state.jsonから前回のファイルリストを読み込む
+	
+	スライディングウィンドウ方式でファイルリストを管理し、
+	同じデータの繰り返し学習を防止する。
+	"""
+	path = os.path.join(data_dir, 'buffer_state.json')
+	if os.path.isfile(path):
+		try:
+			with open(path, 'r', encoding='utf-8') as f:
+				state = json.load(f)
+			# ファイルリストのバリデーション（存在しないファイルを除外）
+			active_files = state.get('active_files', [])
+			valid_files = [f for f in active_files if os.path.isfile(f)]
+			if len(valid_files) != len(active_files):
+				state['active_files'] = valid_files
+			# used_filesフィールドが存在しない場合は初期化
+			if 'used_files' not in state:
+				state['used_files'] = []
+			return state
+		except Exception:
+			pass
+	return {'active_files': [], 'used_files': [], 'last_updated': None, 'file_count': 0}
+
+
+def _save_buffer_state(data_dir: str, active_files: List[str], used_files: List[str] | None = None, logger=None):
+	"""現在のファイルリストをbuffer_state.jsonに保存
+	
+	次回学習時に同じファイルを再度読み込まないようにするため、
+	現在のウィンドウ状態を永続化する。
+	
+	Args:
+		active_files: 現在アクティブなファイルリスト
+		used_files: 使用済みファイルリスト（Noneの場合は既存のused_filesを維持）
+		logger: ログ出力用
+	"""
+	path = os.path.join(data_dir, 'buffer_state.json')
+	# 既存のstateを読み込んでused_filesを維持
+	prev_used_files = []
+	try:
+		if os.path.isfile(path):
+			with open(path, 'r', encoding='utf-8') as f:
+				prev_state = json.load(f)
+				prev_used_files = prev_state.get('used_files', [])
+	except Exception:
+		pass
+	
+	# used_filesが指定されている場合は更新、そうでなければ既存を維持
+	if used_files is not None:
+		# 使用済みファイルリストに追加（重複を避ける）
+		new_used_set = set(prev_used_files) | set(used_files)
+		final_used_files = list(new_used_set)
+	else:
+		final_used_files = prev_used_files
+	
+	state = {
+		'active_files': list(active_files),
+		'used_files': final_used_files,
+		'last_updated': time.time(),
+		'file_count': len(active_files)
+	}
+	try:
+		_atomic_write_json(path, state)
+		if logger:
+			logger.log_text(f"[buffer-state] saved {len(active_files)} active files, {len(final_used_files)} used files to buffer_state.json")
+	except Exception as e:
+		if logger:
+			logger.log_text(f"[WARN] buffer_state save failed: {e}")
+
+
+def _update_buffer_window(
+	prev_files: List[str],
+	all_files: List[str],
+	window_size: int,
+	used_files: List[str] | None = None,
+	enable_random_selection: bool = False,
+	logger=None
+) -> tuple[List[str], List[str]]:
+	"""スライディングウィンドウでファイルリストを更新（改善案A・B対応）
+	
+	Args:
+		prev_files: 前回のファイルリスト（buffer_state.jsonから読み込み）
+		all_files: 現在利用可能な全ファイル（ソート済み、時系列昇順）
+		window_size: ウィンドウサイズ（保持するファイル数の上限）
+		used_files: 使用済みファイルリスト（改善案A: これらを除外）
+		enable_random_selection: 改善案B: Trueの場合はランダムに選択
+		logger: ログ出力用
+	
+	Returns:
+		(更新されたファイルリスト, 削除されたファイルリスト)
+	
+	Note:
+		改善案A: 使用済みファイルを除外して新しいファイルセットを選択
+		改善案B: enable_random_selection=Trueの場合、ランダムにファイルを選択
+	"""
+	import random as _r
+	
+	# 利用可能なファイルから使用済みファイルを除外（改善案A）
+	available_files = all_files
+	if used_files:
+		used_set = set(used_files)
+		available_files = [f for f in all_files if f not in used_set and os.path.isfile(f)]
+		if logger:
+			logger.log_text(f"[buffer-window] excluded {len(used_files)} used files, available={len(available_files)}")
+	
+	# 利用可能なファイルが不足している場合は、全ファイルから選択
+	if len(available_files) < window_size:
+		available_files = [f for f in all_files if os.path.isfile(f)]
+		if logger:
+			logger.log_text(f"[buffer-window] not enough files after exclusion, using all {len(available_files)} files")
+	
+	if not available_files:
+		if logger:
+			logger.log_text("[buffer-window] no available files")
+		return [], []
+	
+	# 改善案B: ランダム選択モード
+	if enable_random_selection:
+		if len(available_files) <= window_size:
+			updated_files = list(available_files)
+			removed_files = []
+		else:
+			updated_files = _r.sample(available_files, window_size)
+			removed_files = []
+		if logger:
+			logger.log_text(
+				f"[buffer-window] random_selection selected={len(updated_files)} from {len(available_files)} available"
+			)
+		return updated_files, removed_files
+	
+	# 通常モード: 最新ファイル優先
+	if not prev_files:
+		# 初回起動: 利用可能なファイルから最新window_size件を選択
+		try:
+			files_with_mtime = [(f, os.path.getmtime(f)) for f in available_files]
+			files_with_mtime.sort(key=lambda x: x[1])  # mtimeで昇順ソート
+			sorted_files = [f for f, _ in files_with_mtime]
+			if len(sorted_files) > window_size:
+				updated_files = sorted_files[-window_size:]
+				removed_files = []
+			else:
+				updated_files = sorted_files
+				removed_files = []
+		except Exception:
+			# フォールバック: ファイル名ソート
+			if len(available_files) > window_size:
+				updated_files = available_files[-window_size:]
+				removed_files = []
+			else:
+				updated_files = list(available_files)
+				removed_files = []
+		
+		if logger:
+			logger.log_text(
+				f"[buffer-window] initial_load selected={len(updated_files)} from {len(available_files)} available window_size={window_size}"
+			)
+		return updated_files, removed_files
+	
+	# prev_filesから使用済みファイルを除外（改善案A）
+	prev_set = set(prev_files)
+	if used_files:
+		used_set = set(used_files)
+		prev_files = [f for f in prev_files if f not in used_set]
+		prev_set = set(prev_files)
+	
+	# 利用可能なファイルから新しいファイルを検出
+	new_files = [f for f in available_files if f not in prev_set]
+	
+	# 既存リストの末尾に新しいファイルを追加
+	# 新しいファイルは更新日時でソート（古い順）
+	try:
+		new_files_with_mtime = [(f, os.path.getmtime(f)) for f in new_files]
+		new_files_with_mtime.sort(key=lambda x: x[1])  # mtimeで昇順ソート
+		new_files_sorted = [f for f, _ in new_files_with_mtime]
+	except Exception:
+		# フォールバック: ファイル名ソート
+		new_files_sorted = sorted(new_files)
+	
+	# 既存ファイルと新規ファイルを結合
+	# 既存ファイルはprev_filesの順序を維持、新規ファイルは時系列順に追加
+	updated_files = list(prev_files) + new_files_sorted
+	
+	# ウィンドウサイズを超えたら先頭（古いファイル）から削除
+	removed_files = []
+	if len(updated_files) > window_size:
+		removed_count = len(updated_files) - window_size
+		removed_files = updated_files[:removed_count]
+		updated_files = updated_files[-window_size:]
+	
+	if logger:
+		# ログ出力: new_filesまたはremoved_filesがある場合
+		if new_files or removed_files:
+			logger.log_text(
+				f"[buffer-window] prev={len(prev_files)} new={len(new_files)} "
+				f"removed={len(removed_files)} current={len(updated_files)} window_size={window_size}"
+			)
+		# 削除されたファイルをログに出力（new_filesの有無に関係なく）
+		if removed_files:
+			try:
+				for removed_file in removed_files:
+					try:
+						# ファイル名のみをログに出力（パスは長いため）
+						removed_name = os.path.basename(removed_file)
+						logger.log_text(f"[buffer-window-removed] {removed_name}")
+					except Exception as e:
+						# 個別ファイルのログ出力エラーは無視（次のファイルを続行）
+						try:
+							logger.log_text(f"[buffer-window-removed] ERROR: {str(e)}")
+						except Exception:
+							pass
+			except Exception as e:
+				# removed_filesのループ全体でエラーが発生した場合
+				try:
+					logger.log_text(f"[buffer-window-removed] ERROR in loop: {str(e)}")
+				except Exception:
+					pass
+	
+	return updated_files, removed_files
+
+
+# --------------------------------------------------
 # Active File Pool Utilities (modularized)
 # --------------------------------------------------
 def _scan_selfplay_files(data_dir: str):
@@ -102,31 +325,57 @@ def _scan_selfplay_files(data_dir: str):
 
 
 def _select_initial_active_files(all_files: List[str], cfg: Dict[str, Any], *, max_files: int | None, files_override: List[str] | None) -> List[str]:
-	"""Encapsulate selection logic (legacy ingest vs active pool)."""
+	"""Encapsulate selection logic (legacy ingest vs active pool).
+	
+	改善版: newest_biasを使って最新ファイルと古いファイルからランダム選択を組み合わせる。
+	- newest_bias=1.0: 全て最新ファイルから選択（従来動作）
+	- newest_bias=0.5: 50%最新、50%古いファイルからランダム
+	- newest_bias=0.0: 全てランダム選択
+	"""
+	import random as _r
+	
 	if files_override:
 		return list(files_override)
+	
+	if not all_files:
+		return []
+	
+	# 設定からパラメータ取得
 	pool_size = int(cfg.get('active_file_pool_size', 0) or 0)
-	newest_bias = float(cfg.get('active_file_newest_bias', 0.0) or 0.0)
-	if pool_size > 0 and all_files:
-		bias_count = int(min(pool_size, max(0, int(pool_size * newest_bias))))
-		latest_slice = all_files[-bias_count:] if bias_count > 0 else []
-		remaining_needed = pool_size - len(latest_slice)
-		older_pool = all_files[:-bias_count] if bias_count > 0 else all_files
-		if remaining_needed > 0 and older_pool:
-			import random as _r
-			active_rest = _r.sample(older_pool, min(remaining_needed, len(older_pool)))
-		else:
-			active_rest = []
-		return latest_slice + active_rest
-	# legacy ingest strategy
+	newest_bias = float(cfg.get('active_file_newest_bias', 0.5) or 0.5)  # デフォルト50%最新
+	
+	# 使用するファイル数を決定
 	try:
 		eff_max_files = int(max_files) if (max_files is not None and int(max_files) > 0) else int(cfg.get('ingest_max_files') or 0)
 	except Exception:
 		eff_max_files = 0
-	pick_newest = bool(cfg.get('ingest_pick_newest', True))
-	if eff_max_files and eff_max_files > 0:
-		return list(all_files[-eff_max_files:] if pick_newest else all_files[:eff_max_files])
-	return list(all_files)
+	
+	# pool_sizeが設定されていればそちらを優先、なければeff_max_filesを使用
+	target_count = pool_size if pool_size > 0 else eff_max_files
+	if target_count <= 0:
+		target_count = len(all_files)
+	target_count = min(target_count, len(all_files))
+	
+	# newest_biasに基づいて最新ファイルとランダム選択の割合を決定
+	newest_count = int(target_count * newest_bias)
+	random_count = target_count - newest_count
+	
+	# 最新ファイル（末尾から取得）
+	latest_slice = all_files[-newest_count:] if newest_count > 0 else []
+	
+	# 残りは古いファイル（latest_sliceに含まれないもの）からランダム選択
+	if random_count > 0:
+		older_pool = all_files[:-newest_count] if newest_count > 0 else all_files
+		if older_pool:
+			random_picks = _r.sample(older_pool, min(random_count, len(older_pool)))
+		else:
+			random_picks = []
+	else:
+		random_picks = []
+	
+	# 結合して返す（最新ファイルを優先して末尾に配置）
+	selected = random_picks + latest_slice
+	return selected
 
 
 def _load_samples_for_files(
@@ -204,25 +453,19 @@ def _load_samples_for_files(
 					parts_map[fp] = (preloaded[fp], 0.0, 0, (len(preloaded[fp].get('train', []) or []) + len(preloaded[fp].get('val', []) or [])))
 
 		# iterate in original order and append samples
+		# Note: max_samples_per_file truncation is already applied in _load_samples_from_file
 		for fp in files:
 			entry = parts_map.get(fp, ({'train': [], 'val': []}, 0.0, 0, 0))
 			parts = entry[0]
 			load_t = entry[1]
 			sz = entry[2]
 			cnt = entry[3]
-			# honor max_samples_per_file truncation
 			try:
 				tr = parts.get('train', []) or []
 				vl = parts.get('val', []) or []
-				if max_samples_per_file is not None and int(max_samples_per_file) > 0:
-					m = int(max_samples_per_file)
-					if len(tr) > m:
-						tr = random.sample(tr, m)  # ランダムサンプリング
-					if len(vl) > m:
-						vl = random.sample(vl, m)  # ランダムサンプリング
 			except Exception:
-				tr = parts.get('train', []) or []
-				vl = parts.get('val', []) or []
+				tr = []
+				vl = []
 			try:
 				all_samples.extend(tr)
 			except Exception:
@@ -244,20 +487,13 @@ def _load_samples_for_files(
 			except Exception:
 				parts = {'train': [], 'val': []}
 
-			# If caller requested a per-file max_samples, ensure we honor it even when
-			# reusing preloaded content.
+			# Note: max_samples_per_file truncation is already applied in _load_samples_from_file
 			try:
 				tr = parts.get('train', []) or []
 				vl = parts.get('val', []) or []
-				if max_samples_per_file is not None and int(max_samples_per_file) > 0:
-					m = int(max_samples_per_file)
-					if len(tr) > m:
-						tr = random.sample(tr, m)  # ランダムサンプリング
-					if len(vl) > m:
-						vl = random.sample(vl, m)  # ランダムサンプリング
 			except Exception:
-				tr = parts.get('train', []) or []
-				vl = parts.get('val', []) or []
+				tr = []
+				vl = []
 
 			try:
 				all_samples.extend(tr)
@@ -268,30 +504,48 @@ def _load_samples_for_files(
 			except Exception:
 				pass
 
+	# 毎セッションで異なるシャッフルを実現するため、時刻ベースの動的seedを使用
+	# これにより、同じファイル群でも毎回異なるサンプル順序になる
+	dynamic_seed = None
 	try:
-		if seed is not None:
-			_r.Random(int(seed)).shuffle(all_samples)
-		else:
-			_r.shuffle(all_samples)
+		import time as _time
+		# 基本seedと現在時刻を組み合わせて毎回異なるseedを生成
+		base_seed = int(seed) if seed is not None else 0
+		dynamic_seed = (base_seed + int(_time.time() * 1000)) % (2**31)
+		_r.Random(dynamic_seed).shuffle(all_samples)
+		# ログ出力（loggerがある場合）
+		if logger:
+			logger.log_text(f"[shuffle] dynamic_seed={dynamic_seed} samples={len(all_samples)}")
 	except Exception:
-		pass
+		# フォールバック: 単純なランダムシャッフル
+		try:
+			_r.shuffle(all_samples)
+			if logger:
+				logger.log_text(f"[shuffle] fallback random shuffle samples={len(all_samples)}")
+		except Exception:
+			pass
 
-	split_idx = int(len(all_samples) * (1.0 - val_ratio))
-	train_part = all_samples[:split_idx]
-	val_part = all_samples[split_idx:]
+	# バリデーション用サンプルはシャッフル後の先頭から val_ratio 分を取得
+	split_idx = int(len(all_samples) * val_ratio)
+	val_part = all_samples[:split_idx]
+	train_part = all_samples[split_idx:]
 	return train_part, val_part, len(train_part), len(val_part)
 
 
-def _rebuild_replay(shared_rb: ReplayBuffer, train_part: List[Dict[str, Any]], val_part: List[Dict[str, Any]]):
+def _rebuild_replay(shared_rb: ReplayBuffer, train_part: List[Dict[str, Any]], val_part: List[Dict[str, Any]], logger=None):
 	"""Clear and repopulate replay buffer with provided parts."""
+	import time as _time
+	t0 = _time.time()
 	try:
 		shared_rb.clear()
 	except Exception:
 		pass
+	t1 = _time.time()
 	train_total = 0
 	val_total = 0
 	# Prepare combined list to bulk-extend for lower overhead
 	combined = []
+	t2 = _time.time()
 	for s in train_part:
 		if isinstance(s, dict):
 			try:
@@ -306,15 +560,25 @@ def _rebuild_replay(shared_rb: ReplayBuffer, train_part: List[Dict[str, Any]], v
 				combined.append(s)
 			except Exception:
 				pass
+	t3 = _time.time()
 	# Use ReplayBuffer.extend when available
 	try:
 		uids = []
+		t4 = _time.time()
 		if hasattr(shared_rb, 'extend'):
 			uids = shared_rb.extend(combined)
+			t5 = _time.time()
 			# estimate counts from uids length proportional to train/val ordering
 			train_total = sum(1 for s in combined if s.get('split') == 'train')
 			val_total = sum(1 for s in combined if s.get('split') == 'val')
+			# Debug timing (always log for now to diagnose)
+			if logger:
+				try:
+					logger.log_text(f"[rebuild-timing] clear={t1-t0:.2f}s build_combined={t3-t2:.2f}s extend={t5-t4:.2f}s total={t5-t0:.2f}s samples={len(combined)}")
+				except Exception:
+					pass
 		else:
+			t5a = _time.time()
 			for s in combined:
 				try:
 					shared_rb.append(s)
@@ -324,10 +588,18 @@ def _rebuild_replay(shared_rb: ReplayBuffer, train_part: List[Dict[str, Any]], v
 						val_total += 1
 				except Exception:
 					pass
+			t6a = _time.time()
+			# Debug timing
+			if logger:
+				try:
+					logger.log_text(f"[rebuild-timing] clear={t1-t0:.2f}s build_combined={t3-t2:.2f}s append_loop={t6a-t5a:.2f}s total={t6a-t0:.2f}s samples={len(combined)}")
+				except Exception:
+					pass
 	except Exception:
 		# fallback to per-item append in case of unexpected errors
 		train_total = 0
 		val_total = 0
+		t7 = _time.time()
 		for s in combined:
 			if isinstance(s, dict):
 				try:
@@ -338,6 +610,13 @@ def _rebuild_replay(shared_rb: ReplayBuffer, train_part: List[Dict[str, Any]], v
 						val_total += 1
 				except Exception:
 					pass
+		t8 = _time.time()
+		# Debug timing
+		if logger:
+			try:
+				logger.log_text(f"[rebuild-timing] clear={t1-t0:.2f}s build_combined={t3-t2:.2f}s fallback_append={t8-t7:.2f}s total={t8-t0:.2f}s samples={len(combined)}")
+			except Exception:
+				pass
 	return train_total, val_total
 
 
@@ -379,12 +658,34 @@ def _compute_dynamic_file_and_sample_params(cfg: Dict[str, Any], train_updates_c
 		(num_files, samples_per_file) or None if dynamic sizing is disabled
 	"""
 	try:
+		# 固定サンプル数が設定されている場合は優先
+		fixed_total = int(cfg.get('fixed_total_samples', 0) or 0)
+		if fixed_total > 0:
+			min_per_file = int(cfg.get('dynamic_sample_min_per_file', 200))
+			max_per_file = int(cfg.get('dynamic_sample_max_per_file', 2500))
+			samples_per_file_target = int(cfg.get('dynamic_samples_per_file_target', 2000))
+			min_files = int(cfg.get('dynamic_min_files', 5))
+			max_files = int(cfg.get('dynamic_max_files', 200))
+			
+			# 固定総サンプル数から必要なファイル数を計算
+			num_files = int(fixed_total / samples_per_file_target)
+			num_files = max(min_files, min(num_files, max_files, available_files_count))
+			
+			# ファイル数に基づいてファイルあたりのサンプル数を再計算
+			samples_per_file = int(fixed_total / num_files) if num_files > 0 else min_per_file
+			samples_per_file = max(min_per_file, min(samples_per_file, max_per_file))
+			
+			if logger:
+				logger.log_text(f"[fixed-sizing] fixed_total_samples={fixed_total} files={num_files} samples_per_file={samples_per_file}")
+			
+			return (num_files, samples_per_file)
+		
 		if not bool(cfg.get('enable_dynamic_sample_sizing', False)):
 			return None
 		
 		exponent = float(cfg.get('dynamic_sample_exponent', 0.75))
 		base = float(cfg.get('dynamic_sample_base', 1.0))
-		min_per_file = int(cfg.get('dynamic_sample_min_per_file', 500))
+		min_per_file = int(cfg.get('dynamic_sample_min_per_file', 200))
 		max_per_file = int(cfg.get('dynamic_sample_max_per_file', 2500))
 		
 		if train_updates_cum <= 0:
@@ -473,7 +774,7 @@ def _refresh_active_pool(active_files: List[str], all_files: List[str], cfg: Dic
 	
 	if not incremental:
 		train_part, val_part, tcount, vcount = _load_samples_for_files(active_files_new, max_samples_per_file=max_samples_per_file, seed=seed, val_ratio=val_ratio, logger=logger, cfg=cfg)
-		loaded_train, loaded_val = _rebuild_replay(shared_rb, train_part, val_part)
+		loaded_train, loaded_val = _rebuild_replay(shared_rb, train_part, val_part, logger)
 		if logger:
 			logger.log_text(f"[active-pool] refresh(rebuild) replaced={replace_n} added={add_n} pool_size={len(active_files_new)} replay_size={len(shared_rb)} train={loaded_train} val={loaded_val}")
 		return active_files_new, {'replaced': replace_n, 'added': add_n, 'train': loaded_train, 'val': loaded_val, 'mode': 'rebuild'}
@@ -729,11 +1030,61 @@ def _run_validation(learner: AlphaZeroAgent, logger: TrainingLogger, cfg: Dict[s
 		vinfo = learner.validate_step(batch_size=bs)
 	except Exception:
 		vinfo = {"policy_loss": None, "value_loss": None, "hand_pred_loss": None}
-	if isinstance(vinfo, dict) and (vinfo.get("policy_loss") is not None or vinfo.get("value_loss") is not None or vinfo.get("hand_pred_loss") is not None):
-		logger.log_validation(vinfo)
-		
-	else:
-		logger.log_text("[val] no validation metrics (val split may be empty)")
+	# Always pass the validation info to the logger so that
+	# the validation columns are present in `train_updates.csv` even when
+	# the validation pool is empty. validate_step may return a dict with
+	# None values when no validation data is available; logger.log_validation
+	# will record those None values (and write a placeholder row if needed).
+	try:
+		if isinstance(vinfo, dict):
+			logger.log_validation(vinfo)
+			# If all primary metrics are None, decide whether to warn.
+			no_val = not (vinfo.get("policy_loss") is not None or vinfo.get("value_loss") is not None or vinfo.get("hand_pred_loss") is not None)
+			# If the config explicitly sets val_split_ratio == 0, the absence of validation
+			# data is intentional -> do not spam warnings. Otherwise, warn once per logger instance.
+			try:
+				val_ratio_cfg = float(cfg.get('val_split_ratio', 0.0) or 0.0)
+			except Exception:
+				val_ratio_cfg = 0.0
+			if no_val:
+				if val_ratio_cfg <= 0.0:
+					# intentional: skip warning
+					try:
+						# still ensure warning flag is cleared so future real warnings can appear
+						if getattr(logger, '_val_warning_logged', False):
+							setattr(logger, '_val_warning_logged', False)
+					except Exception:
+						pass
+				else:
+					if not getattr(logger, '_val_warning_logged', False):
+						try:
+							logger.log_text("[val] no validation metrics (val split may be empty)")
+						except Exception:
+							pass
+						try:
+							setattr(logger, '_val_warning_logged', True)
+						except Exception:
+							pass
+			else:
+				try:
+					if getattr(logger, '_val_warning_logged', False):
+						setattr(logger, '_val_warning_logged', False)
+				except Exception:
+					pass
+		else:
+			# non-dict return: still record empty metrics and warn once
+			try:
+				if not getattr(logger, '_val_warning_logged', False):
+					logger.log_text("[val] validate_step returned non-dict result; skipping detailed val logging")
+					setattr(logger, '_val_warning_logged', True)
+			except Exception:
+				pass
+			logger.log_validation({"policy_loss": None, "value_loss": None, "hand_pred_loss": None})
+	except Exception:
+		try:
+			logger.log_text("[val] validation logging failed")
+		except Exception:
+			pass
 		
 
 
@@ -839,7 +1190,7 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 			ok = False
 			if hasattr(learner, 'load_optimizer'):
 				ok = bool(learner.load_optimizer(opt_p, map_location=bundle.device))
-			logger.log_text(f"[resume] optimizer load {'ok' if ok else 'failed'} from {opt_p}")
+			
 	except Exception as e:
 		logger.log_text(f"[WARN] optimizer load failed: {e}")
 	try:
@@ -850,7 +1201,7 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 			ok = False
 			if hasattr(learner, 'load_scheduler'):
 				ok = bool(learner.load_scheduler(sch_p))
-			logger.log_text(f"[resume] scheduler load {'ok' if ok else 'failed'} from {sch_p}")
+			
 	except Exception as e:
 		logger.log_text(f"[WARN] scheduler load failed: {e}")
 
@@ -880,6 +1231,52 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 	train_updates_cum = max(meta_updates, last_csv_step)
 	# ロガーのカウンタへ適用
 	logger.update_step = int(train_updates_cum)
+
+	# --- 学習率スケジューラの同期修正 ---
+	# optimizer.load_state_dict() が古いlrを復元するため、
+	# schedulerを累積ステップ数に基づいて正しく再初期化し、optimizer lrを更新する
+	# 注意: train_updates_cum == 0 の場合も、古いチェックポイントから誤ったlrがロードされる可能性があるため、
+	# 常にlrを正しい値に設定する
+	try:
+		if hasattr(learner, '_optimizer') and learner._optimizer is not None:
+			import math as _math
+			base_lr = float(cfg.get('lr', 1e-4))
+			lr_min = float(cfg.get('lr_min', 1e-5))
+			warmup = int(cfg.get('lr_warmup_steps', 0) or 0)
+			tmax = int(cfg.get('lr_cosine_T_max_updates', 0) or 0)
+			min_scale = (lr_min / base_lr) if base_lr > 0 else 0.0
+			
+			# 累積ステップ数に基づく正しい学習率を計算
+			step = int(train_updates_cum)
+			if warmup > 0 and step < warmup:
+				lr_scale = max(1e-8, float(step + 1) / float(warmup))
+			elif tmax > warmup and tmax > 0:
+				prog = min(1.0, float(step - warmup) / float(max(1, tmax - warmup)))
+				cos_factor = 0.5 * (1.0 + _math.cos(_math.pi * prog))
+				lr_scale = min_scale + (1.0 - min_scale) * cos_factor
+			else:
+				lr_scale = min_scale
+			
+			correct_lr = base_lr * lr_scale
+			# Value Head用のスケール
+			value_head_lr_scale_cfg = float(cfg.get('value_head_lr_scale', 1.0))
+			
+			# optimizer の各 param_group の lr を強制更新
+			for idx, group in enumerate(learner._optimizer.param_groups):
+				if group.get('name') == 'value_head':
+					group['lr'] = correct_lr * value_head_lr_scale_cfg
+				else:
+					group['lr'] = correct_lr
+			
+			# scheduler の内部状態も同期 (last_epoch を累積ステップ数に設定)
+			if hasattr(learner, '_scheduler') and learner._scheduler is not None:
+				learner._scheduler.last_epoch = step
+			if hasattr(learner, '_update_step'):
+				learner._update_step = step
+			
+			logger.log_text(f"[lr-sync] synced lr to step={step}: correct_lr={correct_lr:.10e} lr_scale={lr_scale:.6f}")
+	except Exception as e:
+		logger.log_text(f"[WARN] lr-sync failed: {e}")
 	
 
 	# --- Active File Pool (modular) ---
@@ -888,7 +1285,51 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 	pool_size = int(cfg.get('active_file_pool_size', 0) or 0)
 	refresh_every = int(cfg.get('active_file_refresh_every_updates', 0) or 0)
 	refresh_fraction = float(cfg.get('active_file_pool_refresh_fraction', 0.0) or 0.0)
-	active_files = _select_initial_active_files(all_files, cfg, max_files=max_files, files_override=files_override)
+	newest_bias = float(cfg.get('active_file_newest_bias', 0.5) or 0.5)
+	
+	# --- Buffer State スライディングウィンドウ方式（過学習防止）---
+	# buffer_window_size > 0 の場合、buffer_state.jsonを使ってファイルリストを永続化し、
+	# 同じデータの繰り返し学習を防止する
+	buffer_window_size = int(cfg.get('buffer_window_size', 0) or 0)
+	buffer_state_used = False
+	used_files_for_session = []  # このセッションで使用したファイルを記録
+	
+	if buffer_window_size > 0 and not files_override:
+		# Buffer State モード: 永続化されたファイルリストを使用
+		buffer_state = _load_buffer_state(data_dir)
+		prev_files = buffer_state.get('active_files', [])
+		used_files = buffer_state.get('used_files', [])
+		
+		# 改善案B: ランダム選択モード（設定で有効化可能）
+		enable_random_selection = bool(cfg.get('buffer_window_random_selection', True))
+		
+		# スライディングウィンドウでファイルリストを更新（改善案A・B対応）
+		active_files, removed_files = _update_buffer_window(
+			prev_files, all_files, buffer_window_size,
+			used_files=used_files,
+			enable_random_selection=enable_random_selection,
+			logger=logger
+		)
+		buffer_state_used = True
+		
+		# このセッションで使用するファイルを記録（改善案A: 次回除外するため）
+		used_files_for_session = list(active_files)
+		
+		if logger:
+			new_count = len([f for f in active_files if f not in set(prev_files)])
+			logger.log_text(
+				f"[buffer-state] mode=sliding_window window_size={buffer_window_size} "
+				f"found={found_count} prev={len(prev_files)} new={new_count} current={len(active_files)} "
+				f"random_selection={enable_random_selection} used_files_count={len(used_files)}"
+			)
+	else:
+		# 従来モード: newest_biasに基づくファイル選択
+		active_files = _select_initial_active_files(all_files, cfg, max_files=max_files, files_override=files_override)
+		# ファイル選択のログ出力（newest_bias情報を含む）
+		if logger and active_files:
+			newest_count = int(len(active_files) * newest_bias)
+			random_count = len(active_files) - newest_count
+			logger.log_text(f"[file-selection] found={found_count} selected={len(active_files)} newest={newest_count} random={random_count} newest_bias={newest_bias:.2f}")
 	eff_max_samp0 = None
 	try:
 		eff_max_samp0 = max_samples_per_file if (max_samples_per_file is not None and max_samples_per_file > 0) else (cfg.get('ingest_max_samples_per_file') or None)
@@ -899,11 +1340,17 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 	preloaded: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 	# By default, initial_active_files == active_files. If resume_defer_preload is
 	# enabled we will only preload a small recent slice to avoid long startup I/O.
+	# ただし、buffer_stateモード時は全ファイルを読み込むため制限しない
 	initial_active_files = list(active_files) if active_files is not None else []
 	try:
+		# buffer_stateモード時は全ファイルを読み込む（制限なし）
+		if buffer_state_used:
+			initial_active_files = list(active_files) if active_files is not None else []
+			if logger:
+				logger.log_text(f"[buffer-state] loading all {len(initial_active_files)} files (no defer)")
 		# Optionally defer preloading heavy sample files after resume.
 		# If `resume_defer_preload` is True in config, skip loading files here to avoid long blocking I/O.
-		if bool(cfg.get('resume_defer_preload', True)):
+		elif bool(cfg.get('resume_defer_preload', True)):
 			# limit initial load to newest N files to avoid long blocking I/O at resume
 			try:
 				# 動的ファイル数計算を試行
@@ -953,21 +1400,25 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 	if val_ratio < 0.0: val_ratio = 0.0
 	if val_ratio > 0.9: val_ratio = 0.9
 	try:
-		# 動的サンプルサイジング: total_updates に基づいてサンプル数を調整
-		dynamic_result = _compute_dynamic_file_and_sample_params(cfg, train_updates_cum, len(initial_active_files), logger)
-		if dynamic_result is not None:
-			_, eff_max_samp = dynamic_result  # サンプル数のみ使用（ファイル数は既に適用済み）
+		# buffer_stateモード時は全件読み込み（サンプル数制限なし）
+		if buffer_state_used:
+			eff_max_samp = None
+			if logger:
+				logger.log_text(f"[buffer-state] no sample limit (full load)")
 		else:
-			eff_max_samp = max_samples_per_file if (max_samples_per_file is not None and max_samples_per_file > 0) else (cfg.get('ingest_max_samples_per_file') or None)
-		if eff_max_samp: eff_max_samp = int(eff_max_samp)
+			# 動的サンプルサイジング: total_updates に基づいてサンプル数を調整
+			dynamic_result = _compute_dynamic_file_and_sample_params(cfg, train_updates_cum, len(initial_active_files), logger)
+			if dynamic_result is not None:
+				_, eff_max_samp = dynamic_result  # サンプル数のみ使用（ファイル数は既に適用済み）
+			else:
+				eff_max_samp = max_samples_per_file if (max_samples_per_file is not None and max_samples_per_file > 0) else (cfg.get('ingest_max_samples_per_file') or None)
+			if eff_max_samp: eff_max_samp = int(eff_max_samp)
 	except Exception:
 		eff_max_samp = None
 	# Use initial_active_files for the first rebuild to limit startup I/O when resume_defer_preload is set.
 	# Instrumentation: measure durations of sample loading and replay rebuild to diagnose long resume pauses.
 	try:
-		resume_timer_start = time.time()
 		if logger:
-			logger.log_text("[resume-timer] starting resume preload")
 			logger.flush_buffers(force=True)
 	except Exception:
 		pass
@@ -989,18 +1440,17 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 		pass
 	# rebuild replay with timing
 	t_rebuild_start = time.time()
-	train_samples_total, val_samples_total = _rebuild_replay(shared_rb, train_part, val_part)
+	train_samples_total, val_samples_total = _rebuild_replay(shared_rb, train_part, val_part, logger)
 	t_rebuild_end = time.time()
 	try:
 		if logger:
-			logger.log_text(f"[resume-timer] rebuild_replay took={t_rebuild_end - t_rebuild_start:.3f}s appended_train={train_samples_total} appended_val={val_samples_total}")
+			# _rebuild_replayの返り値を使用（再カウント不要）
+			logger.log_text(f"[resume-timer] rebuild_replay took={t_rebuild_end - t_rebuild_start:.3f}s train={train_samples_total} val={val_samples_total} total={len(shared_rb)}")
 			logger.flush_buffers(force=True)
 	except Exception:
 		pass
 	# 集約進捗表示 (episodes は meta から取得した累積値)
-	# replay_size は今回選択された全ファイル（max_filesで切り捨て前）の合計サンプル数を表示する
-	# 集約進捗表示 (episodes は meta から取得した累積値)
-	# replay_size は実際のリプレイバッファ長 (上限25万・到達時は10万へ削減) を表示する
+	# replay_size は実際のリプレイバッファ長を表示する
 	try:
 		_total_samples_all = total_train_all + total_val_all
 	except Exception:
@@ -1050,6 +1500,62 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 				logger.log_train(loss_info)
 				last_loss_info = loss_info
 
+		# 100更新ごとに optimizer/scheduler の lr を events.log へ出力
+		try:
+			step_now = int(train_updates_cum + i + 1)
+			if (step_now % 100) == 0:
+				# ensure optimizer exists and fetch param group learning rates
+				if hasattr(learner, 'ensure_optimizer'):
+					try:
+						learner.ensure_optimizer()
+					except Exception:
+						pass
+				opt = getattr(learner, '_optimizer', None)
+				lrs = []
+				if opt is not None and hasattr(opt, 'param_groups'):
+					try:
+						for g in opt.param_groups:
+							try:
+								lrs.append(float(g.get('lr', None)))
+							except Exception:
+								lrs.append(None)
+					except Exception:
+						lrs = []
+				# scheduler debug info
+				sched = getattr(learner, '_scheduler', None)
+				sched_last_epoch = getattr(sched, 'last_epoch', None) if sched else None
+				update_step_internal = getattr(learner, '_update_step', None)
+				# config params for reference
+				base_lr = float(cfg.get('lr', 1e-4))
+				lr_min = float(cfg.get('lr_min', 1e-5))
+				warmup = int(cfg.get('lr_warmup_steps', 0) or 0)
+				tmax = int(cfg.get('lr_cosine_T_max_updates', 0) or 0)
+				# theoretical lr at this step based on config
+				import math
+				if tmax > warmup and step_now >= warmup:
+					prog = min(1.0, float(step_now - warmup) / float(max(1, tmax - warmup)))
+					cos_factor = 0.5 * (1.0 + math.cos(math.pi * prog))
+					min_scale = (lr_min / base_lr) if base_lr > 0 else 0.0
+					theoretical_lr = base_lr * (min_scale + (1.0 - min_scale) * cos_factor)
+				elif step_now < warmup:
+					theoretical_lr = base_lr * max(1e-8, float(step_now + 1) / float(warmup))
+				else:
+					theoretical_lr = lr_min
+				# format and log
+				try:
+					lr_repr = ','.join([('None' if v is None else f"{v:.10e}") for v in lrs]) if lrs else 'unknown'
+					if logger:
+						logger.log_text(
+							f"[lr-debug] step={step_now} lrs=[{lr_repr}] "
+							f"sched_last_epoch={sched_last_epoch} internal_update_step={update_step_internal} "
+							f"theoretical_lr={theoretical_lr:.10e} "
+							f"cfg: base_lr={base_lr:.6e} lr_min={lr_min:.6e} warmup={warmup} tmax={tmax}"
+						)
+				except Exception:
+					pass
+		except Exception:
+			pass
+
 	# 最後に最新モデル保存 (version_tag なし)
 	_save_checkpoint(bundle, cfg, model_version, version_tag=None)
 
@@ -1077,7 +1583,6 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 		meta['replay_size'] = int(len(shared_rb))
 	except Exception:
 		pass
-	logger.log_text(f"[summary-train] updates={updates} total_updates={train_updates_cum} model_version={model_version} replay_size={_total_samples_all}")
 	logger.log_text(f"[summary-train] updates={updates} total_updates={train_updates_cum} model_version={model_version} replay_size={len(shared_rb)}")
 	# Instrumentation: time meta update to detect long blocking IO during resume/finish
 	t_meta_start = time.time()
@@ -1091,7 +1596,16 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 				logger.flush_buffers(force=True)
 		except Exception:
 			pass
-	logger.log_text(f"[summary-train] updates={updates} total_updates={train_updates_cum} model_version={model_version} replay_size={_total_samples_all}")
+	
+	# --- Buffer State 保存（スライディングウィンドウモード時）---
+	# 次回学習時に同じファイルを再度読み込まないよう、現在のウィンドウ状態を永続化
+	# 改善案A: 使用済みファイルを記録して次回除外
+	if buffer_state_used:
+		try:
+			_save_buffer_state(data_dir, active_files, used_files=used_files_for_session, logger=logger)
+		except Exception as e:
+			if logger:
+				logger.log_text(f"[WARN] buffer_state save failed: {e}")
 	# 最終ロスのサマリーを明示出力
 	if isinstance(last_loss_info, dict):
 		try:

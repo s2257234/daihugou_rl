@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+import math
 
 
 class CardEncoder:
@@ -245,8 +246,32 @@ class StateComposer:
       # Self block
       self_bits = self._ce.encode_bits_53(getattr(me, 'hand', []))
       self_pass = 1.0 if (pid < len(getattr(g, 'passed', [])) and getattr(g, 'passed')[pid]) else 0.0
-      # hand_size / 14.0 でスケール (max hand_size=14 基準で 0-1 範囲に正規化)
-      self_remain = len(getattr(me, 'hand', [])) / 14.0
+      # 正規化基準: プレイヤーあたりの最大初期枚数 (total_cards / num_players の切り上げ)
+      try:
+        total_cards = int(getattr(g, 'total_cards', None) or (len(getattr(getattr(g, 'deck', None), 'cards', [])) if getattr(g, 'deck', None) is not None else None) or 53)
+      except Exception:
+        total_cards = 53
+      try:
+        # allow agent.config override to use legacy scaling (/14)
+        use_old = bool(getattr(agent, 'config', {}).get('use_old_remain_scaling', False))
+      except Exception:
+        use_old = False
+      try:
+        if use_old:
+          max_initial_hand = 14
+        else:
+          max_initial_hand = max(1, math.ceil(float(total_cards) / max(1, int(num_players))))
+      except Exception:
+        max_initial_hand = 14
+      # hand_size / max_initial_hand でスケール (0..1)
+      try:
+        self_remain = float(len(getattr(me, 'hand', []))) / float(max_initial_hand)
+      except Exception:
+        self_remain = 0.0
+      if self_remain < 0.0:
+        self_remain = 0.0
+      elif self_remain > 1.0:
+        self_remain = 1.0
       feat: List[float] = self_bits + [self_pass, self_remain]
 
       # Opponent summaries (+ optional hand_labels)
@@ -288,8 +313,12 @@ class StateComposer:
 
       for i in opponents:
         try:
-          # hand_size / 14.0 でスケール (max hand_size=14 基準で 0-1 範囲に正規化)
-          opp_rem = len(g.players[i].hand) / 14.0
+          # hand_size / max_initial_hand でスケール (0..1)
+          opp_rem = float(len(g.players[i].hand)) / float(max_initial_hand)
+          if opp_rem < 0.0:
+            opp_rem = 0.0
+          elif opp_rem > 1.0:
+            opp_rem = 1.0
         except Exception:
           opp_rem = 0.0
         feat.append(opp_rem)

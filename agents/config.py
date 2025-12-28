@@ -18,16 +18,16 @@ ALPHA_ZERO_CONFIG = {
     # ---------------------------
     # 学習 / 最適化
     # ---------------------------
-    "buffer_size": 250000,            # リプレイバッファ最大サイズ 
+    "buffer_size": 750000,            # リプレイバッファ最大サイズ（30ファイル×約23,000サンプル対応） 
     "batch_size": 256,               # 学習バッチサイズ (train_step 実装時に利用)
-    "lr": 1e-4,                      # 学習率　初期値0.0001
-    "weight_decay": 1e-3,          # L2 正則化　初期値1e-4
+    "lr": 7e-5,                      # 学習率　初期値0.0001
+    "weight_decay": 3e-4,          # L2 正則化　初期値1e-4
     # Value Head専用の正則化（過学習対策）
-    "value_head_weight_decay": 5e-3,  # Value Headに強めのWeight Decay (通常の5倍)
-    "value_head_lr_scale": 0.7,       # Value Headの学習率スケール (通常の半分)
+    "value_head_weight_decay": 5e-4,  # Value HeadのWeight Decay
+    "value_head_lr_scale": 1.0,       # Value Headの学習率スケール 
     "value_loss_coef": 1.0,          # 価値損失係数
     "policy_loss_coef": 1.0,         # 方策損失係数
-    "entropy_coef": 1e-3,             # エントロピー正則化
+    "entropy_coef": 1e-4,             # エントロピー正則化
     "epochs_per_update": 1,          # 1回の train 呼び出しで何エポック回すか
 
     # --- 学習率スケジューラ ---
@@ -35,7 +35,7 @@ ALPHA_ZERO_CONFIG = {
     # none | warmup_cosine
     "lr_scheduler": "warmup_cosine",
     "lr_warmup_steps": 1000,
-    "lr_min": 5e-5,
+    "lr_min": 7e-6,
     # ウォームアップ後、ここまでの更新ステップで lr_min へ到達
     "lr_cosine_T_max_updates": 500000, #目標ステップ数に応じて変更する
     # 再開直後に一度だけウォームアップをやり直す（プロセス内一回限り）
@@ -61,19 +61,19 @@ ALPHA_ZERO_CONFIG = {
     # MCTS / 探索
     # ---------------------------
     # MCTS シミュレーション回数 (96で速度重視、tau=0.3の強力シャープ化でカバー) 
-    "num_simulations": 128,       # 1手あたりのシミュレーション回数 (速度とバランス)　初期値96
+    "num_simulations": 200,       # 1手あたりのシミュレーション回数 (速度とバランス)　初期値96
     "puct_c": 1.3,                  # PUCT 探索定数 (1.4→1.2で探索を抑制、訪問集中を促進) 初期値1.0
-    "dirichlet_alpha": 0.35,          # Dirichlet ノイズ α (ルート) 初期値0.3
-    "dirichlet_epsilon": 0.30,       # ノイズ混合率 ε (0.15→0.10でノイズを削減、評価に基づく集中) 
+    "dirichlet_alpha": 0.15,          # Dirichlet ノイズ α (ルート) 初期値0.3
+    "dirichlet_epsilon": 0.25,       # ノイズ混合率 ε (0.15→0.10でノイズを削減、評価に基づく集中) 
     "temperature": 1.0,              # 方策サンプリング温度 (序盤高く終盤低くする調整可) 初期値1.0
-    "temperature_decay_moves": 20,   # この手数以降は温度を 0 (argmax) にする等のスケジューリング用目安
+    "temperature_decay_moves": 20 ,   # この手数以降は温度を 0 (argmax) にする等のスケジューリング用目安
     # 温度スケジュール（序盤高温→後半低温、自己対戦エピソード進行で高温手数を短縮）
     # デフォルト: 最初の10手は τ=0.6、それ以降は τ=0.1。エピソードが進むと高温手数を段階的に短縮（最低2手を維持）
-    "temp_high_value": 2.0,            # 高温 τ (0.8→0.6に下げて過度なランダム性を抑制)
+    "temp_high_value": 1.5,            # 高温 τ (0.8→0.6に下げて過度なランダム性を抑制)
     "temp_low_value": 0.1,              # 低温 τ
-    "temp_high_moves_initial": 10,      # 高温適用の初期手数
-    "temp_high_moves_min": 4,           # 高温適用の最低手数
-    "temp_high_moves_decay_every": 1000, # 何エピソードごとに高温手数を1手短縮するか
+    "temp_high_moves_initial": 14,      # 高温適用の初期手数
+    "temp_high_moves_min": 6,           # 高温適用の最低手数
+    "temp_high_moves_decay_every": 5000, # 何エピソードごとに高温手数を1手短縮するか
     # 序盤ランダム化: 指定手数までは完全ランダムに行動 (探索温度の代替オプション)
     "opening_random_enable": False,    # True で有効化
     "opening_random_moves": 2,          # >0 で有効。例: 3 なら最初の3手をランダム行動
@@ -158,7 +158,7 @@ ALPHA_ZERO_CONFIG = {
     # モデル
     # ---------------------------
     "max_policy_size": 128,          # policy ログits の固定長 (合法手数 <= この値)
-    "hidden_size": 256,              # MLP 隠れ層次元
+    "hidden_size": 128,              # MLP 隠れ層次元
     "num_players": 4,                # 大富豪 4人
 
     
@@ -168,9 +168,10 @@ ALPHA_ZERO_CONFIG = {
     # ---------------------------
     # リプレイを学習用/検証用に確率分割する比率 (0.0〜0.5 程度を推奨)
     # サンプルが確定(value 付与)したタイミングで一度だけ split を付与します。
-    "val_split_ratio": 0.1,
+    # シャッフル後の先頭から val_split_ratio 分をバリデーションとして使用
+    "val_split_ratio": 0.05,
     # 学習更新に対して何回に1回、検証損失を計算するか (0/None で検証無効)
-    "val_eval_every_updates": 200,
+    "val_eval_every_updates": 30,
     # 検証時に使用する最大サンプル数 (過大計算防止)。0/None で全件。
     "val_max_samples": 4096,
     # 検証時のバッチサイズ (未指定で学習バッチと同一)
@@ -181,7 +182,7 @@ ALPHA_ZERO_CONFIG = {
     # ---------------------------
     # 学習で得た候補モデルを採用する前に、直前モデルに対して同一配牌・先後交代で
     # 厳しめの勝率しきい値で判定する仕組み。
-    # True で有効化。しきい値は 0.6 (60%)、対局数は100（= 同一配牌のペア×10）。
+    "val_split_ratio": 0.05,
     "eval_gate_enable": False,
     "eval_gate_games": 40,
     "eval_gate_threshold": 0.55,
@@ -217,29 +218,44 @@ ALPHA_ZERO_CONFIG = {
     # ingest_max_files: 1以上で最新Nファイルのみ学習対象に選択（None/0で全件）
     # ingest_pick_newest: Trueなら新しい順（推奨）、Falseなら古い順
     # ingest_max_samples_per_file: 各joblibから取り込む最大サンプル数（train/val それぞれに適用）。None/0で無制限
-    "ingest_max_files": 40,
+    "ingest_max_files": 100,
     "ingest_pick_newest": True,
-    "ingest_max_samples_per_file": 5000,
-    "active_file_pool_size": 40,  # メモリ削減: アクティブに監視するファイル数
+    "ingest_max_samples_per_file": 0,
+    "active_file_pool_size": 100,  # メモリ削減: アクティブに監視するファイル数
     "active_file_refresh_every_updates": 600,  # 何更新ごとにアクティブファイルリストを更新するか
     "active_file_pool_refresh_fraction": 0.3,  # プール内の何割を更新するか
-    "active_file_newest_bias": 0.05,  # 新しいファイルを選ぶバイアス (0.0-1.0)
+    # newest_bias: 最新ファイルとランダム選択の割合 (0.0-1.0)
+    # 1.0=全て最新から選択（従来動作）, 0.5=50%最新+50%ランダム, 0.0=全てランダム
+    # 過学習防止のため、0.3〜0.5程度を推奨（最新データと多様性のバランス）
+    "active_file_newest_bias": 0.4,  # 40%最新ファイル、60%古いファイルからランダム
     # resume_defer_preload有効時の初期ロードファイル数（デフォルトはingest_max_filesと同じ）
     "resume_initial_load_files": None,  # None時はingest_max_filesを使用
     
+    # ---------------------------
+    # Buffer State スライディングウィンドウ（過学習防止）
+    # ---------------------------
+    # buffer_window_size > 0 でスライディングウィンドウモードを有効化
+    # buffer_state.json にファイルリストを永続化し、同じデータの繰り返し学習を防止
+    # 30ファイル × 約23,000サンプル = 約700,000サンプルのプールを維持
+    "buffer_window_size": 30,  # ウィンドウサイズ（0で無効化し従来モードを使用）
+    
+    # 固定サンプル数制御（優先）: fixed_total_samples > 0 なら動的サイジングを無視してこの値を使用
+    # buffer_window_sizeが有効な場合、全ファイルを読み込むため0に設定推奨
+    "fixed_total_samples": 0,  # 0で無効化（buffer_window_size使用時は全件読み込み）
     # 動的サンプルサイジング: total_updates の累乗に基づいてサンプル数を調整
-    # enable_dynamic_sample_sizing が True の場合、以下の式でサンプル数を計算:
+    # enable_dynamic_sample_sizing が True かつ fixed_total_samples が 0 の場合のみ有効
+    # 注意: buffer_window_size > 0 の場合は無効にすること（全件読み込みのため）
     #   target_samples = dynamic_sample_base * (total_updates ** dynamic_sample_exponent)
     # ファイル数とサンプル数を両方動的に調整
-    "enable_dynamic_sample_sizing": True,
+    "enable_dynamic_sample_sizing": False,  # buffer_window_size使用時は無効化、以下の変数も無効化
     "dynamic_sample_exponent": 0.25,  # total_updates の指数（0.75乗）
     "dynamic_sample_base": 1.0,  # 基準係数（調整用）
-    "dynamic_sample_min_per_file": 200,  # ファイルあたりの最小サンプル数
-    "dynamic_sample_max_per_file": 2500,  # ファイルあたりの最大サンプル数
+    "dynamic_sample_min_per_file": 1000,  # ファイルあたりの最小サンプル数
+    "dynamic_sample_max_per_file": 20000,  # ファイルあたりの最大サンプル数
     # ファイル数の動的調整
     "enable_dynamic_file_count": True,  # ファイル数も動的に調整
-    "dynamic_samples_per_file_target": 2000,  # 1ファイルあたりの目標サンプル数
-    "dynamic_min_files": 10,  # 最小ファイル数
+    "dynamic_samples_per_file_target": 1000,  # 1ファイルあたりの目標サンプル数
+    "dynamic_min_files": 8,  # 最小ファイル数
     "dynamic_max_files": 150,  # 最大ファイル数
 
     # full_input をリプレイサンプルに保持するか。
@@ -337,8 +353,8 @@ ALPHA_ZERO_CONFIG = {
     "tensorboard_episode_log_every": 200,
     "tensorboard_flush_seconds": 300,        # 最低この秒数ごとに flush (0/None なら都度 flush)
     # CSV 出力間引き (1=毎回)。間引いた行は欠番になる
-    "csv_train_log_every": 200,
-    "csv_episode_log_every": 200,
+    "csv_train_log_every": 30,
+    "csv_episode_log_every": 30,
     # MCTS ルート統計 JSONL を更に抑制したい場合 (disable_mcts_log と組み合わせ)
     "mcts_jsonl_max_bytes": 50_000_000,     # 上限超過で以降追記停止 (約50MB)。0/None で無効
 
@@ -394,19 +410,29 @@ ALPHA_ZERO_CONFIG = {
     # ---------------------------
     # 重複サンプルフィルタ設定
     # ---------------------------
-    # True で有効化: _store_sample で (policy top1, value_pred(量子化), legal_ids数) 等から
-    # 簡易シグネチャを作り直近ウィンドウ内の過剰出現(>duplicate_signature_max_count)時に破棄。
-    # 情報量の低い連続同型局面の氾濫を抑制しメモリ圧縮と多様性向上を狙う。
+    # True で有効化: 自己対局データ保存時に forced_pass サンプルを圧縮。
+    # - 同一 state_key（主に state['full_input'] のバイト列ハッシュ）な forced_pass は 1 つに圧縮
+    # - 連続した forced_pass は新しい方を残して古い方を破棄
+    # ※ 非 forced_pass サンプルはフィルタ対象外。
     "enable_duplicate_filter": True,
-    # シグネチャの保持ウィンドウサイズ (FIFO)。大きくし過ぎると計数コスト増。
+    # 以下は旧 signature-based 重複除外の後方互換キー（現在は未使用）。
     "duplicate_window_size": 3000,
-    # 同一シグネチャを許容する最大回数 (この回数を超えると以降スキップ)。
     "duplicate_signature_max_count": 200,
-    # スキップ数を一定間隔でログ出力するか (0/None で無効, >0 でその間隔毎に [dup] 行)。
     "duplicate_log_interval": 0,
-    # フィルタのシグネチャ構成: 'top_value_len' で (policy_top_idx, value_u8, legal_count)
-    # 将来拡張ポイント (例: 'hash_pi')。
+    "duplicate_enable_jsonl_log": False,
+    "duplicate_jsonl_per_sample": False,
     "duplicate_signature_type": "top_value_len",
+    "duplicate_entropy_buckets": 8,
+
+    # ---------------------------
+    # Pass-only サンプルの重み付け設定
+    # ---------------------------
+    # True で有効化: pass-only 局面（合法手が pass のみ）に低い重みを付与して学習効率を向上。
+    "enable_pass_only_weighting": True,
+    # pass-only サンプルの重み（0.0〜1.0）。1.0 で通常、0.1 で大幅に抑制。
+    "pass_only_weight": 0.1,
+    # 終盤判定の手札枚数閾値。この枚数以下のサンプルは戦術的に重要とみなし重み 1.0 を保持。
+    "pass_only_endgame_threshold": 3,
 
     # ---------------------------
     # 追加: チェックポイント保存時にリプレイを purge するオプション

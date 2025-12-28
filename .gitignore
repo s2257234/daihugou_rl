@@ -6,7 +6,7 @@
 .vscode/
 memo.txt
 pytorch_practice.py
-logs/
+#logs/
 *.joblib
 *.pt
 tests/

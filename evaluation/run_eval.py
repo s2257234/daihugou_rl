@@ -70,11 +70,10 @@ def main():
         determinization_mode_override=args.det_mode_eval,
         past_checkpoints=past_ckpts,
     )
-    evaluator.run(num_episodes=args.episodes, workers=args.workers)
+    participants = evaluator.run(num_episodes=args.episodes, workers=args.workers)
     # 参加者ラベルを統一形式で表示（席名のマッピング表示は廃止）
-    labels = evaluator.get_participant_labels()
     print("[EVAL] Participants:")
-    for lb in labels:
+    for lb in participants:
         print(f"  - {lb}")
     if not args.no_auto_plot:
         # 自動プロット更新 (figs ディレクトリを明示)

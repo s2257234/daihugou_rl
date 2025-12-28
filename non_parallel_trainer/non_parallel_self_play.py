@@ -67,6 +67,7 @@ import queue as _q
 import torch
 
 import joblib
+from collections import deque
 
 # Ensure project root is on sys.path when run as a script
 _PROJ_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -76,6 +77,183 @@ if _PROJ_ROOT not in sys.path:
 from agents.config import ALPHA_ZERO_CONFIG
 from utils.logger import TrainingLogger
 from trainer.workers import selfplay_daemon_worker_entry
+from agents.replay_buffer import store_replay_sample
+
+
+def _init_duplicate_filter_state(cfg: Dict[str, Any]) -> Dict[str, Any] | None:
+	"""Initialize state for save-stage duplicate filtering.
+
+	Current policy (forced_pass-friendly):
+	- Compress forced_pass samples of identical state into 1.
+	- Collapse consecutive forced_pass runs by keeping the newest sample.
+
+	Non-forced_pass samples are always kept.
+	"""
+	try:
+		if not bool(cfg.get('enable_duplicate_filter', False)):
+			return None
+	except Exception:
+		return None
+	return {
+		'enabled': True,
+		'kept': [],
+		'raw_count': 0,
+		'removed': 0,
+		'pass_only_raw': 0,
+		'pass_only_kept': 0,
+		'pass_only_removed_same_state': 0,
+		'pass_only_removed_consecutive': 0,
+		'unique_forced_states': set(),
+		'_last_kept_is_forced_pass': False,
+		'_last_kept_forced_key': None,
+		'_last_kept_forced_player_id': None,
+	}
+
+
+def _duplicate_filter_add_samples(state: Dict[str, Any], samples: List[Dict[str, Any]]) -> None:
+	"""Update duplicate-filter state with a batch of samples.
+
+	Filtering is applied only to forced_pass samples:
+	- Same-state forced_pass -> keep 1.
+	- Consecutive forced_pass -> keep newest.
+	"""
+	if not state or not samples:
+		return
+	import json as _json
+	import numpy as _np
+	kept: list = state['kept']
+	unique_forced_states: set = state.get('unique_forced_states') or set()
+	state['unique_forced_states'] = unique_forced_states
+
+	def _is_forced_pass_sample(s: Any) -> bool:
+		if not isinstance(s, dict):
+			return False
+		la = s.get('legal_actions')
+		if not isinstance(la, list) or len(la) == 0:
+			return False
+		try:
+			return all(a is None for a in la)
+		except Exception:
+			return False
+
+	def _state_key_for_forced_pass(s: Dict[str, Any]) -> str:
+		"""Best-effort state key for forced_pass dedup.
+
+		Prefer NN input tensor bytes (state['full_input']). If missing, fall back to a
+		stable JSON signature of a small subset of state keys.
+		"""
+		st = s.get('state')
+		pid = None
+		try:
+			pid = s.get('player_id')
+			if pid is None and isinstance(st, dict):
+				pid = st.get('self_player_id')
+		except Exception:
+			pid = None
+		if isinstance(st, dict):
+			fi = st.get('full_input')
+			if fi is not None:
+				try:
+					arr = _np.asarray(fi)
+					arr = arr.reshape(-1)
+					# float16 for stability/compactness
+					arr16 = arr.astype(_np.float16, copy=False)
+					ver = st.get('full_input_version')
+					dim = int(arr16.size)
+					prefix = f"pid={pid}|v={ver}|dim={dim}|".encode('utf-8', 'ignore')
+					b = prefix + arr16.tobytes(order='C')
+					return hashlib.md5(b).hexdigest()
+				except Exception:
+					pass
+			# fallback: pick a small stable subset if present
+			try:
+				keys = [
+					'self_hand_indices',
+					'field_card_indices',
+					'pass_flags',
+					'revolution',
+					'history',
+					'turn',
+				]
+				mini = {k: st.get(k) for k in keys if k in st}
+				if pid is not None:
+					mini['player_id'] = pid
+				js = _json.dumps(mini, sort_keys=True, ensure_ascii=False, default=str)
+				return hashlib.md5(js.encode('utf-8', 'ignore')).hexdigest()
+			except Exception:
+				pass
+		try:
+			rep = repr(st)
+		except Exception:
+			rep = 'NA'
+		return hashlib.md5(rep.encode('utf-8', 'ignore')).hexdigest()
+
+	for s in samples:
+		state['raw_count'] += 1
+		try:
+			if not _is_forced_pass_sample(s):
+				kept.append(s)
+				state['_last_kept_is_forced_pass'] = False
+				state['_last_kept_forced_key'] = None
+				continue
+			state['pass_only_raw'] += 1
+			k = _state_key_for_forced_pass(s)
+			last_forced = bool(state.get('_last_kept_is_forced_pass', False))
+			last_key = state.get('_last_kept_forced_key')
+			cur_pid = None
+			try:
+				cur_pid = s.get('player_id')
+				if cur_pid is None:
+					cur_pid = (s.get('state') or {}).get('self_player_id')
+			except Exception:
+				cur_pid = None
+			last_pid = state.get('_last_kept_forced_player_id')
+			# consecutive forced_pass: keep newest
+			if last_forced and kept and (cur_pid == last_pid):
+				# If current forced_pass state already exists elsewhere (excluding the last
+				# element we might replace), skip it.
+				if (k in unique_forced_states) and (k != last_key):
+					state['removed'] += 1
+					state['pass_only_removed_same_state'] += 1
+					continue
+				# Replace last kept forced_pass with current one
+				try:
+					kept[-1] = s
+				except Exception:
+					# if kept[-1] fails for any reason, fall back to append
+					kept.append(s)
+				# accounting: we dropped the older forced_pass
+				state['removed'] += 1
+				state['pass_only_removed_consecutive'] += 1
+				# update state-key set if key changed
+				try:
+					if last_key and (last_key in unique_forced_states) and (k != last_key):
+						unique_forced_states.discard(last_key)
+					unique_forced_states.add(k)
+				except Exception:
+					pass
+				state['_last_kept_is_forced_pass'] = True
+				state['_last_kept_forced_key'] = k
+				state['_last_kept_forced_player_id'] = cur_pid
+				continue
+
+			# non-consecutive forced_pass: same-state compression
+			if k in unique_forced_states:
+				state['removed'] += 1
+				state['pass_only_removed_same_state'] += 1
+				continue
+			kept.append(s)
+			unique_forced_states.add(k)
+			state['pass_only_kept'] += 1
+			state['_last_kept_is_forced_pass'] = True
+			state['_last_kept_forced_key'] = k
+			state['_last_kept_forced_player_id'] = cur_pid
+		except Exception:
+			# Any failure -> keep sample (fail-open)
+			kept.append(s)
+			state['_last_kept_is_forced_pass'] = False
+			state['_last_kept_forced_key'] = None
+			state['_last_kept_forced_player_id'] = None
 
 
 def _load_config(base: Dict[str, Any], path: str | None) -> Dict[str, Any]:
@@ -116,15 +294,21 @@ def _read_model_version(checkpoint_dir: str) -> int | None:
 	return None
 
 
-VALUE_U8_NONE = 0xFF
+VALUE_U8_NONE = 0xFF  # Legacy constant for backwards compatibility
 
 
 def _has_value_label(sample: Dict[str, Any]) -> bool:
-	"""Returns True when the sample includes either float or quantized value."""
+	"""Returns True when the sample includes a valid value label.
+	
+	Primary check is for raw float 'value' field.
+	For backwards compatibility, also accepts legacy 'value_u8' field.
+	"""
 	if not isinstance(sample, dict):
 		return False
+	# Primary: raw float value
 	if sample.get('value') is not None:
 		return True
+	# Backwards compatibility: check legacy value_u8
 	value_u8 = sample.get('value_u8')
 	return isinstance(value_u8, int) and 0 <= value_u8 < VALUE_U8_NONE
 
@@ -258,6 +442,11 @@ def run_self_play(cfg: Dict[str, Any], episodes: int, workers: int, model_path: 
 	start_cumulative_eps = cumulative_eps
 	drained_samples: List[Dict[str, Any]] = []
 	val_ratio = float(cfg.get('val_split_ratio', 0.0) or 0.0)
+	dup_state = _init_duplicate_filter_state(cfg)
+	if dup_state is not None:
+		# keep list is owned by dup_state; bind drained_samples to it so len(drained_samples)
+		# naturally becomes the post-dedup count for status-np
+		drained_samples = dup_state['kept']
 	# ステータス連打抑制用: 直近ログ出力した ep 値と直近の drained サンプル数
 	last_status_logged_ep = -1
 	last_status_logged_samples = 0
@@ -309,7 +498,10 @@ def run_self_play(cfg: Dict[str, Any], episodes: int, workers: int, model_path: 
 			# サンプル drain
 			new_samples = _drain_samples(sample_queue, max_batch=2000, val_ratio=val_ratio)
 			if new_samples:
-				drained_samples.extend(new_samples)
+				if dup_state is not None:
+					_duplicate_filter_add_samples(dup_state, new_samples)
+				else:
+					drained_samples.extend(new_samples)
 			# 進捗ステータス: 指定間隔かつ同じ ep で一度のみ、サンプル増分がある場合のみ出力
 			# 既定のログ間隔を 250 エピソードへ（設定 measure_log_every_episodes で上書き可能）
 			log_interval = max(1, int(cfg.get('measure_log_every_episodes', 250) or 250))
@@ -341,7 +533,10 @@ def run_self_play(cfg: Dict[str, Any], episodes: int, workers: int, model_path: 
 		# 最終 drain
 		final_samples = _drain_samples(sample_queue, max_batch=None, val_ratio=val_ratio)
 		if final_samples:
-			drained_samples.extend(final_samples)
+			if dup_state is not None:
+				_duplicate_filter_add_samples(dup_state, final_samples)
+			else:
+				drained_samples.extend(final_samples)
 		if use_thread_mode:
 			# スレッドは stop 指示後に短い待機
 			for th in threads:
@@ -373,6 +568,16 @@ def run_self_play(cfg: Dict[str, Any], episodes: int, workers: int, model_path: 
 
 	elapsed = time.time() - start_ts
 
+	# For reporting: raw is pre-dedup drained count, kept is len(drained_samples).
+	if dup_state is not None:
+		raw_sample_count = int(dup_state.get('raw_count', 0) or 0)
+		dedup_removed = int(dup_state.get('removed', 0) or 0)
+		dedup_unique_sigs = int(len(dup_state.get('unique_forced_states', set()) or set()))
+	else:
+		raw_sample_count = len(drained_samples)
+		dedup_removed = 0
+		dedup_unique_sigs = 0
+
 	# model_version 取得
 	model_version = _read_model_version(checkpoint_dir)
 	# config ハッシュ
@@ -384,6 +589,9 @@ def run_self_play(cfg: Dict[str, Any], episodes: int, workers: int, model_path: 
 		'episodes_cumulative': cumulative_eps,
 		'episodes_this_run': ep_done,
 		'sample_count': len(drained_samples),
+		'sample_count_raw': raw_sample_count,
+		'duplicate_filter_removed': int(dedup_removed),
+		'duplicate_filter_unique_sigs': int(dedup_unique_sigs),
 		'generated_at': time.time(),
 		'model_version': model_version,
 		'workers': workers,
@@ -411,6 +619,26 @@ def run_self_play(cfg: Dict[str, Any], episodes: int, workers: int, model_path: 
 		'meta': new_meta,
 		'samples': drained_samples,
 	}
+
+	# Emit a concise one-line summary per self-play run.
+	try:
+		if bool(cfg.get('enable_duplicate_filter', False)) and raw_sample_count > 0 and dup_state is not None:
+			forced_raw = int(dup_state.get('pass_only_raw', 0) or 0)
+			forced_kept = int(dup_state.get('pass_only_kept', 0) or 0)
+			removed_same = int(dup_state.get('pass_only_removed_same_state', 0) or 0)
+			removed_cons = int(dup_state.get('pass_only_removed_consecutive', 0) or 0)
+			uniq_forced = int(len(dup_state.get('unique_forced_states') or set()))
+			summary_line = (
+				f"[DUP_SUM] episodes={ep_done} samples={raw_sample_count} kept={len(drained_samples)} removed={dedup_removed} "
+				f"pass_only={forced_raw} pass_only_kept={forced_kept} "
+				f"pass_only_removed_same_state={removed_same} pass_only_removed_consecutive={removed_cons} "
+				f"unique_forced_states={uniq_forced} reason=forced_pass_state_key+consecutive"
+			)
+			sum_path = os.path.join(log_dir, 'duplicate_skipped_summary.log')
+			with open(sum_path, 'a', encoding='utf-8') as sf:
+				sf.write(summary_line + '\n')
+	except Exception:
+		pass
 	# 圧縮レベル:
 	# 直列モード (non-parallel) は memmap 利用とI/O高速化を優先し compress=0 を強制。
 	# 並列モードと区別するための設定キー selfplay_joblib_compress があってもここでは無視。

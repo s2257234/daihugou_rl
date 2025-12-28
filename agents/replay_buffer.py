@@ -8,6 +8,9 @@ import time
 import shutil
 import numpy as _np
 import tempfile
+import json
+import hashlib
+import math
 
 
 VALUE_U8_NONE = 255
@@ -50,13 +53,13 @@ def make_replay_sample(
 
     Notes:
     - Keeps backwards-compatible fields used across the codebase.
-    - Stores value in quantized form `value_u8` (255 means None).
+    - Stores value as raw float (None means unset).
     """
     sample: Dict[str, Any] = {
         'state': state if isinstance(state, dict) else {},
         'legal_actions': legal_actions if isinstance(legal_actions, list) else [],
         'pi': pi,
-        'value_u8': _encode_value_u8(value),
+        'value': value,
         'is_terminal': bool(is_terminal),
     }
     if uid is not None:
@@ -471,7 +474,7 @@ def store_replay_sample(agent: Any, state: Any, legal_actions: Any, pi: Any, val
             'state': state,
             'legal_actions': legal_actions,
             'pi': list(pi) if pi is not None else None,
-            'value_u8': _encode_value_u8(value),
+            'value': value,
             'model_version': model_version,
             'feature_version': feature_version,
             'lossless': True,
@@ -608,7 +611,6 @@ def store_replay_sample(agent: Any, state: Any, legal_actions: Any, pi: Any, val
             if 0 <= new_val <= 65535:
                 pi_q[i] = new_val  # type: ignore[index]
 
-    value_u8 = _encode_value_u8(value)
     feature_version = 0
     if isinstance(state, dict) and ('full_input' in state or 'full_compact' in state):
         feature_version = state.get('full_input_version', 1)
@@ -618,7 +620,7 @@ def store_replay_sample(agent: Any, state: Any, legal_actions: Any, pi: Any, val
         'state': state,
         'pi_q': pi_q,
         'pi_format': 'u16_norm65535',
-        'value_u8': value_u8,
+        'value': value,
         'model_version': model_version,
         'feature_version': feature_version,
     }
@@ -652,6 +654,23 @@ def store_replay_sample(agent: Any, state: Any, legal_actions: Any, pi: Any, val
 
     sample['hand_size'] = int(hand_size)
     sample['is_terminal'] = (int(hand_size) == 0)
+
+    # --- Pass-only sample weighting ---
+    if bool(cfg.get('enable_pass_only_weighting', True)):
+        try:
+            is_pass_only = False
+            if legal_actions is not None and isinstance(legal_actions, (list, tuple)):
+                # Pass-only means all actions are None (player can only pass, cannot play any card)
+                is_pass_only = all(a is None for a in legal_actions)
+            if is_pass_only:
+                pass_weight = float(cfg.get('pass_only_weight', 0.1) or 0.1)
+                sample['sample_weight'] = pass_weight
+            else:
+                sample['sample_weight'] = 1.0
+        except Exception:
+            sample['sample_weight'] = 1.0
+    else:
+        sample['sample_weight'] = 1.0
 
     # Ensure saved state contains the self-player perspective marker.
     if isinstance(sample.get('state'), dict):
@@ -731,55 +750,6 @@ def store_replay_sample(agent: Any, state: Any, legal_actions: Any, pi: Any, val
                 except Exception as e:
                     _agent_log(agent, f"[WARN][replay] probe full_input/self_hand_indices failed: {e}")
 
-    # ------------------ Duplicate sample filter ------------------
-    if bool(getattr(agent, '_dup_enabled', False)):
-        sig_type = cfg.get('duplicate_signature_type', 'top_value_len')
-        top_idx = int(_np.argmax(pi_q)) if pi_q.size > 0 else -1
-        legal_len = int(pi_q.size)
-        try:
-            vq = int(sample.get('value_u8', VALUE_U8_NONE))
-        except Exception:
-            vq = VALUE_U8_NONE
-        if sig_type == 'top_value_len':
-            sig = (top_idx, vq, legal_len)
-        else:
-            sig = (top_idx, vq, legal_len)
-        max_cnt = int(cfg.get('duplicate_signature_max_count', 50) or 50)
-        q = getattr(agent, '_dup_sig_queue', None)
-        counts = getattr(agent, '_dup_sig_counts', None)
-        if q is not None and counts is not None:
-            c = counts.get(sig, 0) + 1
-            counts[sig] = c
-            q.append(sig)
-            if getattr(q, 'maxlen', None) and len(q) == q.maxlen and (len(q) % 997 == 0):
-                new_counts: Dict[Any, int] = {}
-                for s_ in q:
-                    new_counts[s_] = new_counts.get(s_, 0) + 1
-                counts.clear()
-                counts.update(new_counts)
-            if c > max_cnt:
-                try:
-                    agent._dup_skipped += 1
-                except Exception:
-                    pass
-                sample['in_buffer'] = False
-                log_int = int(cfg.get('duplicate_log_interval', 0) or 0)
-                if log_int > 0:
-                    try:
-                        total_seen = agent._dup_skipped + agent._dup_kept
-                        if total_seen - agent._dup_last_log >= log_int:
-                            _agent_log(agent, f"[dup] skipped={agent._dup_skipped} kept={agent._dup_kept} ratio={(agent._dup_skipped/max(1,total_seen)):.3f}")
-                            agent._dup_last_log = total_seen
-                    except Exception:
-                        pass
-                return sample
-            try:
-                agent._dup_kept += 1
-            except Exception:
-                pass
-            sample['dup_sig'] = sig
-            sample['in_buffer'] = True
-
     # (Option) keep raw pi for analysis.
     if not bool(cfg.get('drop_raw_pi', True)):
         try:
@@ -787,9 +757,9 @@ def store_replay_sample(agent: Any, state: Any, legal_actions: Any, pi: Any, val
         except Exception:
             pass
 
-    # Optional legal_actions backup.
-    if bool(cfg.get('enable_legal_actions_backup', False)):
-        sample['legal_actions'] = legal_actions
+    # Always save legal_actions for pass-only detection and sample weighting.
+    # (Previously optional via enable_legal_actions_backup, now required for training features)
+    sample['legal_actions'] = legal_actions
 
     if bool(cfg.get('use_full_features')) and sample.get('feature_version') == 0:
         return sample
@@ -957,28 +927,23 @@ class ReplayBuffer:
         return obj
 
     def _normalize_value_fields(self, sample: Dict[str, Any]):
+        """Normalize value field: ensure 'value' is present as float or None.
+        
+        Backwards compatibility: if old sample has 'value_u8', decode to 'value'.
+        """
         if not isinstance(sample, dict):
             return
+        # If sample has legacy value_u8, convert to value
         try:
             vu = sample.get('value_u8')
+            if vu is not None and 'value' not in sample:
+                decoded = _decode_value_u8(vu)
+                if decoded is not None:
+                    sample['value'] = decoded
         except Exception:
-            vu = None
-        need_encode = False
-        if vu is not None:
-            try:
-                vu_int = int(vu)
-                if 0 <= vu_int <= 255:
-                    sample['value_u8'] = vu_int
-                else:
-                    need_encode = True
-            except Exception:
-                need_encode = True
-        else:
-            need_encode = True
-        if need_encode:
-            val = sample.get('value') if isinstance(sample, dict) else None
-            sample['value_u8'] = _encode_value_u8(val if isinstance(val, (int, float)) else None)
-        for legacy_key in ('value', 'value_pred', 'value_pred_u8'):
+            pass
+        # Remove legacy quantized fields
+        for legacy_key in ('value_u8', 'value_pred', 'value_pred_u8'):
             if legacy_key in sample:
                 try:
                     del sample[legacy_key]
@@ -1124,12 +1089,22 @@ class ReplayBuffer:
         assigned = []
         to_add = []
         with self._lock:
+            # 最適化: _prioritiesが空の場合は1.0を使用（rebuild_replayでclear後は常に空）
+            # 空でない場合のみ最大値を計算（一度だけ、ループ外で）
+            default_priority = 1.0
+            if self._priorities:
+                default_priority = max(self._priorities.values())
+            
             # lazy prealloc init may depend on first samples; call per-sample but under single lock
+            # 最適化: 最初のサンプルでのみ初期化を試行（既に初期化済みなら早期リターン）
+            first_sample_init_done = False
             for sample in samples:
                 if not isinstance(sample, dict):
                     continue
                 try:
-                    self._maybe_init_prealloc(sample)
+                    if not first_sample_init_done:
+                        self._maybe_init_prealloc(sample)
+                        first_sample_init_done = True
                 except Exception:
                     pass
                 # prepare sample metadata
@@ -1142,14 +1117,14 @@ class ReplayBuffer:
                             pass
                 sample["uid"] = self._next_id
                 self._next_id += 1
-                # priority
+                # priority - 最適化: 事前計算したdefault_priorityを使用（max()を毎回呼ばない）
                 try:
                     if 'priority' in sample and isinstance(sample['priority'], (int, float)):
                         p = float(sample['priority'])
                     else:
-                        p = max(self._priorities.values()) if self._priorities else 1.0
+                        p = default_priority  # 変更: max()を毎回呼ばない
                 except Exception:
-                    p = 1.0
+                    p = default_priority
                 sample['priority'] = float(p)
                 try:
                     self._priorities[sample['uid']] = float(p)
@@ -1783,11 +1758,12 @@ class ReplayBuffer:
 
     def _save_locked(self, path: str, purge: bool = False):
         import sys, traceback
-        # allow_keys から "pi" と "legal_actions" を除外し、量子化済み/ID化済みの最小構造のみを保存する。
+        # allow_keys から "pi" と "legal_actions" を除外し、最小構造のみを保存する。
         # これにより再帰的な複雑構造の混入 (特に raw pi / backup legal_actions による巨大ネスト) リスクを下げる。
+        # value は量子化せず生の浮動小数点として保存する。
         allow_keys = {
             "player_id", "state", "model_version", "feature_version",
-            "uid", "pi_q", "pi_format", "legal_ids", "actions_format", "value_u8",
+            "uid", "pi_q", "pi_format", "legal_ids", "actions_format", "value",
             "split"
         }
 
@@ -2186,12 +2162,19 @@ class ReplayBuffer:
                         rb._normalize_value_fields(s)
                     except Exception:
                         pass
-                    if 'value_u8' not in s and isinstance(legacy_values, _np.ndarray):
-                        try:
-                            v_float = float(legacy_values[idx]) if idx < len(legacy_values) else None
-                        except Exception:
-                            v_float = None
-                        s['value_u8'] = _encode_value_u8(v_float)
+                    # Backwards compatibility: convert legacy value_u8 / legacy_values to value
+                    if 'value' not in s:
+                        if 'value_u8' in s:
+                            decoded = _decode_value_u8(s.get('value_u8'))
+                            if decoded is not None:
+                                s['value'] = decoded
+                        elif isinstance(legacy_values, _np.ndarray):
+                            try:
+                                v_float = float(legacy_values[idx]) if idx < len(legacy_values) else None
+                            except Exception:
+                                v_float = None
+                            if v_float is not None:
+                                s['value'] = v_float
                 except Exception:
                     pass
                 rb._data.append(s)

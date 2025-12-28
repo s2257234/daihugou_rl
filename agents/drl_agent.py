@@ -64,7 +64,6 @@ from agents.replay_buffer import canonicalize_state as _canonicalize_state_impl
 # Backward compatibility: keep names importable from agents.drl_agent.
 from agents.agent_utills.training import (
     VALUE_U8_NONE,
-    _encode_value_u8,
     _decode_value_u8,
     _extract_value,
     _has_value_label,
@@ -316,7 +315,10 @@ class AlphaZeroAgent(TrainStepMixin):
         else:
             env = getattr(self, "env_ref", None)
 
-        # pass-only: if only pass is legal, return immediately.
+        # pass-only: if only pass is legal, store sample and return immediately.
+        # (Changed: previously skipped sample storage for pass-only situations,
+        #  but we need these samples for training to learn value in forced-pass positions)
+        pass_only_detected = False
         try:
             if env is not None and hasattr(env, "_generate_legal_actions"):
                 g0 = env.game
@@ -325,6 +327,16 @@ class AlphaZeroAgent(TrainStepMixin):
                 field0 = (g0.current_field or [])[:]
                 legal0 = env._generate_legal_actions(hand0, field0)
                 if _is_pass_only(legal0):
+                    pass_only_detected = True
+                    if training:
+                        # Store pass-only sample with legal_actions=[None], pi=[1.0], value=None
+                        state_repr = self._extract_state(env, prev_state=getattr(self, '_last_state', None))
+                        stored = self._store_sample(state_repr, [None], [1.0], None)
+                        self._phase_samples.append(stored)
+                        # PASSのみの場合は MCTS/NN 推論を省略して即座にパスする。
+                        # 予測値は作らない（教師データではなく統計用だが、混同・汚染を避ける）。
+                        self._phase_value_preds.append(None)
+                        self._last_state = state_repr
                     return None
         except Exception:
             pass
@@ -333,6 +345,9 @@ class AlphaZeroAgent(TrainStepMixin):
         if env is None:
             legal_actions_kw = kwargs.get("legal_actions")
             if _is_pass_only(legal_actions_kw):
+                if training:
+                    # Cannot extract state without env, skip sample storage
+                    pass
                 return None
             if legal_actions_kw is not None:
                 for cand in legal_actions_kw:
@@ -346,6 +361,15 @@ class AlphaZeroAgent(TrainStepMixin):
 
         # If env.step provided legal_actions and it is pass-only, skip MCTS and pass.
         if _is_pass_only(kwargs.get("legal_actions")):
+            if training and not pass_only_detected:
+                # Store pass-only sample
+                state_repr = self._extract_state(env, prev_state=getattr(self, '_last_state', None))
+                stored = self._store_sample(state_repr, [None], [1.0], None)
+                self._phase_samples.append(stored)
+                # PASSのみの場合は MCTS/NN 推論を省略して即座にパスする。
+                # 予測値は作らない（教師データではなく統計用だが、混同・汚染を避ける）。
+                self._phase_value_preds.append(None)
+                self._last_state = state_repr
             return None
 
         # デバッグ: MCTS実行前の環境状態を記録
@@ -680,7 +704,10 @@ class AlphaZeroAgent(TrainStepMixin):
         # 1. 状態抽出
         state = self._extract_state(env)
         
-        # 2. ターミナル状態のショートカット（手札が空なら即座に勝利）
+        # 2. ターミナル状態のショートカット（この実装の value は「区間(phase/stage)の勝者=1、それ以外=0」）
+        # NOTE: 多人数のためスカラー 1.0 を返すのは誤り（全プレイヤーが勝ちになる）。
+        # ここでは「手番プレイヤーの手札が0」という異常/境界状態に対しても
+        # per-player dict を返すことで MCTS/ログを壊さないようにする。
         try:
             hand_sz = None
             if isinstance(state, dict):
@@ -702,8 +729,23 @@ class AlphaZeroAgent(TrainStepMixin):
                                     hand_sz = len(hand_attr)
                 except Exception:
                     hand_sz = None
+
             if hand_sz == 0:
-                return {}, 1.0
+                g = getattr(env, 'game', None)
+                turn_pid = int(getattr(g, 'turn', getattr(self, 'player_id', 0))) if g is not None else int(getattr(self, 'player_id', 0))
+                try:
+                    n_players = int(getattr(g, 'num_players', int(self.config.get('num_players', 4)))) if g is not None else int(self.config.get('num_players', 4))
+                except Exception:
+                    n_players = 4
+                # stage winner として turn_pid を採用（手札0ならそのプレイヤーの上がりとして扱う）
+                already_won = set(getattr(env, 'already_won_players', set()) or set())
+                values = {}
+                for pid in range(n_players):
+                    if pid == turn_pid:
+                        values[pid] = 1.0
+                    elif pid not in already_won:
+                        values[pid] = 0.0
+                return {}, values
         except Exception:
             pass
         
@@ -1023,9 +1065,8 @@ class AlphaZeroAgent(TrainStepMixin):
                 self.total_value_samples += 1
                 if value > 0.5:
                     self.total_positive += 1
-            # 量子化フィールドも更新
-            
-            rec["value_u8"] = _encode_value_u8(value)
+            # Store raw float value (no quantization)
+            rec["value"] = float(value)
             
             # 学習/検証スプリットを一度だけ付与
             
@@ -1128,10 +1169,10 @@ class AlphaZeroAgent(TrainStepMixin):
                 if val > 0.5:
                     self.total_positive += 1
             try:
-                encoded = _encode_value_u8(val)
-                rec['value_u8'] = encoded
+                # Store raw float value (no quantization)
+                rec['value'] = float(val)
             except Exception as e:
-                print(f"[ERROR-encode] {e}")
+                print(f"[ERROR-value] {e}")
                 pass
             try:
                 if rec.get('split') is None:
@@ -1238,6 +1279,19 @@ class AlphaZeroAgent(TrainStepMixin):
                 if self.model is None or not hasattr(self.model, 'parameters'):
                     self._optimizer = None
                     return
+                # Debug: dump named parameter names for runtime inspection
+                try:
+                    if bool(self.config.get('debug_optimizer_named_params', False)) or bool(self.config.get('debug_value_flow', False)):
+                        try:
+                            names = [n for n, _ in self.model.named_parameters()]
+                            print(f"[DEBUG_OPT_NAMED_PARAMS] names={names}")
+                        except Exception:
+                            try:
+                                print(f"[DEBUG_OPT_NAMED_PARAMS] failed to list named_parameters")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
                 
                 lr = float(self.config.get("lr", getattr(self, 'lr', 1e-4)))
                 wd = float(self.config.get("weight_decay", getattr(self, 'weight_decay', 1e-4)))
@@ -1260,7 +1314,7 @@ class AlphaZeroAgent(TrainStepMixin):
 
                 # Debug: value_head delta snapshot (ensure_optimizerはvalue_head可視な地点)
                 try:
-                    if bool(self.config.get('debug_value_flow', True)) and bool(self.config.get('debug_value_delta_in_optimizer', True)):
+                    if bool(self.config.get('debug_value_flow', False)) and bool(self.config.get('debug_value_delta_in_optimizer', True)):
                         vh_numel = 0
                         vh_sample0 = None
                         vh_norm = None
@@ -1299,7 +1353,7 @@ class AlphaZeroAgent(TrainStepMixin):
 
                 # Debug: show whether value_head is trainable / included
                 try:
-                    if bool(self.config.get('debug_value_flow', True)):
+                    if bool(self.config.get('debug_value_flow', False)):
                         vh_all = 0
                         vh_trainable = 0
                         for name, param in self.model.named_parameters():
@@ -1330,7 +1384,7 @@ class AlphaZeroAgent(TrainStepMixin):
                 if param_groups:
                     self._optimizer = torch.optim.Adam(param_groups)
                     try:
-                        if bool(self.config.get('debug_value_flow', True)):
+                        if bool(self.config.get('debug_value_flow', False)):
                             # summarize param group sizes
                             gsz = []
                             for g in self._optimizer.param_groups:
@@ -1799,7 +1853,15 @@ class AlphaZeroAgent(TrainStepMixin):
             from agents.validation import validate_on_agent
             return validate_on_agent(self, batch_size=batch_size)
         except Exception as e:
-            return {"policy_loss": None, "value_loss": None, "entropy": None, "reason": f"validate_error: {type(e).__name__}: {e}"}
+            try:
+                import traceback as _tb
+                tb = _tb.format_exc()
+            except Exception:
+                tb = None
+            out = {"policy_loss": None, "value_loss": None, "entropy": None, "reason": f"validate_error: {type(e).__name__}: {e}"}
+            if tb:
+                out['traceback'] = tb
+            return out
 
     def reset_episode(self):
         """エピソード開始時にカウンタ類を初期化."""

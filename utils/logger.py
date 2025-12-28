@@ -2,6 +2,9 @@ import os, json, csv, time, atexit
 import threading
 import queue as _queue
 from typing import Dict, Any, Optional
+import glob
+import joblib
+import numpy as np
 
 class TrainingLogger:
     """Collects and writes training / episode / MCTS root statistics.
@@ -112,7 +115,9 @@ class TrainingLogger:
                         "update_step","policy_loss","value_loss","hand_pred_loss","entropy","train_count",
                         "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","hand_label_pos_rate","samples",
                         # 検証ロス: policy/value/hand
-                        "val_policy_loss","val_value_loss","val_hand_pred_loss","val_hand_recall"
+                        "val_policy_loss","val_value_loss","val_hand_pred_loss","val_hand_recall",
+                        # ValueTarget statistics (computed from latest selfplay joblib)
+                        "vt_count","vt_mean","vt_std","vt_min","vt_max","vt_clip_neg","vt_clip_pos"
                     ])
             # 既存行の有無を記録（初回1行は必ず出すための判定に利用）
             try:
@@ -265,7 +270,8 @@ class TrainingLogger:
                         writer.writerow([
                             "update_step","policy_loss","value_loss","hand_pred_loss","entropy","train_count",
                             "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","hand_label_pos_rate","samples",
-                            "val_policy_loss","val_value_loss","val_hand_pred_loss","val_hand_recall"
+                            "val_policy_loss","val_value_loss","val_hand_pred_loss","val_hand_recall",
+                            "vt_count","vt_mean","vt_std","vt_min","vt_max","vt_clip_neg","vt_clip_pos"
                         ])
             except Exception:
                 pass
@@ -334,6 +340,9 @@ class TrainingLogger:
                 # 新規列: hand_label_pos_rate が無ければ再生成
                 if ('hand_label_pos_rate' not in header_line):
                     needs_rebuild = True
+                # 新規列: vt_mean 等の ValueTarget 列が無ければ再生成
+                if ('vt_mean' not in header_line) or ('vt_count' not in header_line):
+                    needs_rebuild = True
                 if needs_rebuild:
                     # バックアップして新ヘッダで再生成
                     bak = self.train_csv + '.bak'
@@ -344,7 +353,8 @@ class TrainingLogger:
                             writer.writerow([
                                   "update_step","policy_loss","value_loss","hand_pred_loss","entropy","train_count",
                                 "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","hand_label_pos_rate","samples",
-                                "val_policy_loss","val_value_loss","val_hand_pred_loss","val_hand_recall"
+                                "val_policy_loss","val_value_loss","val_hand_pred_loss","val_hand_recall",
+                                "vt_count","vt_mean","vt_std","vt_min","vt_max","vt_clip_neg","vt_clip_pos"
                             ])
         except Exception:
             pass
@@ -387,6 +397,15 @@ class TrainingLogger:
                 metrics.get("samples"),
                 vpl, vvl, vhl, vhr,
             ]
+            # ValueTarget stats (computed from latest selfplay joblib)
+            try:
+                vt_stats = self._compute_value_target_stats()
+            except Exception:
+                vt_stats = {}
+            row.extend([
+                vt_stats.get('vt_count'), vt_stats.get('vt_mean'), vt_stats.get('vt_std'),
+                vt_stats.get('vt_min'), vt_stats.get('vt_max'), vt_stats.get('vt_clip_neg'), vt_stats.get('vt_clip_pos')
+            ])
             # 直接追記 (頻度1や小間隔で確実に行が出るようにする) + バッファは補助的に使用
             try:
                 with open(self.train_csv, "a", newline="", encoding="utf-8") as f:
@@ -483,6 +502,8 @@ class TrainingLogger:
                 vhl = metrics.get('hand_pred_loss')
                 vhr = metrics.get('hand_recall')
                 row = [self.update_step] + [None] * 13 + [vpl, vvl, vhl, vhr]
+                # append placeholder for vt columns
+                row.extend([None, None, None, None, None, None, None])
                 try:
                     with open(self.train_csv, 'a', newline='', encoding='utf-8') as f:
                         csv.writer(f).writerow(row)
@@ -670,7 +691,8 @@ class TrainingLogger:
                         writer.writerow([
                             "update_step","policy_loss","value_loss","hand_pred_loss","entropy","train_count",
                             "value_acc","value_brier","policy_kl","policy_top1_match","pos_rate","cum_pos_rate","hand_label_pos_rate","samples",
-                            "val_policy_loss","val_value_loss","val_hand_pred_loss","val_hand_recall"
+                            "val_policy_loss","val_value_loss","val_hand_pred_loss","val_hand_recall",
+                            "vt_count","vt_mean","vt_std","vt_min","vt_max","vt_clip_neg","vt_clip_pos"
                         ])
                 with open(self.train_csv, 'a', newline='', encoding='utf-8') as f:
                     m = self._last_train_metrics
@@ -698,13 +720,20 @@ class TrainingLogger:
                         vpl, vvl, vhl, vhr = vp, vv, vh, vhr
                     except Exception:
                         pass
+                    try:
+                        vt = self._compute_value_target_stats()
+                    except Exception:
+                        vt = {}
+                    vt_vals = [
+                        vt.get('vt_count'), vt.get('vt_mean'), vt.get('vt_std'), vt.get('vt_min'), vt.get('vt_max'), vt.get('vt_clip_neg'), vt.get('vt_clip_pos')
+                    ]
                     writer.writerow([
                         self.update_step,
                         m.get("policy_loss"), m.get("value_loss"), m.get("hand_pred_loss"), m.get("entropy"), m.get("train_count", self.update_step),
                         m.get("value_acc"), m.get("value_brier"), m.get("policy_kl"), m.get("policy_top1_match"),
                         m.get("pos_rate"), m.get("cum_pos_rate"), m.get("hand_label_pos_rate"), m.get("samples"),
                         vpl, vvl, vhl, vhr
-                    ])
+                    ] + vt_vals)
             if self._last_episode_metrics:
                 if self._buffer_enabled and self._episode_buf:
                     self._flush_episode(force=True)
@@ -750,6 +779,64 @@ class TrainingLogger:
         now = time.time()
         if (len(self._text_buf) >= self._text_buf_max_lines) or ((now - self._last_text_flush) >= self._text_buf_flush_interval):
             self._flush_text()
+
+    def _compute_value_target_stats(self):
+        """Latest selfplay joblib から value target の統計を計算して返す。
+
+        戻り値: dict keys = vt_count, vt_mean, vt_std, vt_min, vt_max, vt_clip_neg, vt_clip_pos
+        """
+        try:
+            # data ディレクトリはプロジェクトルート直下の data/
+            proj_root = os.path.abspath(os.path.join(self.log_dir, '..'))
+            data_dir = os.path.join(proj_root, 'data')
+            pattern = os.path.join(data_dir, 'selfplay_ep*.joblib')
+            files = glob.glob(pattern)
+            if not files:
+                return {}
+            latest = max(files, key=lambda p: os.path.getmtime(p))
+            obj = joblib.load(latest)
+            samples = []
+            if isinstance(obj, dict):
+                for k in ('samples', 'replay', 'data', 'episodes'):
+                    if k in obj and isinstance(obj[k], (list, tuple)):
+                        samples = list(obj[k]); break
+                if not samples and ('pi_q' in obj or 'value' in obj):
+                    samples = [obj]
+            elif isinstance(obj, (list, tuple)):
+                samples = list(obj)
+
+            vals = []
+            for s in samples:
+                try:
+                    if not isinstance(s, dict):
+                        continue
+                    v = s.get('value')
+                    if v is None:
+                        continue
+                    vals.append(float(v))
+                except Exception:
+                    continue
+            if len(vals) == 0:
+                return {}
+            a = np.asarray(vals, dtype=np.float64)
+            vt_count = int(a.size)
+            vt_mean = float(a.mean())
+            vt_std = float(a.std())
+            vt_min = float(a.min())
+            vt_max = float(a.max())
+            vt_clip_neg = int((a <= -0.9999).sum())
+            vt_clip_pos = int((a >= 0.9999).sum())
+            return {
+                'vt_count': vt_count,
+                'vt_mean': vt_mean,
+                'vt_std': vt_std,
+                'vt_min': vt_min,
+                'vt_max': vt_max,
+                'vt_clip_neg': vt_clip_neg,
+                'vt_clip_pos': vt_clip_pos,
+            }
+        except Exception:
+            return {}
 
 
     def _bg_flush_loop(self):  # pragma: no cover (タイマースレッド)

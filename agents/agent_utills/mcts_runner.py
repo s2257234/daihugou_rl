@@ -148,6 +148,9 @@ def run_mcts(agent: Any, env: Any, *, training: bool) -> Any:
         early_stop_post_min_batch=int(agent.config.get('mcts_early_stop_post_min_batch', 0) or 0),
         early_stop_debug=bool(agent.config.get('mcts_early_stop_debug', False)),
         early_stop_logger=getattr(agent, 'logger', None),
+        stage_terminal_debug=bool(agent.config.get('mcts_stage_terminal_debug', False)),
+        stage_terminal_log_sample_rate=float(agent.config.get('mcts_stage_terminal_log_sample_rate', 0.1)),
+        stage_terminal_logger=getattr(agent, 'logger', None),
     )
 
     _det_mode_now = (

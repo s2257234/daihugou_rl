@@ -14,6 +14,62 @@ import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
+def _is_player_finished_in_state(state: Any, player_id: int) -> bool:
+    """Best-effort check whether a player has already finished ("agari") in this state.
+
+    This repo commonly stores finished players in `rankings`.
+    We keep this defensive because dataset/state formats can vary.
+    """
+    try:
+        if not isinstance(state, dict):
+            return False
+        pid = int(player_id)
+
+        rankings = state.get('rankings', None)
+        if isinstance(rankings, (list, tuple, set)):
+            try:
+                return pid in {int(x) for x in rankings}
+            except Exception:
+                return pid in rankings
+
+        for key in ('finished_player_ids', 'finished_players', 'done_player_ids', 'done_players'):
+            finished = state.get(key, None)
+            if isinstance(finished, (list, tuple, set)):
+                try:
+                    return pid in {int(x) for x in finished}
+                except Exception:
+                    return pid in finished
+
+        ranks = state.get('player_ranks', None)
+        if isinstance(ranks, dict):
+            v = ranks.get(pid, None)
+            if v is None:
+                return False
+            try:
+                # Treat any non-negative/non-null rank as finished
+                return int(v) >= 0
+            except Exception:
+                return True
+        if isinstance(ranks, (list, tuple)) and pid < len(ranks):
+            v = ranks[pid]
+            if v is None:
+                return False
+            try:
+                return int(v) >= 0
+            except Exception:
+                return True
+
+        alive_mask = state.get('alive_mask', None)
+        if isinstance(alive_mask, (list, tuple)) and pid < len(alive_mask):
+            try:
+                return not bool(alive_mask[pid])
+            except Exception:
+                return False
+        return False
+    except Exception:
+        return False
+
+
 # ============================================================
 # Inference Engine Abstraction
 # ============================================================
@@ -104,13 +160,29 @@ class LocalInferenceClient(InferenceClient):
                     logits.extend([float('-inf')] * (n - len(logits)))
                 elif len(logits) > n:
                     logits = logits[:n]
+                # Defensive: sanitize logits (avoid NaN/inf poisoning softmax)
+                try:
+                    import math as _math
+                    for i, x in enumerate(logits):
+                        try:
+                            xf = float(x)
+                            if not _math.isfinite(xf):
+                                logits[i] = float('-inf')
+                        except Exception:
+                            logits[i] = float('-inf')
+                except Exception:
+                    pass
                 
                 # Softmax
                 import math
                 mx = max(logits) if logits else 0.0
-                exps = [math.exp(x - mx) for x in logits]
-                s = sum(exps)
-                probs = [e / s for e in exps] if s > 0 else [1.0 / n] * n
+                # if all are -inf, fallback uniform
+                if (not logits) or (mx == float('-inf')):
+                    probs = [1.0 / n] * n
+                else:
+                    exps = [math.exp(x - mx) for x in logits]
+                    s = sum(exps)
+                    probs = [e / s for e in exps] if s > 0 else [1.0 / n] * n
                 
                 # legal_actions は List[List[str]] だが、辞書のキーは hashable である必要があるため tuple に変換
                 policy_dict = {(tuple(legal_actions[i]) if isinstance(legal_actions[i], list) else legal_actions[i]): probs[i] for i in range(n)}
@@ -205,6 +277,11 @@ def _decode_value_u8(value_u8: Any) -> Optional[float]:
 
 
 def _extract_value(sample: Any) -> Optional[float]:
+    """Extract value label from sample as float.
+    
+    Value is stored as raw float in 'value' field. Returns None if not set.
+    For backwards compatibility, also checks legacy 'value_u8' field.
+    """
     getter = None
     try:
         if hasattr(sample, 'get'):
@@ -213,6 +290,7 @@ def _extract_value(sample: Any) -> Optional[float]:
         getter = None
     if getter is None:
         return None
+    # Primary: raw float value
     try:
         v = getter('value', None)
     except Exception:
@@ -222,6 +300,7 @@ def _extract_value(sample: Any) -> Optional[float]:
             return float(v)
         except Exception:
             return None
+    # Backwards compatibility: decode legacy value_u8
     try:
         vu = getter('value_u8', None)
     except Exception:
@@ -255,6 +334,11 @@ def _iter_value_head_params(model: Any):
 
 
 def _has_value_label(sample: Any) -> bool:
+    """Check if sample has a valid value label.
+    
+    Returns True if 'value' field is present and not None.
+    For backwards compatibility, also accepts legacy 'value_u8' field.
+    """
     getter = None
     try:
         if isinstance(sample, dict) or hasattr(sample, 'get'):
@@ -263,11 +347,14 @@ def _has_value_label(sample: Any) -> bool:
         getter = None
     if getter is None:
         return False
+    # Primary: raw float value
     try:
-        if getter('value', None) is not None:
+        v = getter('value', None)
+        if v is not None:
             return True
     except Exception:
         pass
+    # Backwards compatibility: check legacy value_u8
     try:
         vu = getter('value_u8', None)
     except Exception:
@@ -485,6 +572,18 @@ class TrainStepMixin:
                 pi_arr = _np.asarray(list(raw_pi), dtype=_np.float32)
             if pi_arr.size == 0:
                 continue
+            # Defensive: ensure pi is a valid distribution (non-negative, finite, sums to 1)
+            try:
+                pi_arr = _np.asarray(pi_arr, dtype=_np.float32)
+                pi_arr[~_np.isfinite(pi_arr)] = 0.0
+                pi_arr = _np.maximum(pi_arr, 0.0)
+                s_pi = float(pi_arr.sum())
+                if s_pi > 0.0:
+                    pi_arr = pi_arr / s_pi
+                else:
+                    pi_arr = _np.ones_like(pi_arr, dtype=_np.float32) / float(pi_arr.size)
+            except Exception:
+                pass
             # canonicalize state so stored viewpoint becomes self=0 (best-effort)
             try:
                 st_raw = sample.get('state') or {}
@@ -992,10 +1091,25 @@ class TrainStepMixin:
                     mask = (arange < lengths_t.unsqueeze(1)).float()
                     LARGE_NEG = -1e9
                     masked_logits = logits_slice * mask + (1 - mask) * LARGE_NEG
+                    # Explicitly mask+renormalize policy targets so illegal/padded positions are 0
+                    # and each row sums to 1.0 (fallback: uniform over legal positions).
+                    try:
+                        pi_masked = pi_pad_t * mask
+                        row_sum = pi_masked.sum(dim=1, keepdim=True)
+                        mask_sum = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+                        uniform = mask / mask_sum
+                        pi_pad_t = torch.where(row_sum > 0.0, pi_masked / row_sum.clamp(min=1e-12), uniform)
+                    except Exception:
+                        # keep original targets if anything goes wrong
+                        pass
                     log_probs = torch.log_softmax(masked_logits, dim=1)
                     probs = torch.exp(log_probs) * mask  # パディング部ほぼ0
-                    # policy loss (各行で sum)
-                    policy_loss_all = - (pi_pad_t * log_probs).sum(dim=1)
+                    # Extract sample_weight from batch for weighting losses
+                    sample_weights_list = [float(s.get('sample_weight', 1.0)) for s in batch]
+                    sample_weights_t = torch.tensor(sample_weights_list, dtype=torch.float32, device=device).view(-1)
+                    # policy loss (各行で sum), weighted by sample_weight
+                    policy_loss_raw_all = - (pi_pad_t * log_probs).sum(dim=1)
+                    policy_loss_all = policy_loss_raw_all * sample_weights_t
                     # value ロジット選択: 各サンプルに埋め込まれた視点(self_player_id)に対応する列を選ぶ
                     # NOTE: ここは「学習グラフに含める必要がある」ため no_grad / detach を絶対に使わない。
                     # (保存時の player_id と学習エージェントの player_id が異なるバッチを許容するため)
@@ -1022,10 +1136,22 @@ class TrainStepMixin:
                                 pids_norm = pids_t.clamp(min=0, max=num_cols - 1)
                                 v_logits = value_logits_batch.gather(1, pids_norm.unsqueeze(1)).squeeze(1)
                         elif hasattr(value_logits_batch, 'dim') and value_logits_batch.dim() == 1:
-                            # rare: model returned (num_players,) for whole batch
-                            sel = int(pids_list[0]) if pids_list else int(getattr(self, 'player_id', 0))
-                            sel = max(0, min(sel, int(value_logits_batch.numel()) - 1))
-                            v_logits = value_logits_batch[sel].unsqueeze(0)
+                            # Two possibilities for 1D:
+                            # - model returned per-sample scalar logits as a 1D tensor of length B
+                            # - model returned a per-player vector (num_players,) for the whole batch
+                            try:
+                                if int(value_logits_batch.numel()) == int(pids_t.numel()):
+                                    # per-sample logits
+                                    v_logits = value_logits_batch.view(-1)
+                                else:
+                                    # treat as per-player vector: select by pid
+                                    sel = int(pids_list[0]) if pids_list else int(getattr(self, 'player_id', 0))
+                                    sel = max(0, min(sel, int(value_logits_batch.numel()) - 1))
+                                    v_logits = value_logits_batch[sel].unsqueeze(0)
+                            except Exception:
+                                sel = int(pids_list[0]) if pids_list else int(getattr(self, 'player_id', 0))
+                                sel = max(0, min(sel, int(value_logits_batch.numel()) - 1))
+                                v_logits = value_logits_batch[sel].unsqueeze(0)
                         else:
                             # fallback
                             v_logits = value_logits_batch[:, 0]
@@ -1047,6 +1173,23 @@ class TrainStepMixin:
                         except Exception:
                             import torch as _t
                             v_logits = _t.zeros(1)
+
+                    # "あがり"(finished) 後のプレイヤーは value loss から除外する。
+                    # 選択した視点 player_id が既に rankings 等に含まれている場合、そのサンプルの value 誤差を 0 にする。
+                    try:
+                        value_active_list = []
+                        for st_i, pid_i in zip(states, pids_list if 'pids_list' in locals() else []):
+                            try:
+                                value_active_list.append(0.0 if _is_player_finished_in_state(st_i, int(pid_i)) else 1.0)
+                            except Exception:
+                                value_active_list.append(1.0)
+                        if len(value_active_list) != B:
+                            # Fallback: assume all active
+                            value_active_t = torch.ones((B,), dtype=torch.float32, device=device)
+                        else:
+                            value_active_t = torch.tensor(value_active_list, dtype=torch.float32, device=device).view(-1)
+                    except Exception:
+                        value_active_t = torch.ones((B,), dtype=torch.float32, device=device)
                     # Optionally boost terminal samples via config 'terminal_sample_boost'
                     try:
                         term_boost = float(self.config.get('terminal_sample_boost', 3.0) or 3.0)
@@ -1085,6 +1228,11 @@ class TrainStepMixin:
                             is_weights_t = torch.tensor(list(map(float, is_weights_list)), dtype=torch.float32, device=device).view(-1)
 
                     v_targets_t = torch.tensor(v_targets_list, dtype=torch.float32, device=device).view(-1)
+                    # ラベルスムージング: 過学習防止のため、0/1のハードラベルを少し中央に寄せる
+                    # smoothed_target = target * (1 - smoothing) + smoothing / 2
+                    # 0.0 → 0.025, 1.0 → 0.975
+                    value_label_smoothing = 0.05
+                    v_targets_t = v_targets_t * (1.0 - value_label_smoothing) + value_label_smoothing / 2.0
                     # Debug: print value logits/targets distribution when requested
                     try:
                         if bool(self.config.get('debug_log_value_stats', False)):
@@ -1114,7 +1262,7 @@ class TrainStepMixin:
                         pass
                     # Extra debug: show predicted probability stats and near-0.5 rate
                     try:
-                        if bool(self.config.get('debug_value_flow', True)):
+                        if bool(self.config.get('debug_value_flow', False)):
                             import numpy as _np
                             import torch as _t
                             with _t.no_grad():
@@ -1139,7 +1287,7 @@ class TrainStepMixin:
 
                     # Extra debug 2: verify value-head selection (multi-player) and weight norms
                     try:
-                        if bool(self.config.get('debug_value_flow', True)):
+                        if bool(self.config.get('debug_value_flow', False)):
                             # 1) selection sanity: what sample_pid indices are used?
                             try:
                                 from collections import Counter as _Counter
@@ -1187,10 +1335,17 @@ class TrainStepMixin:
                                 msgs = []
                                 for i_st, st in enumerate(states):
                                     try:
-                                        is_term = False
-                                        # state from dataset may include is_terminal/hand_size
-                                        if isinstance(st, dict):
-                                            is_term = bool(st.get('is_terminal', False)) or (int(st.get('hand_size', -1)) == 0)
+                                        # Only treat explicit is_terminal as terminal.
+                                        # hand_size==0 can also occur for already-finished players in later turns,
+                                        # and those samples may be masked out from the value loss.
+                                        is_term = bool(st.get('is_terminal', False)) if isinstance(st, dict) else False
+                                        # Respect the same active-mask used for value loss if present.
+                                        try:
+                                            if 'value_active_t' in locals() and value_active_t is not None:
+                                                if float(value_active_t[i_st].detach().cpu().item()) <= 0.0:
+                                                    continue
+                                        except Exception:
+                                            pass
                                         if is_term:
                                             p = float(v_probs[i_st].cpu().item()) if hasattr(v_probs[i_st], 'cpu') else float(v_probs[i_st].item())
                                             vt = float(v_targets_t[i_st].cpu().item()) if hasattr(v_targets_t[i_st],'cpu') else float(v_targets_t[i_st])
@@ -1220,7 +1375,8 @@ class TrainStepMixin:
                         if pw != 1.0:
                             pos_w_tensor = torch.tensor([pw], dtype=torch.float32, device=device)
                         self.bce_logits_loss_fn = _nn.BCEWithLogitsLoss(pos_weight=pos_w_tensor) if pos_w_tensor is not None else _nn.BCEWithLogitsLoss()
-                    # Compute per-sample BCE (no reduction) then apply IS weights conservatively to value loss only
+                    # Compute per-sample BCE (no reduction) then take an equal-weight mean.
+                    # NOTE: Per-sample weighting by sample type (e.g., forced-pass) is applied to policy only.
                     try:
                         import torch.nn as _nn
                         # create a reduction='none' BCE with same pos_weight behavior
@@ -1234,11 +1390,24 @@ class TrainStepMixin:
                             pos_w_tensor = torch.tensor([pos_w], dtype=torch.float32, device=device)
                         bce_none = _nn.BCEWithLogitsLoss(pos_weight=pos_w_tensor, reduction='none') if pos_w_tensor is not None else _nn.BCEWithLogitsLoss(reduction='none')
                         value_loss_per = bce_none(v_logits.unsqueeze(1), v_targets_t.unsqueeze(1)).squeeze(1)
-                        # apply importance weights and average
-                        value_loss_all = (value_loss_per * is_weights_t).mean()
+                        # Mask out finished players ("agari") so their prediction error is 0.
+                        try:
+                            if 'value_active_t' in locals() and value_active_t is not None:
+                                value_loss_per = value_loss_per * value_active_t
+                        except Exception:
+                            pass
+                        value_loss_all = value_loss_per.mean()
                     except Exception:
                         # fallback to previous mean if anything goes wrong
-                        value_loss_all = self.bce_logits_loss_fn(v_logits.unsqueeze(1), v_targets_t.unsqueeze(1))
+                        try:
+                            import torch.nn as _nn
+                            bce_none = _nn.BCEWithLogitsLoss(reduction='none')
+                            value_loss_per = bce_none(v_logits.unsqueeze(1), v_targets_t.unsqueeze(1)).squeeze(1)
+                            if 'value_active_t' in locals() and value_active_t is not None:
+                                value_loss_per = value_loss_per * value_active_t
+                            value_loss_all = value_loss_per.mean()
+                        except Exception:
+                            value_loss_all = self.bce_logits_loss_fn(v_logits.unsqueeze(1), v_targets_t.unsqueeze(1))
                     # Entropy
                     entropy_all = - (probs * log_probs).sum(dim=1)
                     # 集約
@@ -1451,27 +1620,46 @@ class TrainStepMixin:
                 except Exception:
                     _model_dev = 'cpu'
 
+                LARGE_NEG = -1e9
                 if hasattr(logits_raw, 'shape'):
                     logits_t = logits_raw
                     if logits_t.shape[0] < n:
-                        pad = torch.zeros(n - logits_t.shape[0], device=logits_t.device)
+                        pad = torch.full((n - logits_t.shape[0],), float(LARGE_NEG), device=logits_t.device)
                         logits_t = torch.cat([logits_t, pad], dim=0)
                     else:
                         logits_t = logits_t[:n]
                 else:
                     logits_list = list(logits_raw)
                     if len(logits_list) < n:
-                        logits_list += [0.0] * (n - len(logits_list))
+                        logits_list += [float(LARGE_NEG)] * (n - len(logits_list))
                     logits_t = torch.tensor(logits_list[:n], dtype=torch.float32, device=_model_dev)
                 log_probs = logits_t.log_softmax(dim=0)
                 probs = log_probs.exp()
-                pi_t = torch.tensor(pi_target, dtype=torch.float32, device=log_probs.device)
+                # Explicitly normalize π target (defensive against truncation/mismatch)
+                try:
+                    pi_t = torch.tensor(pi_target, dtype=torch.float32, device=log_probs.device)
+                    pi_t = torch.where(torch.isfinite(pi_t), pi_t, torch.zeros_like(pi_t))
+                    pi_t = torch.clamp(pi_t, min=0.0)
+                    s_pi = float(pi_t.sum().detach().cpu().item()) if pi_t.numel() > 0 else 0.0
+                    if s_pi > 0.0:
+                        pi_t = pi_t / float(s_pi)
+                    else:
+                        if pi_t.numel() > 0:
+                            pi_t = torch.ones_like(pi_t) / float(pi_t.numel())
+                except Exception:
+                    pi_t = torch.tensor(pi_target, dtype=torch.float32, device=log_probs.device)
                 if pi_t.shape[0] != log_probs.shape[0]:
                     m = min(pi_t.shape[0], log_probs.shape[0])
                     pi_t = pi_t[:m]
                     log_probs = log_probs[:m]
                     probs = probs[:m]
-                policy_loss = -(pi_t * log_probs).sum()
+                # Extract sample_weight
+                try:
+                    sw = float(sample.get('sample_weight', 1.0))
+                except Exception:
+                    sw = 1.0
+                policy_loss_raw = -(pi_t * log_probs).sum()
+                policy_loss = policy_loss_raw * sw
                 if isinstance(v_pred_raw, float):
                     # ensure scalar logits are created on same device as model
                     try:
@@ -1481,6 +1669,9 @@ class TrainStepMixin:
                 else:
                     v_logit = v_pred_raw.float()
                 v_t = torch.tensor(float(v_target), dtype=torch.float32, device=v_logit.device)
+                # ラベルスムージング: 過学習防止 (0.0 → 0.025, 1.0 → 0.975)
+                value_label_smoothing = 0.05
+                v_t = v_t * (1.0 - value_label_smoothing) + value_label_smoothing / 2.0
                 if 'bce_logits_loss_fn' not in self.__dict__:
                     import torch.nn as _nn
                     try:
@@ -1492,28 +1683,20 @@ class TrainStepMixin:
                         import torch as _t
                         pos_w_tensor = _t.tensor([pw], dtype=_t.float32, device=v_logit.device)
                     self.bce_logits_loss_fn = _nn.BCEWithLogitsLoss(pos_weight=pos_w_tensor) if pos_w_tensor is not None else _nn.BCEWithLogitsLoss()
-                # apply importance-sampling weight (if prioritized sampling was used)
+                value_loss_raw = self.bce_logits_loss_fn(v_logit.unsqueeze(0), v_t.unsqueeze(0))
+                # "あがり"(finished) 後のプレイヤーは value loss から除外する
                 try:
-                    uid = sample.get('uid')
-                    iw = float(uid2weight.get(int(uid), 1.0)) if uid2weight is not None else 1.0
+                    st = sample.get('state') or {}
+                    pid = None
+                    if isinstance(st, dict) and ('self_player_id' in st):
+                        pid = int(st.get('self_player_id'))
+                    else:
+                        pid = int(getattr(self, 'player_id', 0))
+                    value_active = 0.0 if _is_player_finished_in_state(st, pid) else 1.0
                 except Exception:
-                    iw = 1.0
-                # Per-sample terminal boost (fallback for non-vectorized path)
-                try:
-                    term_boost = float(self.config.get('terminal_sample_boost', 1.0) or 1.0)
-                except Exception:
-                    term_boost = 1.0
-                if term_boost != 1.0:
-                    try:
-                        st = sample.get('state') or {}
-                        is_term = False
-                        if isinstance(st, dict):
-                            is_term = bool(st.get('is_terminal', False)) or (int(st.get('hand_size', -1)) == 0)
-                        if is_term:
-                            iw = float(iw) * float(term_boost)
-                    except Exception:
-                        pass
-                value_loss = self.bce_logits_loss_fn(v_logit.unsqueeze(0), v_t.unsqueeze(0)) * float(iw)
+                    value_active = 1.0
+                # Value loss is always equal-weighted across samples (no sample-type weighting).
+                value_loss = value_loss_raw * float(value_active)
                 v_prob = torch.sigmoid(v_logit)
                 entropy = -(probs * log_probs).sum()
                 policy_losses.append(policy_loss)
@@ -1635,6 +1818,35 @@ class TrainStepMixin:
 
         if valid == 0:
             return {"loss": None, "reason": "no_valid_samples"}
+
+        # --- Compute pass-only ratios ---
+        pass_only_count = 0
+        pass_only_weighted_sum = 0.0
+        total_weight_sum = 0.0
+        played_count = 0
+        debug_pass_only = bool(self.config.get('debug_pass_only_detection', False))
+        try:
+            for i, s in enumerate(batch):
+                sw = float(s.get('sample_weight', 1.0))
+                total_weight_sum += sw
+                leg = s.get('legal_actions')
+                if leg is not None and isinstance(leg, (list, tuple)):
+                    # Pass-only means all actions are None (cannot play any card)
+                    is_pass_only = all(a is None for a in leg)
+                    if is_pass_only:
+                        pass_only_count += 1
+                        pass_only_weighted_sum += sw
+                    else:
+                        played_count += 1
+                    # Debug: log first few samples
+                    if debug_pass_only and i < 3:
+                        print(f"[DEBUG_PASS_ONLY] sample {i}: legal_actions={leg[:3] if len(leg) > 3 else leg}... is_pass_only={is_pass_only} sw={sw}")
+        except Exception as e:
+            if debug_pass_only:
+                print(f"[DEBUG_PASS_ONLY] exception: {e}")
+        pass_only_ratio_raw = (pass_only_count / float(len(batch))) if len(batch) > 0 else 0.0
+        pass_only_ratio_weighted = (pass_only_weighted_sum / total_weight_sum) if total_weight_sum > 0 else 0.0
+        played_ratio_raw = (played_count / float(len(batch))) if len(batch) > 0 else 0.0
 
         policy_loss_mean = torch.stack(policy_losses).mean()
         value_loss_mean = torch.stack(value_losses).mean()
@@ -1851,7 +2063,7 @@ class TrainStepMixin:
                 did_update = False
 
         # Debug: after backward, report value_head grad norm if enabled
-        if bool(self.config.get('debug_value_flow', True)):
+        if bool(self.config.get('debug_value_flow', False)):
             _msg = f"[DEBUG_VALUE_GRAD] value_head_grad_norm={value_head_grad_norm} total_grad_norm={grad_norm} did_update={did_update}"
             try:
                 print(_msg)
@@ -1863,34 +2075,16 @@ class TrainStepMixin:
             except Exception:
                 pass
         # Scheduler step (warmup+cosine) — optimizer 実ステップがあった時のみ実行
+        # did_update=True の時点で optimizer.step() は実行済みなので、
+        # 追加のチェックなしで scheduler.step() を呼ぶ
         try:
             if did_update:
                 if self._scheduler is None:
                     self.ensure_scheduler()
                 if self._scheduler is not None:
-                    # 一部の実装では optimizer._step_count に基づき順序チェックが行われ、
-                    # さらに PyTorch は optimizer.step() より前の scheduler.step() を警告する。
-                    # そのため、確実に optimizer の内部ステップが進んだと判定できる場合のみ scheduler を進める。
-                    step_cnt = getattr(self._optimizer, "_step_count", None)
-                    has_stepped = False
-                    try:
-                        if isinstance(step_cnt, int):
-                            has_stepped = step_cnt > 0
-                        else:
-                            # Fallback: 任意の param state から 'step' を参照 (Adam系は per-param で保持)
-                            opt_state = getattr(self._optimizer, "state", {})
-                            if isinstance(opt_state, dict) and opt_state:
-                                for st in opt_state.values():
-                                    s = st.get("step") if isinstance(st, dict) else None
-                                    if isinstance(s, int) and s > 0:
-                                        has_stepped = True
-                                        break
-                    except Exception:
-                        has_stepped = True  # 最悪でも進める
-                    if has_stepped:
-                        # 自前カウンタも同期してから scheduler を進める
-                        self._update_step += 1
-                        self._scheduler.step()
+                    # 自前カウンタも同期してから scheduler を進める
+                    self._update_step += 1
+                    self._scheduler.step()
         except Exception:
             pass
 
@@ -1971,7 +2165,7 @@ class TrainStepMixin:
         # Debug: stable per-step delta using optimizer's value_head param group
         # (works even if model.named_parameters() can't see value_head early)
         try:
-            debug_delta_step = bool(self.config.get('debug_value_flow', True)) and bool(
+            debug_delta_step = bool(self.config.get('debug_value_flow', False)) and bool(
                 self.config.get('debug_value_delta_in_step', True)
             )
         except Exception:
@@ -2043,7 +2237,7 @@ class TrainStepMixin:
         policy_top1 = None
 
         # Debug (end of step): report grad norms once computed
-        if bool(self.config.get('debug_value_flow', True)):
+        if bool(self.config.get('debug_value_flow', False)):
             _msg2 = f"[DEBUG_VALUE_GRAD_END] value_head_grad_norm={value_head_grad_norm} total_grad_norm={grad_norm} did_update={did_update}"
             try:
                 print(_msg2)
@@ -2087,6 +2281,11 @@ class TrainStepMixin:
             "pos_rate": pos_rate,
             "cum_pos_rate": (self.total_positive / self.total_value_samples) if self.total_value_samples > 0 else None,
             "tt_hit_rate": (self.tt_hits / max(1, (self.tt_hits + self.tt_misses))) if (self.tt_hits + self.tt_misses) > 0 else None,
+            "pass_only_ratio_raw": pass_only_ratio_raw,
+            "pass_only_ratio_weighted": pass_only_ratio_weighted,
+            "pass_only_count": pass_only_count,
+            "played_ratio_raw": played_ratio_raw,
+            "played_count": played_count,
         }
         # attach gradient/weight norms if available
         try:
@@ -2269,6 +2468,9 @@ class TrainStepMixin:
                             f"pos={metrics.get('pos_rate'):.3f}" if metrics.get('pos_rate') is not None else None,
                             f"hand_pos={metrics.get('hand_label_pos_rate'):.3f}" if metrics.get('hand_label_pos_rate') is not None else None,
                             f"cum_pos={metrics.get('cum_pos_rate'):.3f}" if metrics.get('cum_pos_rate') is not None else None,
+                            f"pass_only_raw={metrics.get('pass_only_ratio_raw'):.3f}" if metrics.get('pass_only_ratio_raw') is not None else None,
+                            f"pass_only_wt={metrics.get('pass_only_ratio_weighted'):.3f}" if metrics.get('pass_only_ratio_weighted') is not None else None,
+                            f"played_raw={metrics.get('played_ratio_raw'):.3f}" if metrics.get('played_ratio_raw') is not None else None,
                             f"samples={metrics.get('samples')}" if metrics.get('samples') is not None else None,
                         ]
                         line = " ".join(p for p in parts if p is not None)

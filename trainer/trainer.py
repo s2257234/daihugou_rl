@@ -67,11 +67,15 @@ def _selfplay_worker_entry(worker_id: int, num_episodes: int, cfg: Dict[str, Any
             if isinstance(ag, AlphaZeroAgent):
                 ag.flush_unfinished_phase()
                 ag.finalize_game()
-        learner = agents[learning_player_id]
-        if isinstance(learner, AlphaZeroAgent):
-            labeled = learner.pop_labeled_samples()
-            if not zero_buf:
-                local_samples.extend(labeled)
+        # Collect labeled samples from all AlphaZeroAgent instances (remove filter by learning_player)
+        for ag in agents:
+            if isinstance(ag, AlphaZeroAgent):
+                try:
+                    labeled = ag.pop_labeled_samples()
+                except Exception:
+                    labeled = []
+                if not zero_buf and labeled:
+                    local_samples.extend(labeled)
     return {"samples": local_samples, "episodes": num_episodes}
 
 
@@ -259,6 +263,11 @@ class Trainer:
         if self._loaded_from_checkpoint:
             # logger 初期化後なのでログも残す
             print(f"[resume] loaded model from {latest_path}")
+            try:
+                if self.logger:
+                    self.logger.log_text(f"[resume] loaded model from {latest_path}")
+            except Exception:
+                pass
         # フルモード時: 旧フォーマットサンプル浄化 (初期残存している可能性に備える)
         if self.config.get('use_full_features'):
             for ag in self.agents:
@@ -323,6 +332,35 @@ class Trainer:
                             self.logger.log_text(f"[resume] scheduler load {'ok' if ok else 'failed'} from {sch_path}")
                 except Exception as e:
                     print(f"[WARN] scheduler load failed: {e}")
+        except Exception:
+            pass
+        # 既存の train_updates.csv から update_step を復元して単調増加を保証
+        try:
+            log_dir = self.config.get("log_dir", "logs")
+            csv_path = os.path.join(log_dir, "train_updates.csv")
+            last_step = 0
+            if os.path.isfile(csv_path):
+                with open(csv_path, 'r', encoding='utf-8') as rf:
+                    lines = rf.readlines()
+                # 末尾から走査し、ヘッダ以外の最終行の update_step を取得
+                for line in reversed(lines):
+                    s = line.strip()
+                    if not s or s.startswith('update_step'):
+                        continue
+                    first = s.split(',')[0].strip()
+                    try:
+                        last_step = int(first)
+                        break
+                    except Exception:
+                        continue
+            # logger の内部カウンタへ反映（以降の log_train で +1 されて継続）
+            if hasattr(self, 'logger') and self.logger is not None:
+                try:
+                    self.logger.update_step = int(last_step)
+                    # 参考ログ
+                    self.logger.log_text(f"[resume] logger.update_step restored to {last_step}")
+                except Exception:
+                    pass
         except Exception:
             pass
         # オプション: 今回の再開に限り Warmup をやり直す（ワンショット）
@@ -682,6 +720,15 @@ class Trainer:
             except Exception as _e:
                 print(f"[WARN] eval-gate baseline load failed: {_e}")
                 baseline_model = None
+        # 事前検証: 最初の学習行から val_* を必ず埋めるため、設定に関わらず一度実施
+        if self.logger:
+            try:
+                vinfo0 = self.agents[0].validate_step(batch_size=self.config.get("val_batch_size") or self.config.get("batch_size", 256))
+            except Exception:
+                vinfo0 = {"policy_loss": None, "value_loss": None, "entropy": None}
+            if isinstance(vinfo0, dict) and (vinfo0.get("policy_loss") is not None or vinfo0.get("value_loss") is not None):
+                self.logger.log_validation(vinfo0)
+
         for i in range(num_updates):
             loss_info = self.agents[0].train_step(batch_size=self.config.get("batch_size", 256))
             # ログ用にエポック情報を付与（存在する辞書に無害に追加）
@@ -710,29 +757,28 @@ class Trainer:
                 except Exception:
                     pass
                 print(_msg)
+            # 検証: 指定間隔で検証バッチの損失を測定しログへ（同一行に反映させるため、train行の直前に実施）
+            try:
+                # 既定は設定値（agents.config）に従う。0 明示設定で無効化可。
+                val_every = int(self.config.get("val_eval_every_updates", 200))
+            except Exception:
+                val_every = 200
+            if self.logger and val_every > 0 and ((i + 1) % val_every == 0):
+                try:
+                    vinfo = self.agents[0].validate_step(batch_size=self.config.get("val_batch_size") or self.config.get("batch_size", 256))
+                except Exception:
+                    vinfo = {"policy_loss": None, "value_loss": None, "entropy": None}
+                if isinstance(vinfo, dict) and (vinfo.get("policy_loss") is not None or vinfo.get("value_loss") is not None):
+                    self.logger.log_validation(vinfo)
+
             # ロガーへ (train_step 内で既に push されている場合は二重記録を避ける)
             if self.logger and loss_info.get("loss") is not None and not getattr(self.agents[0], '_logged_inside', False):
-                # 新列: 非並行モードではローカルカウンタで代用（logger 側で update_step をフォールバックに使用）
                 try:
                     payload = dict(loss_info)
                     payload["train_count"] = i + 1
                 except Exception:
                     payload = loss_info
                 self.logger.log_train(payload)
-
-            # 検証: 指定間隔で検証バッチの損失を測定しログへ
-            try:
-                val_every = int(self.config.get("val_eval_every_updates", 0) or 0)
-            except Exception:
-                val_every = 0
-            if self.logger and val_every > 0 and ((i + 1) % val_every == 0):
-                try:
-                    vinfo = self.agents[0].validate_step(batch_size=self.config.get("val_batch_size") or self.config.get("batch_size", 256))
-                except Exception:
-                    vinfo = {"policy_loss": None, "value_loss": None, "entropy": None}
-                # 可能ならロギング
-                if isinstance(vinfo, dict) and (vinfo.get("policy_loss") is not None or vinfo.get("value_loss") is not None):
-                    self.logger.log_validation(vinfo)
             # 追加: 各学習更新後に最新のゲート結果を毎回ログ（非並行モード用）
             try:
                 thr_val = float(self.config.get("eval_gate_threshold", self._last_gate_threshold)) if hasattr(self, "_last_gate_threshold") else 0.6
@@ -1052,6 +1098,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cfg = dict(ALPHA_ZERO_CONFIG)
+    # Allow overriding checkpoint path via environment for quick experiments.
+    # If ALPHA_ZERO_CHECKPOINT_PATH is set to empty string, trainer will build a fresh model.
+    try:
+        env_ckpt = os.environ.get('ALPHA_ZERO_CHECKPOINT_PATH', None)
+        if env_ckpt is not None:
+            cfg['checkpoint_path'] = env_ckpt
+    except Exception:
+        pass
     if args.num_sim is not None:
         cfg["num_simulations"] = args.num_sim
     if args.batch_size is not None:

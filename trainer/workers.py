@@ -9,15 +9,21 @@ from agents.factory import create_env_and_agents
 from agents.drl_agent import AlphaZeroAgent
 
 
-VALUE_U8_NONE = 0xFF
+VALUE_U8_NONE = 0xFF  # Legacy constant for backwards compatibility
 
 
 def _has_value_label(sample: Dict[str, Any]) -> bool:
-    """Returns True when the sample includes either float or quantized value."""
+    """Returns True when the sample includes a valid value label.
+    
+    Primary check is for raw float 'value' field.
+    For backwards compatibility, also accepts legacy 'value_u8' field.
+    """
     if not isinstance(sample, dict):
         return False
+    # Primary: raw float value
     if sample.get('value') is not None:
         return True
+    # Backwards compatibility: check legacy value_u8
     value_u8 = sample.get('value_u8')
     return isinstance(value_u8, int) and 0 <= value_u8 < VALUE_U8_NONE
 

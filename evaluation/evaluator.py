@@ -44,6 +44,8 @@ _EV_PAST_MODELS: List[Any] | None = None
 _EV_PAST_CKPTS: List[str] | None = None
 _EV_BASELINE_MIX: List[str] | None = None
 _EV_SEAT_ROTATION: bool = True
+_EV_VALUE_THRESHOLD: float = 0.5
+_EV_WRITE_ZERO_ON_MISSING: bool = False
 
 def _parallel_eval_init(checkpoint_path: str,
                         device: str,
@@ -51,7 +53,9 @@ def _parallel_eval_init(checkpoint_path: str,
                         baseline_mix: List[str],
                         det_mode_eval: str | None,
                         past_checkpoints: List[str] | None,
-                        seed: int | None):
+                        seed: int | None,
+                        value_threshold: float = 0.5,
+                        write_zero_on_missing: bool = False):
     # グローバルを書き換え
     global _EV_CFG, _EV_DEVICE, _EV_CKPT, _EV_MODEL, _EV_PAST_MODELS, _EV_PAST_CKPTS, _EV_BASELINE_MIX, _EV_SEAT_ROTATION
     import random as _rnd
@@ -74,6 +78,8 @@ def _parallel_eval_init(checkpoint_path: str,
     _EV_BASELINE_MIX = list(baseline_mix or ["rule", "random", "random"])
     _EV_PAST_CKPTS = list(past_checkpoints or [])
     _EV_SEAT_ROTATION = True  # 座席回転の有無は呼び出し側でエピソード順に渡すため常に有効扱い
+    _EV_VALUE_THRESHOLD = float(value_threshold)
+    _EV_WRITE_ZERO_ON_MISSING = bool(write_zero_on_missing)
     # モデル読み込み
     from agents.models import PolicyValueNet as _PVN
     try:
@@ -171,12 +177,34 @@ def _parallel_eval_one(ep_index: int) -> Dict[str, Any]:
     env.reset()
     step_limit = 1000
     steps = 0
+    eval_preds: List[float] = []
     while not getattr(env.game, 'done', False):
         if steps >= step_limit:
             break
         current_player_id = env.game.turn
         agent = env.agents[current_player_id]
         if isinstance(agent, _AZ):
+            # collect value prediction for the evaluated model instance
+            try:
+                # only collect preds from the main evaluated agent object (ag_eval)
+                if agent is ag_eval:
+                    _, v = agent._policy_value(env)
+                    if isinstance(v, dict):
+                        v_prob = float(v.get(getattr(agent, 'player_id', 0), 0.0))
+                    elif isinstance(v, (list, tuple)):
+                        pid = int(getattr(agent, 'player_id', 0) or 0)
+                        try:
+                            v_prob = float(v[pid])
+                        except Exception:
+                            v_prob = float(v[0]) if v else 0.0
+                    else:
+                        v_prob = float(v)
+                    eval_preds.append(v_prob if v_prob is not None else 0.0)
+            except Exception:
+                try:
+                    eval_preds.append(0.5)
+                except Exception:
+                    pass
             action = agent.select_action(env, training=False)
         else:
             current_player = env.game.players[current_player_id]
@@ -194,8 +222,25 @@ def _parallel_eval_one(ep_index: int) -> Dict[str, Any]:
     if len(rankings) != 4:
         remaining = [i for i in range(4) if i not in rankings]
         rankings += remaining
+    # compute recall for evaluated model (ag_eval)
+    recall = None
+    try:
+        try:
+            eval_seat = agents.index(ag_eval)
+        except Exception:
+            eval_seat = 0
+        won = (len(rankings) > 0 and rankings[0] == eval_seat)
+        if won:
+            tp = sum(1 for p in eval_preds if p > 0.5)
+            fn = sum(1 for p in eval_preds if p <= 0.5)
+            denom = tp + fn
+            recall = (tp / denom) if denom > 0 else None
+        else:
+            recall = None
+    except Exception:
+        recall = None
     # ラベル順（席番号順）を返し、親で Elo を更新できるようにする
-    return {"ep": ep_index, "rankings": rankings, "labels": labels, "steps": steps}
+    return {"ep": ep_index, "rankings": rankings, "labels": labels, "steps": steps, "recall": recall}
 
 
 class Evaluator:
@@ -213,6 +258,10 @@ class Evaluator:
         # 評価安定化のため既定で fixed_once を適用（推論/実運用は config 側デフォルトの "stochastic" を維持）
         determinization_mode_override: str | None = "fixed_once",
         past_checkpoints: List[str] | None = None,
+        # 閾値: value 予測を陽性と見なすカットオフ
+        value_threshold: float = 0.5,
+        # 指標が計算できないときに 0.0 を出力するか (False -> 空欄)
+        write_zero_on_missing_metrics: bool = False,
     ):
         if seed is not None:
             random.seed(seed)
@@ -251,7 +300,7 @@ class Evaluator:
         if not os.path.exists(self.metrics_csv):
             try:
                 with open(self.metrics_csv, "w", encoding="utf-8") as f:
-                    f.write("episode,win_rate,avg_rank,rating_p0,raw_rank,steps\n")
+                    f.write("episode,win_rate,avg_rank,rating_p0,raw_rank,steps,recall,precision,auc\n")
             except Exception:
                 pass
         # 各エージェント別の順位分布/勝率ログ（縦持ち, 累積）
@@ -360,6 +409,10 @@ class Evaluator:
         self._assign_seat_ids(self.players)
         # 表示用の初期ラベル（実行時はエピソードごとに再構築）
         self.agent_labels = self._labels_for_players(self.players)
+
+        # value -> positive の閾値と出力オプション
+        self.value_threshold = float(value_threshold)
+        self.write_zero_on_missing_metrics = bool(write_zero_on_missing_metrics)
 
     def _auto_device(self) -> str:
         try:
@@ -485,7 +538,7 @@ class Evaluator:
             labels.append(self._agent_label_map.get(id(ag), type(ag).__name__))
         return labels
 
-    def play_one_game(self) -> List[int]:
+    def play_one_game(self) -> Dict[str, Any]:
         env = DaifugoSimpleEnv(num_players=4, agent_classes=None)
         env.agents = self.players  # あらかじめ構築した順序 (P0=評価対象)
         if hasattr(self.eval_agent, 'set_env_ref'):
@@ -495,6 +548,8 @@ class Evaluator:
         step_limit = 1000
         steps = 0
         prev_rankings: List[int] = list(getattr(env.game, 'rankings', []))
+        # collect per-move value predictions for the eval agent
+        eval_preds: List[float] = []
         while not getattr(env.game, 'done', False):
             if steps >= step_limit:
                 print(f"[WARN] step limit reached ({step_limit}) forcing termination")
@@ -502,6 +557,28 @@ class Evaluator:
             current_player_id = env.game.turn
             agent = env.agents[current_player_id]
             if isinstance(agent, AlphaZeroAgent):
+                # get a direct value prediction for this agent (probability of 'winning'/phase)
+                try:
+                    _, v = agent._policy_value(env)
+                    # extract scalar for this agent's seat if possible
+                    v_prob = None
+                    if isinstance(v, dict):
+                        v_prob = float(v.get(getattr(agent, 'player_id', 0), 0.0))
+                    elif isinstance(v, (list, tuple)):
+                        pid = int(getattr(agent, 'player_id', 0) or 0)
+                        try:
+                            v_prob = float(v[pid])
+                        except Exception:
+                            v_prob = float(v[0]) if v else 0.0
+                    else:
+                        v_prob = float(v)
+                    eval_preds.append(v_prob if v_prob is not None else 0.0)
+                except Exception:
+                    # fallback: unknown -> 0.5 (neutral)
+                    try:
+                        eval_preds.append(0.5)
+                    except Exception:
+                        pass
                 action = agent.select_action(env, training=False)
             else:
                 # baseline: シンプル観測
@@ -521,7 +598,69 @@ class Evaluator:
             # 強制終了時など順位未確定は残りをランダム末尾扱い
             remaining = [i for i in range(4) if i not in rankings]
             rankings += remaining
-        return rankings
+        # build labels: for now we treat the episode-level outcome as the true label
+        # i.e., each collected sample in this episode is labeled positive if eval agent won the episode
+        try:
+            p0_seat = self.players.index(self.eval_agent)
+        except Exception:
+            p0_seat = 0
+        won = (len(rankings) > 0 and rankings[0] == p0_seat)
+        true_label = 1 if won else 0
+        labels = [true_label] * len(eval_preds)
+
+        # compute precision/recall
+        precision = None
+        recall = None
+        auc = None
+        try:
+            thresh = float(getattr(self, 'value_threshold', 0.5))
+            preds_pos = [1 if p > thresh else 0 for p in eval_preds]
+            tp = sum(1 for p, t in zip(preds_pos, labels) if p == 1 and t == 1)
+            fp = sum(1 for p, t in zip(preds_pos, labels) if p == 1 and t == 0)
+            fn = sum(1 for p, t in zip(preds_pos, labels) if p == 0 and t == 1)
+            if (tp + fp) > 0:
+                precision = tp / (tp + fp)
+            if (tp + fn) > 0:
+                recall = tp / (tp + fn)
+            # AUC: only if both classes present
+            if labels and (any(l == 1 for l in labels) and any(l == 0 for l in labels)):
+                try:
+                    # simple ROC AUC implementation
+                    pairs = sorted(list(zip(eval_preds, labels)), key=lambda x: x[0], reverse=True)
+                    P = sum(1 for _, l in pairs if l == 1)
+                    N = sum(1 for _, l in pairs if l == 0)
+                    if P > 0 and N > 0:
+                        tp_cum = 0
+                        fp_cum = 0
+                        prev_tpr = 0.0
+                        prev_fpr = 0.0
+                        auc_acc = 0.0
+                        for score, lab in pairs:
+                            if lab == 1:
+                                tp_cum += 1
+                            else:
+                                fp_cum += 1
+                            tpr = tp_cum / P
+                            fpr = fp_cum / N
+                            auc_acc += (fpr - prev_fpr) * (tpr + prev_tpr) / 2.0
+                            prev_tpr = tpr
+                            prev_fpr = fpr
+                        auc = float(auc_acc)
+                except Exception:
+                    auc = None
+        except Exception:
+            precision = recall = auc = None
+
+        # If configured, write zeros instead of empty for missing metrics
+        if getattr(self, 'write_zero_on_missing_metrics', False):
+            if precision is None:
+                precision = 0.0
+            if recall is None:
+                recall = 0.0
+            if auc is None:
+                auc = 0.0
+
+        return {"rankings": rankings, "steps": steps, "recall": recall, "precision": precision, "auc": auc}
 
     def run(self, num_episodes: int = 10, workers: int | None = None):
         # P0（評価対象: eval_agent）専用の勝率/順位集計はエピソードごとに座席が変わっても
@@ -547,8 +686,11 @@ class Evaluator:
                     games_by_label = {lb: 0 for lb in cur_labels}
                     rank_sum_by_label = {lb: 0 for lb in cur_labels}
                     rank_counts_by_label = {lb: {1: 0, 2: 0, 3: 0, 4: 0} for lb in cur_labels}
-                rankings = self.play_one_game()
-                steps = None  # 現在 step カウントは play_one_game 内部で未返却なので拡張余地
+                # play_one_game now returns a dict with rankings, steps, recall
+                res = self.play_one_game()
+                rankings = res.get("rankings", [])
+                steps = res.get("steps")
+                recall = res.get("recall")
                 # Elo 更新: エピソード内の現在座席に対応する固有ラベルで更新（重複不可）
                 ranking_names = [cur_labels[pid] for pid in rankings]
                 self.elo.update_from_rankings(ranking_names)
@@ -564,10 +706,11 @@ class Evaluator:
                 win_rate = p0_wins / (ep + 1)
                 # 評価対象モデルの Elo は eval_label で取得
                 r = self.elo.get_rating(self.eval_label)
-                # CSV 追記
+                # CSV 追記 (recall 列を追加)
                 try:
+                    recall_str = '' if recall is None else f"{recall:.6f}"
                     with open(self.metrics_csv, "a", encoding="utf-8") as f:
-                        f.write(f"{ep+1},{win_rate:.6f},{avg_rank:.6f},{r:.2f},{'|'.join(map(str, rankings))},{'' if steps is None else steps}\n")
+                        f.write(f"{ep+1},{win_rate:.6f},{avg_rank:.6f},{r:.2f},{'|'.join(map(str, rankings))},{'' if steps is None else steps},{recall_str}\n")
                 except Exception:
                     pass
                 # 各エージェント別の勝率/平均順位を更新（追記は評価終了後に1回のみ）
@@ -702,7 +845,9 @@ class Evaluator:
                 # CSV 追記
                 try:
                     with open(self.metrics_csv, "a", encoding="utf-8") as f:
-                        f.write(f"{idx},{win_rate:.6f},{avg_rank:.6f},{r:.2f},{'|'.join(map(str, rankings))},\n")
+                        recall = res.get('recall')
+                        recall_str = '' if recall is None else f"{recall:.6f}"
+                        f.write(f"{idx},{win_rate:.6f},{avg_rank:.6f},{r:.2f},{'|'.join(map(str, rankings))},{recall_str}\n")
                 except Exception:
                     pass
                 # 各エージェント別の勝率・順位
@@ -771,6 +916,11 @@ class Evaluator:
         if self.tb_writer is not None:
             self.tb_writer.flush()
             self.tb_writer.close()
+        # 戻り値: 今回の評価参加者ラベル一覧（表示/外部利用向け）
+        try:
+            return self.get_participant_labels()
+        except Exception:
+            return []
 
     def print_player_types(self):
         """現在のプレイヤー順序と型を表示 (デバッグ用)。"""

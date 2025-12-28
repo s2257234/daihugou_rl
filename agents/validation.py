@@ -10,22 +10,38 @@ import random
 from typing import Any, Dict, List, Optional
 
 
-VALUE_U8_NONE = 255
+VALUE_U8_NONE = 255  # Legacy constant for backwards compatibility
+
+
+def _decode_value_u8(value_u8: Any) -> Optional[float]:
+    """Decode legacy value_u8 to float. For backwards compatibility only."""
+    try:
+        val = int(value_u8)
+    except Exception:
+        return None
+    if 0 <= val < VALUE_U8_NONE:
+        return val / 254.0
+    return None
 
 
 def _extract_value(sample: Any) -> Optional[float]:
+    """Extract value label from sample as float.
+    
+    Value is stored as raw float in 'value' field. Returns None if not set.
+    For backwards compatibility, also checks legacy 'value_u8' field.
+    """
     if not isinstance(sample, dict):
         return None
+    # Primary: raw float value
     v = sample.get('value')
     if v is not None:
         try:
             return float(v)
         except Exception:
             return None
+    # Backwards compatibility: decode legacy value_u8
     vu = sample.get('value_u8')
-    if isinstance(vu, int) and 0 <= vu < VALUE_U8_NONE:
-        return vu / 255.0
-    return None
+    return _decode_value_u8(vu)
 
 
 def _has_value_label(sample: Any) -> bool:
@@ -157,6 +173,8 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
     except ImportError:
         return {"policy_loss": None, "value_loss": None, "entropy": None, "reason": "torch_not_installed"}
 
+    # main validation logic
+    
     if agent.model is None:
         return {"policy_loss": None, "value_loss": None, "entropy": None, "reason": "no_model"}
 
@@ -526,13 +544,40 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
                     logits_raw, v_pred_raw = agent.model.evaluate(sample['state'], legal_actions)
                 else:
                     logits_raw, v_out_logits = agent.model.forward(sample['state'])
-                    if hasattr(v_out_logits, 'shape'):
-                        pid = getattr(agent, 'player_id', 0)
-                        if 0 <= pid < v_out_logits.shape[0]:
-                            v_pred_raw = v_out_logits[pid]
+                    # v_out_logits may be:
+                    # - a scalar (0-d tensor / float)
+                    # - a 1-d array/tensor with per-player logits
+                    # - other shapes. Handle safely to avoid IndexError on shape[0].
+                    try:
+                        shape = getattr(v_out_logits, 'shape', None)
+                        # If shape is a tuple-like and has at least one dim
+                        if shape is None:
+                            # not array-like, treat as scalar
+                            v_pred_raw = v_out_logits
                         else:
-                            v_pred_raw = v_out_logits[0]
-                    else:
+                            # some numpy/tensor types expose empty tuple for scalars
+                            try:
+                                # obtain length of first dimension if possible
+                                dim0 = shape[0]
+                            except Exception:
+                                # scalar (0-d), use as-is
+                                v_pred_raw = v_out_logits
+                            else:
+                                pid = getattr(agent, 'player_id', 0)
+                                try:
+                                    # prefer pid index when available
+                                    if isinstance(dim0, int) and 0 <= pid < int(dim0):
+                                        v_pred_raw = v_out_logits[pid]
+                                    else:
+                                        # fallback to first element when available
+                                        if int(dim0) > 0:
+                                            v_pred_raw = v_out_logits[0]
+                                        else:
+                                            v_pred_raw = v_out_logits
+                                except Exception:
+                                    # final fallback
+                                    v_pred_raw = v_out_logits
+                    except Exception:
                         v_pred_raw = v_out_logits
 
                 try:
