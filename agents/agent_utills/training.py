@@ -277,6 +277,11 @@ def _decode_value_u8(value_u8: Any) -> Optional[float]:
 
 
 def _extract_value(sample: Any) -> Optional[float]:
+    """Extract value (z) from sample.
+    
+    Returns the value field from a sample. For backwards compatibility,
+    also accepts legacy value_u8 field.
+    """
     """Extract value label from sample as float.
     
     Value is stored as raw float in 'value' field. Returns None if not set.
@@ -306,6 +311,29 @@ def _extract_value(sample: Any) -> Optional[float]:
     except Exception:
         vu = None
     return _decode_value_u8(vu)
+
+
+def _extract_value_q(sample: Any) -> Optional[float]:
+    """Extract value_q (MCTS evaluation value) from sample.
+    
+    Returns the value_q field from a sample, which contains the MCTS
+    root node evaluation value. Returns None if not present.
+    """
+    getter = None
+    try:
+        if hasattr(sample, 'get'):
+            getter = sample.get
+    except Exception:
+        getter = None
+    if getter is None:
+        return None
+    try:
+        vq = getter('value_q', None)
+        if vq is not None:
+            return float(vq)
+    except Exception:
+        pass
+    return None
 
 
 def _iter_value_head_params(model: Any):
@@ -529,6 +557,7 @@ class TrainStepMixin:
         states: List[Any] = []
         pi_arrays: List[_np.ndarray] = []
         v_targets: List[float] = []
+        v_targets_q: List[Optional[float]] = []  # MCTS評価値（q）のリスト
         is_weights: List[float] = []
         lengths: List[int] = []
         hand_labels: List[Optional[_np.ndarray]] = []
@@ -545,6 +574,13 @@ class TrainStepMixin:
                 st_meta = sample.get('state') or {}
                 if ('full_compact' not in st_meta) and ('full_input' not in st_meta):
                     continue
+            
+            # MCTS評価値（q）を取得
+            v_target_q = _extract_value_q(sample)
+            # デバッグ: 最初の数サンプルでvalue_qの抽出を確認
+            if bool(self.config.get('debug_value_mix', False)) and len(v_targets_q) < 5:
+                print(f"[DEBUG_VALUE_MIX] _prepare_batch sample[{len(v_targets_q)}]: value_q={v_target_q}, value={v_target}")
+            
             # π 復元
             try:
                 if 'pi_q' in sample and sample.get('pi_format') == 'u16_norm65535':
@@ -604,6 +640,7 @@ class TrainStepMixin:
             states.append(st_can)
             pi_arrays.append(pi_arr)
             v_targets.append(float(v_target))
+            v_targets_q.append(v_target_q)  # MCTS評価値（q）を追加
             lengths.append(int(pi_arr.shape[0]))
             # hand labels (存在時のみ) -- use canonicalized state so labels follow viewpoint rotation
             hl = None
@@ -632,6 +669,7 @@ class TrainStepMixin:
             'states': states,
             'pi_arrays': pi_arrays,
             'v_targets': v_targets,
+            'v_targets_q': v_targets_q,  # MCTS評価値（q）のリスト
             'is_weights': is_weights,
             'lengths': lengths,
             'hand_labels': hand_labels,
@@ -647,6 +685,8 @@ class TrainStepMixin:
         代表的失敗理由: torch_not_installed / no_model / no_data / no_valid_samples
         """
         self._logged_inside = False
+        if bool(self.config.get('debug_value_mix', False)):
+            print(f"[DEBUG_VALUE_MIX] train_step called, replay_buffer size={len(self.replay_buffer) if self.replay_buffer else 0}, _use_shared={getattr(self, '_use_shared', False)}, has_iter_all={hasattr(self.replay_buffer, 'iter_all') if self.replay_buffer else False}, player_id={getattr(self, 'player_id', None)}")
         try:
             import torch
         except ImportError:
@@ -655,8 +695,22 @@ class TrainStepMixin:
             return {"loss": None, "reason": "no_model"}
         # 共有バッファ: 自プレイヤーの確定サンプルのみ抽出 (学習splitのみ)
         if self._use_shared and hasattr(self.replay_buffer, 'iter_all'):
-            my_samples = [s for s in self.replay_buffer.iter_all(owner_pid=self.player_id)
+            iter_all_results = list(self.replay_buffer.iter_all(owner_pid=self.player_id))
+            # デバッグ: iter_allの結果を確認
+            if bool(self.config.get('debug_value_mix', False)):
+                print(f"[DEBUG_VALUE_MIX] iter_all(owner_pid={self.player_id}) returned {len(iter_all_results)} samples")
+                if iter_all_results:
+                    first_sample = iter_all_results[0]
+                    has_val = _has_value_label(first_sample)
+                    split_val = first_sample.get('split')
+                    pid_val = first_sample.get('player_id')
+                    print(f"[DEBUG_VALUE_MIX] first sample: player_id={pid_val} (type={type(pid_val).__name__}), split={split_val}, has_value_label={has_val}")
+            my_samples = [s for s in iter_all_results
                           if _has_value_label(s) and (s.get('split') != 'val')]
+            # デバッグ: my_samples内のvalue_qの有無を確認（早期リターン前）
+            if bool(self.config.get('debug_value_mix', False)):
+                q_count_my = sum(1 for s in my_samples[:min(100, len(my_samples))] if _extract_value_q(s) is not None) if my_samples else 0
+                print(f"[DEBUG_VALUE_MIX] my_samples size={len(my_samples)}, samples_with_q (first 100)={q_count_my}")
             if not my_samples:
                 return {"loss": None, "reason": "no_data"}
             batch_pool = my_samples
@@ -667,6 +721,10 @@ class TrainStepMixin:
                 batch_pool = [s for s in self.replay_buffer if isinstance(s, dict) and _has_value_label(s) and (s.get('split') != 'val')]
             except Exception:
                 batch_pool = self.replay_buffer
+            # デバッグ: batch_pool内のvalue_qの有無を確認
+            if bool(self.config.get('debug_value_mix', False)):
+                q_count_batch = sum(1 for s in batch_pool[:min(100, len(batch_pool))] if _extract_value_q(s) is not None)
+                print(f"[DEBUG_VALUE_MIX] batch_pool size={len(batch_pool)}, samples_with_q (first 100)={q_count_batch}")
 
         # Optimizer 遅延初期化（Value Head専用の正則化を適用）
         if self._optimizer is None:
@@ -878,6 +936,10 @@ class TrainStepMixin:
                     pool_snapshot = [s for s in pool_snapshot if s.get('feature_version', 0) >= 1]
                 if not pool_snapshot:
                     return {"loss": None, "reason": "no_data"}
+                # デバッグ: pool_snapshot内のvalue_qの有無を確認
+                if bool(self.config.get('debug_value_mix', False)):
+                    q_count_in_pool = sum(1 for s in pool_snapshot[:min(100, len(pool_snapshot))] if _extract_value_q(s) is not None)
+                    print(f"[DEBUG_VALUE_MIX] pool_snapshot size={len(pool_snapshot)}, samples_with_q (first 100)={q_count_in_pool}")
                 # uid -> idx mapping
                 uid2idx: Dict[int, int] = {}
                 for i, s in enumerate(pool_snapshot):
@@ -1004,6 +1066,7 @@ class TrainStepMixin:
                     states = prepared_batch['states']
                     pi_arrays = prepared_batch['pi_arrays']
                     v_targets_list = prepared_batch['v_targets']
+                    v_targets_q_list = prepared_batch.get('v_targets_q', [])
                     is_weights_list = prepared_batch['is_weights']
                     lengths = prepared_batch['lengths']
                     used_uids.extend(prepared_batch.get('used_uids', []))
@@ -1012,6 +1075,7 @@ class TrainStepMixin:
                     states = prep['states']
                     pi_arrays = prep['pi_arrays']
                     v_targets_list = prep['v_targets']
+                    v_targets_q_list = prep.get('v_targets_q', [])
                     is_weights_list = prep['is_weights']
                     lengths = prep['lengths']
                     used_uids.extend(prep['used_uids'])
@@ -1228,6 +1292,94 @@ class TrainStepMixin:
                             is_weights_t = torch.tensor(list(map(float, is_weights_list)), dtype=torch.float32, device=device).view(-1)
 
                     v_targets_t = torch.tensor(v_targets_list, dtype=torch.float32, device=device).view(-1)
+                    
+                    # zとqの混合処理（MCTS評価値と勝敗結果を混ぜる）
+                    enable_mix = bool(self.config.get('value_mix_z_q_enable', True))
+                    # デバッグ: v_targets_q_listの状態を確認
+                    if bool(self.config.get('debug_value_mix', False)):
+                        print(f"[DEBUG_VALUE_MIX] enable_mix={enable_mix}, v_targets_q_list length={len(v_targets_q_list) if v_targets_q_list else 0}")
+                        if v_targets_q_list:
+                            q_count = sum(1 for q in v_targets_q_list if q is not None)
+                            print(f"[DEBUG_VALUE_MIX] v_targets_q_list: total={len(v_targets_q_list)}, with_q={q_count}, without_q={len(v_targets_q_list)-q_count}")
+                            # サンプルを実際に確認
+                            if q_count == 0 and len(v_targets_q_list) > 0:
+                                # 最初の数サンプルを確認
+                                for i, sample in enumerate(batch[:min(5, len(batch))]):
+                                    vq = _extract_value_q(sample) if hasattr(sample, 'get') or isinstance(sample, dict) else None
+                                    print(f"[DEBUG_VALUE_MIX] batch[{i}]: value_q={vq}, has_get={hasattr(sample, 'get') if sample else False}, is_dict={isinstance(sample, dict)}")
+                    if enable_mix and v_targets_q_list:
+                        try:
+                            # 現在の累積ステップ数を取得
+                            train_updates_cum = getattr(self, '_update_step', 0)
+                            if not isinstance(train_updates_cum, int):
+                                try:
+                                    train_updates_cum = int(train_updates_cum)
+                                except Exception:
+                                    train_updates_cum = 0
+                            
+                            # 混合比率の閾値を取得
+                            threshold_1 = int(self.config.get('value_mix_threshold_1', 5000))
+                            threshold_2 = int(self.config.get('value_mix_threshold_2', 10000))
+                            
+                            # ステップ数に応じて混合比率を決定
+                            if train_updates_cum < threshold_1:
+                                ratio_z, ratio_q = 1.0, 0.0
+                            elif train_updates_cum < threshold_2:
+                                ratio_z, ratio_q = 0.75, 0.25
+                            else:
+                                ratio_z, ratio_q = 0.5, 0.5
+                            
+                            # v_targets_q_listをtensorに変換
+                            v_targets_q_t_list = []
+                            for i, vq in enumerate(v_targets_q_list):
+                                if vq is not None:
+                                    v_targets_q_t_list.append(float(vq))
+                                else:
+                                    # value_qがない場合はzのみ使用（後方互換性）
+                                    v_targets_q_t_list.append(None)
+                            
+                            # 混合計算: target = ratio_z * z + ratio_q * q
+                            if v_targets_q_t_list and any(vq is not None for vq in v_targets_q_t_list):
+                                v_targets_mixed = []
+                                mixed_count = 0
+                                z_only_count = 0
+                                for i, (z, q) in enumerate(zip(v_targets_list, v_targets_q_t_list)):
+                                    if q is not None:
+                                        # zとqを混ぜる
+                                        mixed = ratio_z * float(z) + ratio_q * float(q)
+                                        v_targets_mixed.append(mixed)
+                                        mixed_count += 1
+                                    else:
+                                        # value_qがない場合はzのみ使用（後方互換性）
+                                        v_targets_mixed.append(float(z))
+                                        z_only_count += 1
+                                
+                                # デバッグログ出力
+                                if bool(self.config.get('debug_value_mix', False)):
+                                    sample_z = float(v_targets_list[0]) if v_targets_list else None
+                                    sample_q = float(v_targets_q_t_list[0]) if v_targets_q_t_list and v_targets_q_t_list[0] is not None else None
+                                    sample_mixed = float(v_targets_mixed[0]) if v_targets_mixed else None
+                                    print(f"[DEBUG_VALUE_MIX] step={train_updates_cum} ratio_z={ratio_z} ratio_q={ratio_q} "
+                                          f"mixed={mixed_count} z_only={z_only_count} "
+                                          f"sample: z={sample_z} q={sample_q} mixed={sample_mixed}")
+                                
+                                # 混合された値をtensorに変換
+                                v_targets_t = torch.tensor(v_targets_mixed, dtype=torch.float32, device=device).view(-1)
+                            else:
+                                # value_qが全くない場合
+                                if bool(self.config.get('debug_value_mix', False)):
+                                    print(f"[DEBUG_VALUE_MIX] step={train_updates_cum} no_value_q: using z only (backward compatibility)")
+                        except Exception as e:
+                            # エラーが発生した場合はzのみ使用（後方互換性）
+                            import traceback
+                            if hasattr(self, 'logger') and self.logger:
+                                try:
+                                    self.logger.log_text(f"[WARN] value mix failed: {e}")
+                                except Exception:
+                                    pass
+                            if bool(self.config.get('debug_value_mix', False)):
+                                print(f"[DEBUG_VALUE_MIX] ERROR: {e}, falling back to z only")
+                    
                     # ラベルスムージング: 過学習防止のため、0/1のハードラベルを少し中央に寄せる
                     # smoothed_target = target * (1 - smoothing) + smoothing / 2
                     # 0.0 → 0.025, 1.0 → 0.975
@@ -1861,6 +2013,53 @@ class TrainStepMixin:
             hand_coef = 0.0
         if hand_coef > 0.0 and hand_loss_mean is not None:
             total_loss = total_loss + hand_coef * hand_loss_mean
+        
+        # NaN/Inf検出: 損失値の検証
+        try:
+            import torch as _t
+            loss_has_nan = False
+            loss_has_inf = False
+            if isinstance(total_loss, _t.Tensor):
+                if _t.isnan(total_loss).any():
+                    loss_has_nan = True
+                if _t.isinf(total_loss).any():
+                    loss_has_inf = True
+            elif isinstance(policy_loss_mean, _t.Tensor):
+                if _t.isnan(policy_loss_mean).any():
+                    loss_has_nan = True
+                if _t.isinf(policy_loss_mean).any():
+                    loss_has_inf = True
+            elif isinstance(value_loss_mean, _t.Tensor):
+                if _t.isnan(value_loss_mean).any():
+                    loss_has_nan = True
+                if _t.isinf(value_loss_mean).any():
+                    loss_has_inf = True
+            
+            if loss_has_nan or loss_has_inf:
+                error_msg = "[ERROR] NaN/Inf detected in loss values: "
+                if loss_has_nan:
+                    error_msg += "NaN "
+                if loss_has_inf:
+                    error_msg += "Inf "
+                error_msg += f"total_loss={total_loss.item() if isinstance(total_loss, _t.Tensor) else total_loss} "
+                error_msg += f"policy_loss={policy_loss_mean.item() if isinstance(policy_loss_mean, _t.Tensor) else policy_loss_mean} "
+                error_msg += f"value_loss={value_loss_mean.item() if isinstance(value_loss_mean, _t.Tensor) else value_loss_mean}"
+                try:
+                    if self.logger:
+                        self.logger.log_text(error_msg)
+                except Exception:
+                    pass
+                print(error_msg)
+                # NaN/Inf損失の場合は学習をスキップ
+                return {
+                    'loss': None,
+                    'policy_loss': None,
+                    'value_loss': None,
+                    'entropy': None,
+                    'reason': 'nan_inf_loss'
+                }
+        except Exception:
+            pass
         # --- Mixed precision training (GradScaler) ---
         try:
             import torch as _t
@@ -1890,7 +2089,7 @@ class TrainStepMixin:
 
         self._optimizer.zero_grad()
         did_update = False
-        # placeholders for gradient/weight norms
+        # placeholders for gradient/weight norms (module-level to ensure visibility in metrics)
         grad_norm = None
         # value_head specific grad norm (computed when grads exist)
         value_head_grad_norm = None
@@ -1943,26 +2142,30 @@ class TrainStepMixin:
                     import math as _m
                     total_sq = 0.0
                     v_total_sq = 0.0
+                    grad_count = 0
                     for p in self.model.parameters():
                         if getattr(p, 'grad', None) is not None:
                             try:
                                 gnorm = float(p.grad.detach().cpu().norm().item())
                                 total_sq += (gnorm * gnorm)
+                                grad_count += 1
                             except Exception:
                                 continue
                     # value_head grad norm
                     try:
+                        vh_grad_count = 0
                         for p in _iter_vh_params_local():
                             if getattr(p, 'grad', None) is not None:
                                 try:
                                     gnorm = float(p.grad.detach().cpu().norm().item())
                                     v_total_sq += (gnorm * gnorm)
+                                    vh_grad_count += 1
                                 except Exception:
                                     continue
-                        value_head_grad_norm = float(_m.sqrt(v_total_sq)) if v_total_sq >= 0.0 else None
+                        value_head_grad_norm = float(_m.sqrt(v_total_sq)) if v_total_sq >= 0.0 and vh_grad_count > 0 else None
                     except Exception:
                         value_head_grad_norm = None
-                    grad_norm = float(_m.sqrt(total_sq)) if total_sq >= 0.0 else None
+                    grad_norm = float(_m.sqrt(total_sq)) if total_sq >= 0.0 and grad_count > 0 else None
                 except Exception:
                     grad_norm = None
                     value_head_grad_norm = None
@@ -1991,27 +2194,72 @@ class TrainStepMixin:
                             import math as _m
                             total_sq = 0.0
                             v_total_sq = 0.0
+                            grad_count = 0
                             for p in self.model.parameters():
                                 if getattr(p, 'grad', None) is not None:
                                     try:
                                         gnorm = float(p.grad.detach().cpu().norm().item())
                                         total_sq += (gnorm * gnorm)
+                                        grad_count += 1
                                     except Exception:
                                         continue
                             try:
+                                vh_grad_count = 0
                                 for p in _iter_vh_params_local():
                                     if getattr(p, 'grad', None) is not None:
                                         try:
                                             gnorm = float(p.grad.detach().cpu().norm().item())
                                             v_total_sq += (gnorm * gnorm)
+                                            vh_grad_count += 1
                                         except Exception:
                                             continue
-                                value_head_grad_norm = float(_m.sqrt(v_total_sq)) if v_total_sq >= 0.0 else None
+                                value_head_grad_norm = float(_m.sqrt(v_total_sq)) if v_total_sq >= 0.0 and vh_grad_count > 0 else None
                             except Exception:
                                 value_head_grad_norm = None
-                            grad_norm = float(_m.sqrt(total_sq)) if total_sq >= 0.0 else None
+                            grad_norm = float(_m.sqrt(total_sq)) if total_sq >= 0.0 and grad_count > 0 else None
                     except Exception:
                         grad_norm = None
+                    
+                    # NaN/Inf検出: 勾配の検証（FP32パス）
+                    try:
+                        grad_has_nan = False
+                        grad_has_inf = False
+                        large_grad_params = []
+                        for name, param in self.model.named_parameters():
+                            if param.grad is not None:
+                                grad = param.grad
+                                if _t.isnan(grad).any():
+                                    grad_has_nan = True
+                                if _t.isinf(grad).any():
+                                    grad_has_inf = True
+                                # 勾配爆発の検出（100を超える勾配）
+                                grad_max = grad.abs().max().item()
+                                if grad_max > 100.0:
+                                    large_grad_params.append((name, grad_max))
+                        
+                        if grad_has_nan or grad_has_inf:
+                            error_msg = "[ERROR] NaN/Inf detected in gradients (FP32): "
+                            if grad_has_nan:
+                                error_msg += "NaN "
+                            if grad_has_inf:
+                                error_msg += "Inf "
+                            try:
+                                if self.logger:
+                                    self.logger.log_text(error_msg)
+                            except Exception:
+                                pass
+                            print(error_msg)
+                        elif large_grad_params:
+                            warn_msg = f"[WARN] Large gradients detected (FP32, gradient explosion risk): {large_grad_params[:3]}"
+                            try:
+                                if self.logger:
+                                    self.logger.log_text(warn_msg)
+                            except Exception:
+                                pass
+                            print(warn_msg)
+                    except Exception:
+                        pass
+                    
                     if self.grad_clip and self.grad_clip > 0:
                         try:
                             _t.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
@@ -2030,25 +2278,29 @@ class TrainStepMixin:
                     import math as _m
                     total_sq = 0.0
                     v_total_sq = 0.0
+                    grad_count = 0
                     for p in self.model.parameters():
                         if getattr(p, 'grad', None) is not None:
                             try:
                                 gnorm = float(p.grad.detach().cpu().norm().item())
                                 total_sq += (gnorm * gnorm)
+                                grad_count += 1
                             except Exception:
                                 continue
                     try:
+                        vh_grad_count = 0
                         for p in _iter_vh_params_local():
                             if getattr(p, 'grad', None) is not None:
                                 try:
                                     gnorm = float(p.grad.detach().cpu().norm().item())
                                     v_total_sq += (gnorm * gnorm)
+                                    vh_grad_count += 1
                                 except Exception:
                                     continue
-                        value_head_grad_norm = float(_m.sqrt(v_total_sq)) if v_total_sq >= 0.0 else None
+                        value_head_grad_norm = float(_m.sqrt(v_total_sq)) if v_total_sq >= 0.0 and vh_grad_count > 0 else None
                     except Exception:
                         value_head_grad_norm = None
-                    grad_norm = float(_m.sqrt(total_sq)) if total_sq >= 0.0 else None
+                    grad_norm = float(_m.sqrt(total_sq)) if total_sq >= 0.0 and grad_count > 0 else None
                 except Exception:
                     grad_norm = None
                     value_head_grad_norm = None
@@ -2079,12 +2331,21 @@ class TrainStepMixin:
         # 追加のチェックなしで scheduler.step() を呼ぶ
         try:
             if did_update:
+                # Optimizer 更新が行われたので内部カウンタを進める
+                current_step = getattr(self, '_update_step', 0)
+                try:
+                    current_step = int(current_step)
+                except Exception:
+                    current_step = 0
+                new_step = current_step + 1
+                self._update_step = new_step
                 if self._scheduler is None:
                     self.ensure_scheduler()
                 if self._scheduler is not None:
-                    # 自前カウンタも同期してから scheduler を進める
-                    self._update_step += 1
-                    self._scheduler.step()
+                    try:
+                        self._scheduler.step()
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -2092,13 +2353,15 @@ class TrainStepMixin:
         try:
             import math as _m
             total_sq_w = 0.0
+            weight_count = 0
             for p in self.model.parameters():
                 try:
                     wnorm = float(p.detach().cpu().norm().item())
                     total_sq_w += (wnorm * wnorm)
+                    weight_count += 1
                 except Exception:
                     continue
-            weight_norm = float(_m.sqrt(total_sq_w)) if total_sq_w >= 0.0 else None
+            weight_norm = float(_m.sqrt(total_sq_w)) if total_sq_w >= 0.0 and weight_count > 0 else None
         except Exception:
             weight_norm = None
 
@@ -2286,14 +2549,25 @@ class TrainStepMixin:
             "pass_only_count": pass_only_count,
             "played_ratio_raw": played_ratio_raw,
             "played_count": played_count,
+            # 勾配/重みノルムを確実に含める
+            "grad_norm": grad_norm,
+            "weight_norm": weight_norm,
+            "value_head_grad_norm": value_head_grad_norm,
         }
-        # attach gradient/weight norms if available
-        try:
-            metrics['grad_norm'] = grad_norm
-            metrics['weight_norm'] = weight_norm
-            metrics['value_head_grad_norm'] = value_head_grad_norm
-        except Exception:
-            pass
+        # 勾配/重みノルムの取得状況をログ出力（デバッグ用）
+        if bool(self.config.get('debug_grad_norm', False)):
+            logger_obj = getattr(self, 'logger', None)
+            if logger_obj is not None and hasattr(logger_obj, 'log_text'):
+                try:
+                    logger_obj.log_text(
+                        f"[grad_norm_debug] final metrics: grad_norm={grad_norm}, weight_norm={weight_norm}, vh_grad_norm={value_head_grad_norm}, did_update={did_update}"
+                    )
+                except Exception as e:
+                    try:
+                        logger_obj.log_text(f"[grad_norm_debug] failed to attach norms to metrics: {e}")
+                    except Exception:
+                        print(f"[grad_norm_debug] failed to attach norms to metrics: {e}")
+        # compute hand-pred metrics (top-K accuracy, Brier) if we collected predictions
         # compute hand-pred metrics (top-K accuracy, Brier) if we collected predictions
         try:
             if collected_hand_logits:
@@ -2477,6 +2751,67 @@ class TrainStepMixin:
                         self.logger.log_text(f"[TRAIN] step={step} {line}", also_print=False)
             except Exception:
                 pass
+
+        # --- メモリクリーンアップ: 大きなテンソル/リストを明示的に解放 ---
+        try:
+            if bool(self.config.get('train_step_clear_tensors', True)):
+                # 主要テンソルを解放（存在チェックしてから None 代入）
+                if 'xs' in locals():
+                    xs = None  # type: ignore[local-defined]
+                if 'pi_pad_t' in locals():
+                    pi_pad_t = None  # type: ignore[local-defined]
+                if 'masked_logits' in locals():
+                    masked_logits = None  # type: ignore[local-defined]
+                if 'policy_logits_batch' in locals():
+                    policy_logits_batch = None  # type: ignore[local-defined]
+                if 'value_logits_batch' in locals():
+                    value_logits_batch = None  # type: ignore[local-defined]
+                if 'hand_logits_batch' in locals():
+                    hand_logits_batch = None  # type: ignore[local-defined]
+                if 'sample_weights_t' in locals():
+                    sample_weights_t = None  # type: ignore[local-defined]
+                if 'v_logits' in locals():
+                    v_logits = None  # type: ignore[local-defined]
+                if 'value_active_t' in locals():
+                    value_active_t = None  # type: ignore[local-defined]
+                if 'collected_pi' in locals():
+                    collected_pi.clear()
+                if 'collected_model' in locals():
+                    collected_model.clear()
+                if 'collected_v_pred' in locals():
+                    collected_v_pred.clear()
+                if 'collected_v_t' in locals():
+                    collected_v_t.clear()
+                if 'collected_hand_logits' in locals():
+                    collected_hand_logits.clear()
+                if 'collected_hand_tgts' in locals():
+                    collected_hand_tgts.clear()
+                if 'collected_hand_masks' in locals():
+                    collected_hand_masks.clear()
+                if 'prepared_batch' in locals() and prepared_batch is not None:
+                    try:
+                        prepared_batch.clear()
+                    except Exception:
+                        prepared_batch = None  # type: ignore[local-defined]
+                if 'pool_snapshot' in locals():
+                    pool_snapshot = None  # type: ignore[local-defined]
+                if 'fast_full_input_np' in locals():
+                    fast_full_input_np = None  # type: ignore[local-defined]
+                if 'batch' in locals():
+                    batch = None  # type: ignore[local-defined]
+                if 'batch_pool' in locals():
+                    batch_pool = None  # type: ignore[local-defined]
+                if 'my_samples' in locals():
+                    my_samples = None  # type: ignore[local-defined]
+                if bool(self.config.get('train_step_clear_cuda_cache', True)):
+                    try:
+                        import torch as _torch
+                        if _torch.cuda.is_available():
+                            _torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         return metrics
 
 

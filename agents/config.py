@@ -18,17 +18,25 @@ ALPHA_ZERO_CONFIG = {
     # ---------------------------
     # 学習 / 最適化
     # ---------------------------
-    "buffer_size": 750000,            # リプレイバッファ最大サイズ（30ファイル×約23,000サンプル対応） 
+    "buffer_size": 750000,            # リプレイバッファ最大サイズ（メモリ効率優先で削減） 
     "batch_size": 256,               # 学習バッチサイズ (train_step 実装時に利用)
-    "lr": 7e-5,                      # 学習率　初期値0.0001
-    "weight_decay": 3e-4,          # L2 正則化　初期値1e-4
+    "lr": 7e-5,                      # 学習率　7e-5→1e-4（Val loss改善のため引き上げ）
+    "weight_decay": 3e-3,          # L2 正則化　初期値1e-4
+    # 勾配ノルムクリップ: 大きな勾配スパイクを防ぎ安定化するための上限 (float>0で有効)
+    "grad_clip": 4.0,
     # Value Head専用の正則化（過学習対策）
-    "value_head_weight_decay": 5e-4,  # Value HeadのWeight Decay
-    "value_head_lr_scale": 1.0,       # Value Headの学習率スケール 
+    "value_head_weight_decay": 3e-3,  # Value HeadのWeight Decay
+    "value_head_lr_scale": 1.0,       # Value Headの学習率スケール（0.8→1.2、積極学習） 
     "value_loss_coef": 1.0,          # 価値損失係数
     "policy_loss_coef": 1.0,         # 方策損失係数
     "entropy_coef": 1e-4,             # エントロピー正則化
     "epochs_per_update": 1,          # 1回の train 呼び出しで何エポック回すか
+    # メモリ最適化オプション
+    "rebuild_chunk_size": 5000,      # _rebuild_replay のチャンク処理単位（現在は無視され全件一括処理）
+    "train_step_clear_tensors": True,  # train_step 終了時にテンソル/リストを明示解放
+    "train_step_clear_cuda_cache": True,  # 上記処理時に CUDA キャッシュも開放
+    "aggressive_gc": False,          # True なら学習フェーズ各所で gc.collect を実行
+    "log_memory_usage": True,        # True なら学習主要ポイントでpsutilによるメモリログを残す
 
     # --- 学習率スケジューラ ---
     # デフォルト: Warmup + Cosine (再開なし)
@@ -37,7 +45,12 @@ ALPHA_ZERO_CONFIG = {
     "lr_warmup_steps": 1000,
     "lr_min": 7e-6,
     # ウォームアップ後、ここまでの更新ステップで lr_min へ到達
-    "lr_cosine_T_max_updates": 500000, #目標ステップ数に応じて変更する
+    "lr_cosine_T_max_updates": 100000, #目標ステップ数に応じて変更する
+    
+    # MCTS評価値（q）と勝敗結果（z）の混合設定
+    "value_mix_z_q_enable": True,  # zとqを混ぜる機能を有効にするか
+    "value_mix_threshold_1": 5000,  # ステップ数 < threshold_1 のとき、z:q = 100:0
+    "value_mix_threshold_2": 10000,  # threshold_1 <= ステップ数 < threshold_2 のとき、z:q = 75:25、threshold_2以上で50:50
     # 再開直後に一度だけウォームアップをやり直す（プロセス内一回限り）
     # True にすると、optimizer/scheduler 復元後にスケジューラを last_epoch=-1 で再初期化し、
     # param_group['lr'] を基準学習率に戻します。その後このフラグは False に戻されます。
@@ -53,6 +66,8 @@ ALPHA_ZERO_CONFIG = {
     "hand_pred_loss_coef": 1.0,
     # デターミニゼーション時に予測確率を用いて割当サンプリングするか (False なら従来ランダム)
     "hand_pred_use_in_determinization": True,
+    # Step A (確定枠): この確率以上のカードは即座に確定割り当て (0.0-1.0, 例: 0.95)
+    "hand_pred_deterministic_threshold": 0.85,
     # リモート推論結果(hand_probs)のキャッシュ有効TTL(秒)。古い予測は無視してローカル再計算。
     # determinization 時の鮮度確保と過度なIPC依存を避けるために使用。
     "hand_pred_cache_ttl_sec": 0.5,
@@ -158,7 +173,7 @@ ALPHA_ZERO_CONFIG = {
     # モデル
     # ---------------------------
     "max_policy_size": 128,          # policy ログits の固定長 (合法手数 <= この値)
-    "hidden_size": 128,              # MLP 隠れ層次元
+    "hidden_size": 64,               # MLP 隠れ層次元
     "num_players": 4,                # 大富豪 4人
 
     
@@ -169,13 +184,20 @@ ALPHA_ZERO_CONFIG = {
     # リプレイを学習用/検証用に確率分割する比率 (0.0〜0.5 程度を推奨)
     # サンプルが確定(value 付与)したタイミングで一度だけ split を付与します。
     # シャッフル後の先頭から val_split_ratio 分をバリデーションとして使用
-    "val_split_ratio": 0.05,
+    "val_split_ratio": 0.1,         # 0.1→0.15（検証統計の安定化とval_loss改善）
     # 学習更新に対して何回に1回、検証損失を計算するか (0/None で検証無効)
-    "val_eval_every_updates": 30,
+    "val_eval_every_updates": 50,
     # 検証時に使用する最大サンプル数 (過大計算防止)。0/None で全件。
-    "val_max_samples": 4096,
+    "val_max_samples": 4096,        # 16384→32768（2倍、より正確な汎化性能評価）
     # 検証時のバッチサイズ (未指定で学習バッチと同一)
     "val_batch_size": None,
+    "resume_skip_prevalidation": True,  # 7分削減
+    # Early Stopping (検証損失ベース)。過学習進行を防ぎ最良モデルを確保。
+    "early_stop_patience": 10,
+    "early_stop_min_delta": 0.0,
+    # val_lossがほぼ同等の場合は Train/Val Gap がより小さいモデルを優先
+    "early_stop_gap_min_delta": 0.0,
+
 
     # ---------------------------
     # モデル更新前 評価ゲート
@@ -222,12 +244,12 @@ ALPHA_ZERO_CONFIG = {
     "ingest_pick_newest": True,
     "ingest_max_samples_per_file": 0,
     "active_file_pool_size": 100,  # メモリ削減: アクティブに監視するファイル数
-    "active_file_refresh_every_updates": 600,  # 何更新ごとにアクティブファイルリストを更新するか
-    "active_file_pool_refresh_fraction": 0.3,  # プール内の何割を更新するか
+    "active_file_refresh_every_updates": 0,  # 何更新ごとにアクティブファイルリストを更新するか
+    "active_file_pool_refresh_fraction": 0.25,  # プール内の何割を更新するか（メモリスパイク抑制のため削減）
     # newest_bias: 最新ファイルとランダム選択の割合 (0.0-1.0)
     # 1.0=全て最新から選択（従来動作）, 0.5=50%最新+50%ランダム, 0.0=全てランダム
     # 過学習防止のため、0.3〜0.5程度を推奨（最新データと多様性のバランス）
-    "active_file_newest_bias": 0.4,  # 40%最新ファイル、60%古いファイルからランダム
+    "active_file_newest_bias": 0.3,  # 30%最新、70%古い（データ多様性向上でval_loss改善）
     # resume_defer_preload有効時の初期ロードファイル数（デフォルトはingest_max_filesと同じ）
     "resume_initial_load_files": None,  # None時はingest_max_filesを使用
     
@@ -237,11 +259,11 @@ ALPHA_ZERO_CONFIG = {
     # buffer_window_size > 0 でスライディングウィンドウモードを有効化
     # buffer_state.json にファイルリストを永続化し、同じデータの繰り返し学習を防止
     # 30ファイル × 約23,000サンプル = 約700,000サンプルのプールを維持
-    "buffer_window_size": 30,  # ウィンドウサイズ（0で無効化し従来モードを使用）
+    "buffer_window_size": 50,  # ウィンドウサイズ（0で無効化し従来モードを使用）
     
     # 固定サンプル数制御（優先）: fixed_total_samples > 0 なら動的サイジングを無視してこの値を使用
     # buffer_window_sizeが有効な場合、全ファイルを読み込むため0に設定推奨
-    "fixed_total_samples": 0,  # 0で無効化（buffer_window_size使用時は全件読み込み）
+    "fixed_total_samples": 550000,  # 0で無効化（buffer_sizeと整合、メモリ効率優先）
     # 動的サンプルサイジング: total_updates の累乗に基づいてサンプル数を調整
     # enable_dynamic_sample_sizing が True かつ fixed_total_samples が 0 の場合のみ有効
     # 注意: buffer_window_size > 0 の場合は無効にすること（全件読み込みのため）
@@ -353,8 +375,8 @@ ALPHA_ZERO_CONFIG = {
     "tensorboard_episode_log_every": 200,
     "tensorboard_flush_seconds": 300,        # 最低この秒数ごとに flush (0/None なら都度 flush)
     # CSV 出力間引き (1=毎回)。間引いた行は欠番になる
-    "csv_train_log_every": 30,
-    "csv_episode_log_every": 30,
+    "csv_train_log_every": 50,
+    "csv_episode_log_every": 50,
     # MCTS ルート統計 JSONL を更に抑制したい場合 (disable_mcts_log と組み合わせ)
     "mcts_jsonl_max_bytes": 50_000_000,     # 上限超過で以降追記停止 (約50MB)。0/None で無効
 

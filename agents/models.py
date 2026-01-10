@@ -73,9 +73,11 @@ from __future__ import annotations
 
 from typing import Dict, Any, Optional, List, Tuple
 import warnings
+import math
 
 import torch
 import torch.nn as nn
+import torch.nn.init as init
 from torch import autograd
 
 
@@ -127,7 +129,7 @@ class PolicyValueNet(nn.Module):
                  use_full_features: bool = True,
                  full_feature_dim: Optional[int] = None,
                  enable_hand_prediction_head: bool = True,
-                 context_out_dim: int = 256,
+                 context_out_dim: int = 128,
                  signal_noise_std: float = 0.2):
         """Policy-Value Net (フル特徴専用)
 
@@ -183,20 +185,17 @@ class PolicyValueNet(nn.Module):
                 raise ValueError(f"invalid full_feature_dim {legacy_dim}: must be > self_dim({self.self_dim})")
             self.full_feature_dim = legacy_dim
             self.context_dim = new_context_dim
-            # context_encoder を再構築
-            self.context_encoder = nn.Sequential(
-                nn.Linear(self.context_dim, self.context_out_dim),
-                nn.ReLU(),
-            )
             # legacy ckpt branch: no runtime prints here
 
         # ---- Small encoders for each component ----
-        # 出力次元: Self=32, Context=可変 (デフォルト256)。旧 ckpt 互換のため可変化。
+        # 出力次元: Self=32, Context=128 (hidden_sizeに合わせる)。旧 ckpt 互換のため可変化。
         self.self_out_dim = 32
         self.self_encoder = nn.Sequential(
             nn.Linear(self.self_dim, self.self_out_dim),
             nn.ReLU(),
         )
+        # context_encoder は上記の条件分岐で context_dim が調整されている場合があるため、
+        # ここで統一して定義（重複定義を回避）
         self.context_encoder = nn.Sequential(
             nn.Linear(self.context_dim, self.context_out_dim),
             nn.ReLU(),
@@ -249,10 +248,13 @@ class PolicyValueNet(nn.Module):
         )
         # value_head: ロジット出力 (Sigmoid は呼び出し側で適用 / BCEWithLogitsLoss 用)
         # Value head: single scalar logit per sample (Sigmoid applied by caller when needed)
+        # LayerNormを削除: value_head.0.weightがゼロになる問題を回避
         self.value_head = nn.Sequential(
+            # 1層目: 特徴抽出 & 圧縮
             nn.Linear(h, h),
             nn.ReLU(),
-            nn.Linear(h, 1),
+            # 2層目: スカラー出力 (BCEWithLogitsLoss用ロジット)
+            nn.Linear(h, 1)
         )
         # 追加ヘッド: 相手手札予測（belief）
         self.enable_hand_prediction_head = bool(enable_hand_prediction_head)
@@ -267,7 +269,28 @@ class PolicyValueNet(nn.Module):
             )
         else:
             self.hand_head = None  # type: ignore[assignment]
+        
+        # 重みの明示的な初期化（ゼロ初期化問題の回避）
+        self._initialize_weights()
+        
         self.to(self.device)
+    
+    def _initialize_weights(self):
+        """ネットワークの重みを明示的に初期化する。
+        
+        Xavier/Kaiming初期化を使用してゼロ初期化問題を回避する。
+        """
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                # Kaiming He初期化（ReLU用）
+                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.LayerNorm):
+                if module.weight is not None:
+                    nn.init.constant_(module.weight, 1.0)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
 
     def _encode_state(self, state: Dict[str, Any]):
         # フル特徴必須: full_input か full_compact が無ければ例外
@@ -292,8 +315,12 @@ class PolicyValueNet(nn.Module):
                         else:
                             floats_arr = _np.zeros(0, dtype=_np.float32)
                         state['full_input'] = _np.concatenate([bits_arr, floats_arr])
-                except Exception:
-                    pass
+                except Exception as e:
+                    # full_compactからfull_inputへの変換に失敗した場合は、後続の処理でエラーになる
+                    # 無意味に例外を握り潰さず、適切に処理する
+                    import warnings
+                    warnings.warn(f"Failed to convert full_compact to full_input: {e}", RuntimeWarning)
+                    # full_inputが設定されなかった場合、後続の処理で適切にエラーが発生する
             arr = state.get('full_input')
             if arr is None:
                 arr = []
@@ -565,9 +592,122 @@ class PolicyValueNet(nn.Module):
 
         return policy_logits, v_prob
 
-    def save(self, path: str, *, force_sync: bool = False):
+    def save(self, path: str, *, force_sync: bool = False, logger=None):
+        # 保存前に親ディレクトリを作成（torch.save()が親ディレクトリを自動作成しない場合があるため）
+        try:
+            import os
+            parent_dir = os.path.dirname(path)
+            if parent_dir and not os.path.exists(parent_dir):
+                os.makedirs(parent_dir, exist_ok=True)
+        except Exception as e:
+            # ディレクトリ作成失敗時もログを記録
+            try:
+                if logger:
+                    logger.log_text(f"[save] WARNING: Failed to create parent directory for {path}: {e}")
+            except Exception:
+                pass
+        
+        # state_dict()を取得
+        state_dict = self.state_dict()
+        
+        # 保存前の検証: 重要なパラメータがゼロでないことを確認
+        critical_params = [
+            'self_encoder.0.weight',
+            'context_encoder.0.weight',
+            'backbone_proj.weight',
+            'backbone.0.lin1.weight',
+            'backbone.0.lin2.weight',
+            'policy_head.0.weight',
+            'value_head.0.weight',
+        ]
+        
+        # 保存前の検証: 重要なパラメータがゼロでないことを確認
+        # この検証は保存を中断する可能性があるため、例外処理を慎重に行う
+        zero_params = []
+        validation_error = None
+        
+        try:
+            for key in critical_params:
+                if key in state_dict:
+                    param = state_dict[key]
+                    if hasattr(param, 'abs'):
+                        try:
+                            abs_max = param.abs().max().item()
+                            if abs_max < 1e-8:
+                                zero_params.append(key)
+                        except Exception as e:
+                            # パラメータの検証中にエラーが発生した場合
+                            validation_error = f"Failed to validate parameter {key}: {e}"
+                            if logger:
+                                try:
+                                    logger.log_text(f"[save] WARNING: {validation_error}")
+                                except Exception:
+                                    pass
+                            print(f"[save] WARNING: {validation_error}")
+        except Exception as e:
+            # 検証処理自体でエラーが発生した場合
+            validation_error = f"Parameter validation process failed: {e}"
+            if logger:
+                try:
+                    logger.log_text(f"[save] ERROR: {validation_error}")
+                except Exception:
+                    pass
+            print(f"[save] ERROR: {validation_error}")
+            # 検証に失敗した場合は保存を中断（安全性のため）
+            raise ValueError(f"Cannot save checkpoint due to validation failure: {e}")
+        
+        # ゼロパラメータの処理
+        if zero_params:
+            # 重みパラメータのみをチェック（バイアスはゼロでも問題ない）
+            weight_zero_params = [p for p in zero_params if 'weight' in p]
+            bias_zero_params = [p for p in zero_params if 'bias' in p]
+            
+            if weight_zero_params:
+                # 重みパラメータがゼロの場合は詳細な情報を収集して保存を中断
+                # ゼロパラメータの詳細情報を収集
+                zero_details = []
+                for param_name in weight_zero_params[:10]:  # 最初の10個のみ
+                    if param_name in state_dict:
+                        param = state_dict[param_name]
+                        try:
+                            shape = param.shape if hasattr(param, 'shape') else 'unknown'
+                            abs_max = param.abs().max().item() if hasattr(param, 'abs') else 0.0
+                            abs_mean = param.abs().mean().item() if hasattr(param, 'abs') else 0.0
+                            zero_details.append(f"{param_name}: shape={shape}, max={abs_max:.2e}, mean={abs_mean:.2e}")
+                        except Exception:
+                            zero_details.append(f"{param_name}: (failed to get details)")
+                
+                warning_msg = f"[save] WARNING: Found zero weight parameters before save: {weight_zero_params[:10]}{'...' if len(weight_zero_params) > 10 else ''}"
+                error_msg = f"[save] ERROR: Cannot save checkpoint with zero weight parameters. Checkpoint save aborted."
+                details_msg = f"[save] Zero parameter details:\n" + "\n".join(f"  {d}" for d in zero_details)
+                
+                if logger:
+                    try:
+                        logger.log_text(warning_msg)
+                        logger.log_text(error_msg)
+                        logger.log_text(details_msg)
+                    except Exception:
+                        pass
+                
+                print(warning_msg)
+                print(error_msg)
+                print(details_msg)
+                
+                # 保存を中断（ValueErrorを発生）
+                raise ValueError(
+                    f"Cannot save checkpoint with zero weight parameters: {weight_zero_params[:5]}{'...' if len(weight_zero_params) > 5 else ''}. "
+                    f"This indicates a serious training issue. Please investigate why these parameters became zero."
+                )
+            elif bias_zero_params:
+                # バイアスパラメータのみがゼロの場合は警告のみ（問題ない）
+                if logger:
+                    try:
+                        logger.log_text(f"[save] INFO: Bias parameters are zero (this is normal): {bias_zero_params[:5]}{'...' if len(bias_zero_params) > 5 else ''}")
+                    except Exception:
+                        pass
+        
         ckpt = {
-            "state_dict": self.state_dict(),
+            "state_dict": state_dict,
             "max_policy_size": self.max_policy_size,
             "hidden_size": int(getattr(self, "hidden_size", 256)),
             "num_players": self.num_players,
@@ -614,10 +754,74 @@ class PolicyValueNet(nn.Module):
                     return
             except Exception:
                 pass
-        torch.save(ckpt, path)
+        
+        # torch.save()実行
+        try:
+            torch.save(ckpt, path)
+            
+            # 保存後の検証: 保存されたチェックポイントが正しく読み込めるか確認
+            try:
+                verify_ckpt = torch.load(path, map_location='cpu', weights_only=False)
+                verify_state_dict = verify_ckpt.get('state_dict', verify_ckpt) if 'state_dict' in verify_ckpt else verify_ckpt
+                
+                # 重要なパラメータが保存されているか確認
+                missing_critical = []
+                for key in critical_params:
+                    if key not in verify_state_dict:
+                        missing_critical.append(key)
+                
+                if missing_critical:
+                    warning_msg = f"[save] WARNING: Critical parameters missing in saved checkpoint: {missing_critical[:5]}{'...' if len(missing_critical) > 5 else ''}"
+                    if logger:
+                        try:
+                            logger.log_text(warning_msg)
+                        except Exception:
+                            pass
+                    print(warning_msg)
+                else:
+                    # 値が正しく保存されているか確認（最初の数個のパラメータのみ）
+                    verify_ok = True
+                    for key in critical_params[:3]:  # 最初の3つだけ確認
+                        if key in state_dict and key in verify_state_dict:
+                            orig = state_dict[key]
+                            saved = verify_state_dict[key]
+                            if hasattr(orig, 'abs') and hasattr(saved, 'abs'):
+                                orig_max = orig.abs().max().item()
+                                saved_max = saved.abs().max().item()
+                                if abs(orig_max - saved_max) > 1e-6:
+                                    verify_ok = False
+                                    break
+                    
+                    if verify_ok and logger:
+                        try:
+                            logger.log_text(f"[save] Checkpoint saved and verified successfully: {path}")
+                        except Exception:
+                            pass
+            except Exception as verify_e:
+                # 検証エラーは保存を失敗としない（警告のみ）
+                warning_msg = f"[save] WARNING: Checkpoint verification failed: {verify_e}"
+                if logger:
+                    try:
+                        logger.log_text(warning_msg)
+                    except Exception:
+                        pass
+                print(warning_msg)
+                
+        except Exception as e:
+            error_msg = f"[save] ERROR: Exception during torch.save(): {e}"
+            if logger:
+                try:
+                    logger.log_text(error_msg)
+                except Exception:
+                    pass
+            print(error_msg)
+            import traceback
+            traceback.print_exc()
+            raise  # 例外を再発生させる
 
     @staticmethod
     def load(path: str, map_location: Optional[str] = None) -> "PolicyValueNet":
+        """チェックポイントをロード（古いフォーマット対応、strict=False）"""
         try:
             ckpt = torch.load(path, map_location=map_location or "cpu", weights_only=True)
         except TypeError:
@@ -634,7 +838,16 @@ class PolicyValueNet(nn.Module):
                 )
                 ckpt = torch.load(path, map_location=map_location or "cpu", weights_only=False)
 
-        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        # ckptの内容を安全に取得（Tensorの真偽値判定を回避）
+        is_dict = isinstance(ckpt, dict)
+        has_state_dict = False
+        if is_dict:
+            try:
+                has_state_dict = "state_dict" in ckpt
+            except Exception:
+                has_state_dict = False
+        
+        if is_dict and has_state_dict:
             state_dict = ckpt["state_dict"]
             max_policy_size = ckpt.get("max_policy_size", 128)
             hidden_size = ckpt.get("hidden_size", 128)
@@ -671,13 +884,25 @@ class PolicyValueNet(nn.Module):
             context_out_dim = 32
             self_out_dim = 32
 
+        # Signal Augmentationを無効化（勾配爆発対策）
         model = PolicyValueNet(max_policy_size=max_policy_size,
                                hidden_size=hidden_size,
                                num_players=num_players,
                                use_full_features=True,
                                full_feature_dim=int(full_dim),
                                enable_hand_prediction_head=ckpt.get("has_hand_head", False),
-                               context_out_dim=int(context_out_dim))
+                               context_out_dim=int(context_out_dim),
+                               signal_noise_std=0.0)  # 常に無効化
+        
+        # hidden_sizeの不一致を検出して警告
+        try:
+            from agents.config import ALPHA_ZERO_CONFIG
+            config_hidden_size = ALPHA_ZERO_CONFIG.get("hidden_size", hidden_size)
+            if hidden_size != config_hidden_size:
+                print(f"[load] WARNING: Checkpoint hidden_size ({hidden_size}) differs from config hidden_size ({config_hidden_size}). "
+                      f"This may cause shape mismatches when loading parameters (strict=False).")
+        except Exception:
+            pass  # configの読み込みに失敗しても続行
         # 旧 ckpt の単層 policy_head (policy_head.weight) を MLP 最終層へ移植
         try:
             if ("policy_head.weight" in state_dict and "policy_head.2.weight" in model.state_dict()):
@@ -690,23 +915,179 @@ class PolicyValueNet(nn.Module):
                         state_dict["policy_head.2.bias"] = b_old
         except Exception:
             pass
+        def _convert_legacy_value_head(sd, ms):
+            """Convert old LayerNorm付き value_head to current 2-layer MLP safely.
+
+            実際に旧形式の構造が検出された場合のみキーを書き換える。誤検知による
+            正常キー削除を防ぐため、以下を満たすときだけ変換する:
+              - モデルが現行の value_head.2.* を持つ
+              - チェックポイントが LayerNorm 付き旧構造を示唆する
+                (value_head.1.* が LayerNorm 用に存在する、もしくは value_head.3.weight のみ存在し
+                 value_head.2.weight が欠落している)
+            戻り値: 変換を実行した場合 True
+            """
+            has_layernorm = ('value_head.1.weight' in sd) or ('value_head.1.bias' in sd)
+            has_old_final = 'value_head.3.weight' in sd
+            missing_new_final = 'value_head.2.weight' not in sd
+            model_wants_new = 'value_head.2.weight' in ms  # 現行構造
+
+            if not model_wants_new:
+                return False  # 現行モデルでなければ何もしない
+
+            # 旧構造と判定できる場合のみ変換を実施
+            if not (has_layernorm or (has_old_final and missing_new_final)):
+                return False
+
+            old_w = sd.get('value_head.3.weight')
+            old_b = sd.get('value_head.3.bias')
+            if old_w is None:
+                return False
+
+            import torch as _t
+            ow = _t.as_tensor(old_w) if not isinstance(old_w, _t.Tensor) else old_w
+            target_shape = tuple(ms['value_head.2.weight'].shape)
+
+            if ow.shape == target_shape:
+                sd['value_head.2.weight'] = ow.cpu().numpy() if not isinstance(old_w, _t.Tensor) else ow
+                if old_b is not None and 'value_head.2.bias' in ms:
+                    ob = _t.as_tensor(old_b) if not isinstance(old_b, _t.Tensor) else old_b
+                    if ob.shape == tuple(ms['value_head.2.bias'].shape):
+                        sd['value_head.2.bias'] = ob.cpu().numpy() if not isinstance(old_b, _t.Tensor) else ob
+            elif ow.dim() == 2 and target_shape[0] == 1:
+                # 旧: 複数出力 → 新: 単一出力の平均化
+                nw = ow.mean(dim=0, keepdim=True)
+                sd['value_head.2.weight'] = nw.cpu().numpy() if not isinstance(old_w, _t.Tensor) else nw
+                if old_b is not None and 'value_head.2.bias' in ms:
+                    ob = _t.as_tensor(old_b) if not isinstance(old_b, _t.Tensor) else old_b
+                    nb = _t.tensor([float(ob.mean())], dtype=ob.dtype)
+                    sd['value_head.2.bias'] = nb.cpu().numpy() if not isinstance(old_b, _t.Tensor) else nb
+            else:
+                return False  # 形状不一致で変換不可
+
+            # 旧 LayerNorm / 旧最終層のキーを安全に削除
+            for k in ['value_head.3.weight', 'value_head.3.bias', 'value_head.1.weight', 'value_head.1.bias']:
+                if k in sd:
+                    del sd[k]
+            return True
+
+        def _reinit_critical_if_zero(m: nn.Module):
+            """Re-init critical layers if they ended up all-zero after load."""
+            critical_params = [
+                'self_encoder.0.weight',
+                'context_encoder.0.weight',
+                'backbone_proj.weight',
+                'backbone.0.lin1.weight',
+                'policy_head.0.weight',
+                'value_head.0.weight',
+            ]
+            zero_params = []
+            loaded_state_dict = m.state_dict()
+            for key in critical_params:
+                if key in loaded_state_dict:
+                    param = loaded_state_dict[key]
+                    if hasattr(param, 'abs'):
+                        abs_max = param.abs().max().item()
+                        if abs_max < 1e-8:
+                            zero_params.append(key)
+
+            def _reinit_linear(layer: nn.Linear, nonlinearity: str = 'relu'):
+                if hasattr(layer, 'weight') and layer.weight is not None:
+                    init.kaiming_uniform_(layer.weight, a=0, mode='fan_in', nonlinearity=nonlinearity)
+                if hasattr(layer, 'bias') and layer.bias is not None:
+                    fan_in, _ = init._calculate_fan_in_and_fan_out(layer.weight)
+                    bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                    init.uniform_(layer.bias, -bound, bound)
+
+            if 'value_head.0.weight' in zero_params:
+                try:
+                    _reinit_linear(m.value_head[0], nonlinearity='relu')
+                    print(f"[load] INFO: Re-initialized value_head.0.weight (was zero)")
+                    zero_params.remove('value_head.0.weight')
+                except Exception as reinit_e:
+                    print(f"[load] WARNING: Failed to re-initialize value_head.0.weight: {reinit_e}")
+            if 'policy_head.0.weight' in zero_params:
+                try:
+                    _reinit_linear(m.policy_head[0], nonlinearity='relu')
+                    print(f"[load] INFO: Re-initialized policy_head.0.weight (was zero)")
+                    zero_params.remove('policy_head.0.weight')
+                except Exception as reinit_e:
+                    print(f"[load] WARNING: Failed to re-initialize policy_head.0.weight: {reinit_e}")
+            if 'backbone_proj.weight' in zero_params:
+                try:
+                    _reinit_linear(m.backbone_proj, nonlinearity='relu')
+                    print(f"[load] INFO: Re-initialized backbone_proj.weight (was zero)")
+                    zero_params.remove('backbone_proj.weight')
+                except Exception as reinit_e:
+                    print(f"[load] WARNING: Failed to re-initialize backbone_proj.weight: {reinit_e}")
+            if zero_params:
+                warning_msg = f"[load] WARNING: Found zero parameters after load: {zero_params[:5]}{'...' if len(zero_params) > 5 else ''}"
+                print(warning_msg)
+
         try:
-            model.load_state_dict(state_dict, strict=True)  # 追加ヘッド後互換
+            ms = model.state_dict()
+            # value_head構造の互換性処理（旧LayerNorm付き ckpt → 現行2層MLP）
+            _convert_legacy_value_head(state_dict, ms)
+
+            # strict=False で互換性のあるパラメータのみロード（古いチェックポイント対応）
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+            
+            # 形状不一致によるスキップを検出
+            shape_mismatch_keys = []
+            if missing_keys:
+                # missing_keysに含まれるパラメータが、state_dictには存在するが形状が異なる可能性がある
+                for key in missing_keys:
+                    if key in state_dict:
+                        ckpt_shape = state_dict[key].shape if hasattr(state_dict[key], 'shape') else None
+                        model_shape = model.state_dict().get(key)
+                        if model_shape is not None and hasattr(model_shape, 'shape'):
+                            model_shape = model_shape.shape
+                            if ckpt_shape != model_shape:
+                                shape_mismatch_keys.append((key, ckpt_shape, model_shape))
+            
+            if shape_mismatch_keys:
+                print(f"[load] WARNING: Shape mismatches detected (parameters skipped due to strict=False):")
+                for key, ckpt_shape, model_shape in shape_mismatch_keys[:10]:
+                    print(f"  {key}: checkpoint {ckpt_shape} vs model {model_shape}")
+                if len(shape_mismatch_keys) > 10:
+                    print(f"  ... and {len(shape_mismatch_keys) - 10} more")
+            
+            if missing_keys or unexpected_keys:
+                # デバッグ用に警告を出すが、エラーにはしない
+                if missing_keys:
+                    # 形状不一致でないmissing_keysのみ表示
+                    non_shape_mismatch = [k for k in missing_keys if k not in [item[0] for item in shape_mismatch_keys]]
+                    if non_shape_mismatch:
+                        print(f"[INFO] Missing keys when loading checkpoint: {non_shape_mismatch[:5]}{'...' if len(non_shape_mismatch) > 5 else ''}")
+                if unexpected_keys:
+                    print(f"[INFO] Unexpected keys when loading checkpoint: {unexpected_keys[:5]}{'...' if len(unexpected_keys) > 5 else ''}")
+            
+            # ロード後の検証: 重要パラメータのゼロ埋まりを検出し再初期化
+            try:
+                _reinit_critical_if_zero(model)
+            except Exception as verify_e:
+                # 検証エラーはロードを失敗としない（警告のみ）
+                print(f"[load] WARNING: Load verification failed: {verify_e}")
         except TypeError:
+            # 古いPyTorchでstrict引数がない場合
             model.load_state_dict(state_dict)
-        except RuntimeError:
+        except RuntimeError as e:
             # Handle potential shape mismatch for value_head when migrating from
             # multi-player value outputs to single-scalar output.
             try:
                 sd = state_dict
                 ms = model.state_dict()
-                # possible keys for final linear: 'value_head.2.weight'/'value_head.weight'
-                old_w = sd.get('value_head.2.weight', None) or sd.get('value_head.weight', None)
-                old_b = sd.get('value_head.2.bias', None) or sd.get('value_head.bias', None)
-                # pick target keys present in model
+                # possible keys for final linear in checkpoint: 'value_head.2.weight'/'value_head.3.weight'/'value_head.weight'
+                # 現在のモデル構造: value_head.0 (Linear), value_head.1 (ReLU), value_head.2 (Linear)
+                # 古いチェックポイント（LayerNormあり）: value_head.0 (Linear), value_head.1 (LayerNorm), value_head.2 (ReLU), value_head.3 (Linear)
+                old_w = sd.get('value_head.3.weight', None) or sd.get('value_head.2.weight', None) or sd.get('value_head.weight', None)
+                old_b = sd.get('value_head.3.bias', None) or sd.get('value_head.2.bias', None) or sd.get('value_head.bias', None)
+                # pick target keys present in model (現在の構造では value_head.2 が最終層)
                 if 'value_head.2.weight' in ms:
                     new_w_key = 'value_head.2.weight'
                     new_b_key = 'value_head.2.bias'
+                elif 'value_head.3.weight' in ms:
+                    new_w_key = 'value_head.3.weight'
+                    new_b_key = 'value_head.3.bias'
                 else:
                     new_w_key = 'value_head.weight'
                     new_b_key = 'value_head.bias'
@@ -722,6 +1103,13 @@ class PolicyValueNet(nn.Module):
                             ob = _t.as_tensor(old_b) if not isinstance(old_b, _t.Tensor) else old_b
                             nb = _t.tensor([float(ob.mean())], dtype=ob.dtype)
                             sd[new_b_key] = nb.cpu().numpy() if not isinstance(old_b, _t.Tensor) else nb
+                    # 形状が一致する場合はそのままコピー
+                    elif ow.shape == target_shape:
+                        sd[new_w_key] = ow.cpu().numpy() if not isinstance(old_w, _t.Tensor) else ow
+                        if old_b is not None and new_b_key in ms:
+                            ob = _t.as_tensor(old_b) if not isinstance(old_b, _t.Tensor) else old_b
+                            if ob.shape == tuple(ms[new_b_key].shape):
+                                sd[new_b_key] = ob.cpu().numpy() if not isinstance(old_b, _t.Tensor) else ob
                 # try load again permissively
                 try:
                     model.load_state_dict(sd, strict=False)
@@ -730,6 +1118,23 @@ class PolicyValueNet(nn.Module):
             except Exception:
                 # fallback: re-raise original
                 raise
+        # どのロード経路でも最後にゼロチェックと再初期化を実行
+        try:
+            _reinit_critical_if_zero(model)
+        except Exception as verify_e:
+            print(f"[load] WARNING: Post-load verification failed: {verify_e}")
+        # Signal Augmentationを確実に無効化（既存チェックポイントからロードした場合でも）
+        # load_state_dict()後でも、signal_augmentationモジュールのstdを0.0に設定
+        if hasattr(model, 'signal_augmentation') and model.signal_augmentation is not None:
+            model.signal_augmentation.std = 0.0
+            model.signal_noise_std = 0.0
+            # ResBlock内のaugmentationも無効化（すべて同じインスタンスを参照しているが念のため）
+            if hasattr(model, 'backbone'):
+                for block in model.backbone:
+                    if hasattr(block, 'aug') and block.aug is not None:
+                        if hasattr(block.aug, 'std'):
+                            block.aug.std = 0.0
+        
         # map_location を指定していた場合はモデル本体をそのデバイスへ移動し device 属性を同期
         if map_location:
             try:

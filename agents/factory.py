@@ -39,7 +39,10 @@ def _load_or_build_model(config: Dict[str, Any], *, device: str, model_path: Opt
             model = PolicyValueNet.load(model_path, map_location=device)
             loaded = True
             return model, loaded
-        except Exception:
+        except Exception as e:
+            # 古いチェックポイント互換性エラーを詳細にログ
+            print(f"[WARN] Failed to load checkpoint '{model_path}': {e}")
+            print(f"[INFO] Falling back to new model creation")
             # フォールバックで新規作成へ
             pass
     # 新規作成
@@ -60,14 +63,18 @@ def _load_or_build_model(config: Dict[str, Any], *, device: str, model_path: Opt
             use_full_features=True,
             # 初期は新仕様に合わせた次元、後でプローブで再構築（必要なら）
             full_feature_dim=default_full_dim,
+            context_out_dim=config.get("hidden_size", 128),  # hidden_sizeに合わせる（過学習防止）
+            signal_noise_std=0.0,  # Signal Augmentationを無効化（勾配爆発対策）
         )
     else:
+        # use_full_features=False は廃止されているが、互換性のため残している
         model = PolicyValueNet(
             max_policy_size=config.get("max_policy_size", 128),
             hidden_size=config.get("hidden_size", 128),
             num_players=config.get("num_players", 4),
             device=device,
             use_full_features=False,
+            signal_noise_std=0.0,  # Signal Augmentationを無効化（勾配爆発対策）
         )
     return model, loaded
 
@@ -96,6 +103,11 @@ def _attach_agent_context(
         if context == "main":
             if shared_replay is not None:
                 ag.replay_buffer = shared_replay
+                # non_parallel_trainer では常に shared_replay を渡すため、_use_shared を True に設定
+                try:
+                    ag._use_shared = True
+                except Exception:
+                    pass
         else:
             # worker: 共有RBは使わずローカル保持（ゼロバッファ運用が有効なら None）
             try:
@@ -145,7 +157,94 @@ def _maybe_rebuild_full_model(config: Dict[str, Any], model: PolicyValueNet, age
                 device=device_str,
                 use_full_features=True,
                 full_feature_dim=int(full_dim_i),
+                context_out_dim=config.get("hidden_size", 128),  # hidden_sizeに合わせる（過学習防止）
+                signal_noise_std=0.0,  # Signal Augmentationを無効化（勾配爆発対策）
             )
+            
+            # 古いモデルのパラメータを可能な限りコピー
+            try:
+                old_state_dict = model.state_dict()
+                new_state_dict = new_model.state_dict()
+                # キーが一致するパラメータをコピー
+                copied_count = 0
+                skipped_count = 0
+                zero_params_after_copy = []
+                
+                for key in new_state_dict.keys():
+                    if key in old_state_dict:
+                        old_param = old_state_dict[key]
+                        new_param = new_state_dict[key]
+                        # 形状が一致する場合のみコピー
+                        if old_param.shape == new_param.shape:
+                            # デバイスを統一（CPUに移動してからコピー）
+                            if old_param.device != new_param.device:
+                                old_param = old_param.cpu()
+                            new_state_dict[key] = old_param.clone() if hasattr(old_param, 'clone') else old_param
+                            copied_count += 1
+                        else:
+                            skipped_count += 1
+                
+                # load_state_dictを実行
+                missing_keys, unexpected_keys = new_model.load_state_dict(new_state_dict, strict=False)
+                
+                # コピー後のパラメータを検証（重要なパラメータがゼロでないことを確認）
+                critical_params = [
+                    'self_encoder.0.weight',
+                    'context_encoder.0.weight',
+                    'backbone_proj.weight',
+                    'backbone.0.lin1.weight',
+                    'backbone.0.lin2.weight',
+                    'policy_head.0.weight',
+                    'value_head.0.weight',
+                ]
+                
+                for key in critical_params:
+                    if key in new_model.state_dict():
+                        param = new_model.state_dict()[key]
+                        if hasattr(param, 'abs'):
+                            abs_max = param.abs().max().item()
+                            if abs_max < 1e-8:
+                                zero_params_after_copy.append(key)
+                
+                if zero_params_after_copy:
+                    print(f"[WARN] _maybe_rebuild_full_model: After parameter copy, zero parameters found: {zero_params_after_copy}")
+                    # ゼロパラメータが見つかった場合、元のパラメータを再確認
+                    for key in zero_params_after_copy:
+                        if key in old_state_dict:
+                            old_abs_max = old_state_dict[key].abs().max().item()
+                            print(f"  [INFO] Original {key}: max={old_abs_max:.6f}")
+                            if old_abs_max > 1e-8:
+                                # 元のパラメータは正常なので、再コピーを試みる
+                                try:
+                                    old_param = old_state_dict[key]
+                                    target_param = new_model.state_dict()[key]
+                                    # デバイスを統一
+                                    if old_param.device != target_param.device:
+                                        old_param = old_param.to(target_param.device)
+                                    # copy_を使用して確実にコピー
+                                    import torch
+                                    with torch.no_grad():
+                                        target_param.copy_(old_param)
+                                    # コピー後の検証
+                                    copied_abs_max = target_param.abs().max().item()
+                                    if copied_abs_max > 1e-8:
+                                        print(f"  [INFO] Re-copied {key} successfully (max={copied_abs_max:.6f})")
+                                    else:
+                                        print(f"  [ERROR] Re-copy failed: {key} is still zero after copy_")
+                                except Exception as re_copy_e:
+                                    print(f"  [ERROR] Failed to re-copy {key}: {re_copy_e}")
+                                    import traceback
+                                    traceback.print_exc()
+                
+                # デバッグ用: コピーされたパラメータ数をログ出力（オプション）
+                if config.get("debug_model_rebuild", False):
+                    print(f"[factory] _maybe_rebuild_full_model: copied {copied_count}/{len(new_state_dict)} parameters from old model (skipped {skipped_count} due to shape mismatch)")
+            except Exception as e:
+                # パラメータコピーに失敗した場合は警告のみ（初期化済みモデルで継続）
+                print(f"[WARN] Failed to copy parameters from old model to new model during rebuild: {e}")
+                import traceback
+                traceback.print_exc()
+            
             for ag in agents:
                 try:
                     ag.set_model(new_model)
@@ -223,7 +322,32 @@ def create_env_and_agents(
                 pass
     except Exception:
         pass
-    return AgentEnvBundle(model=model, agents=agents, env=env, device=device, loaded_from_checkpoint=loaded)
+    # bundle.modelとlearner.modelが同じインスタンスであることを保証
+    # _maybe_rebuild_full_modelで新しいモデルが作成された場合、各エージェントのモデルは更新されているが、
+    # bundle.modelも同じインスタンスを参照するようにする
+    bundle = AgentEnvBundle(model=model, agents=agents, env=env, device=device, loaded_from_checkpoint=loaded)
+    # 念のため、学習プレイヤーのモデルとbundle.modelが同じインスタンスであることを確認
+    learning_player_id = config.get('learning_player_id', 0)
+    if learning_player_id < len(agents):
+        learner = agents[learning_player_id]
+        if id(learner.model) != id(bundle.model):
+            # 学習プレイヤーのモデルとbundle.modelが異なる場合は、bundle.modelを更新
+            import warnings
+            warnings.warn(
+                f"[factory] bundle.model and learner.model are different instances. "
+                f"Updating bundle.model to match learner.model. "
+                f"bundle.model ID: {id(bundle.model)}, learner.model ID: {id(learner.model)}",
+                RuntimeWarning
+            )
+            # bundle.modelを学習プレイヤーのモデルに更新（dataclassのため直接代入できないので、新しいBundleを作成）
+            bundle = AgentEnvBundle(
+                model=learner.model,
+                agents=agents,
+                env=env,
+                device=device,
+                loaded_from_checkpoint=loaded
+            )
+    return bundle
 
 
 __all__ = [

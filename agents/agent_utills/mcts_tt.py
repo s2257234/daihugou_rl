@@ -355,7 +355,6 @@ def build_single_determinization(agent: Any, e_clone: Any, original_env: Any, ro
             guided_used = False
             if guided_enable and attempt == 0:
                 try:
-                    _r.shuffle(unknown)
                     capacities = {i: len(g_new.players[i].hand) for i in opp_ids}
                     assignment_hands = {i: [] for i in opp_ids}
                     from game.card import Card
@@ -375,7 +374,40 @@ def build_single_determinization(agent: Any, e_clone: Any, original_env: Any, ro
                         except Exception:
                             return 52
 
+                    # Step A (確定枠): 高確率カードを確率順にソートして割り当て
+                    threshold = float(agent.config.get('hand_pred_deterministic_threshold', 0.95))
+                    candidate_list = []  # [(card_id, player_id, probability), ...]
+                    
                     for cid in unknown:
+                        idx = _card_index_from_str(cid)
+                        for pid_ in opp_ids:
+                            p_val = 0.0
+                            try:
+                                p_list = hand_card_probs.get(pid_, None)
+                                if p_list and 0 <= idx < len(p_list):
+                                    p_val = float(p_list[idx])
+                            except (KeyError, IndexError, TypeError, ValueError):
+                                p_val = 0.0
+                            if p_val > 0.0:
+                                candidate_list.append((cid, pid_, p_val))
+                    
+                    # 確率の降順でソート（高い確率から順に割り当て）
+                    candidate_list.sort(key=lambda x: x[2], reverse=True)
+                    
+                    # Step A: 高確率カードを確定割り当て
+                    deterministic_cards = set()
+                    for cid, pid_, prob in candidate_list:
+                        if prob >= threshold and cid not in deterministic_cards:
+                            if capacities.get(pid_, 0) > 0:
+                                assignment_hands[pid_].append(cid)
+                                capacities[pid_] -= 1
+                                deterministic_cards.add(cid)
+                    
+                    # Step B (抽選枠): 残りのカードを確率分布に従って抽選
+                    remaining_unknown = [cid for cid in unknown if cid not in deterministic_cards]
+                    _r.shuffle(remaining_unknown)
+                    
+                    for cid in remaining_unknown:
                         remaining_opps = [i for i in opp_ids if capacities[i] > 0]
                         if not remaining_opps:
                             break
@@ -388,14 +420,16 @@ def build_single_determinization(agent: Any, e_clone: Any, original_env: Any, ro
                                 p_list = hand_card_probs.get(pid_, None)
                                 if p_list and 0 <= idx < len(p_list):
                                     p_val = float(p_list[idx])
-                            except Exception:
+                            except (KeyError, IndexError, TypeError, ValueError):
                                 p_val = 0.0
                             probs_raw.append(p_val)
                             total += p_val
+                        
                         if total <= 1e-12:
                             probs_norm = [1.0 / len(remaining_opps)] * len(remaining_opps)
                         else:
                             probs_norm = [p / total for p in probs_raw]
+                        
                         r = _r.random()
                         cum = 0.0
                         chosen = remaining_opps[-1]
@@ -407,6 +441,7 @@ def build_single_determinization(agent: Any, e_clone: Any, original_env: Any, ro
                         assignment_hands[chosen].append(cid)
                         capacities[chosen] -= 1
 
+                    # 未割り当てカードがあれば均等に配分
                     leftover_unknown = [cid for cid in unknown if all(cid not in v for v in assignment_hands.values())]
                     if leftover_unknown:
                         for cid in leftover_unknown:
@@ -417,19 +452,26 @@ def build_single_determinization(agent: Any, e_clone: Any, original_env: Any, ro
                             assignment_hands[choice].append(cid)
                             capacities[choice] -= 1
 
+                    # 割り当て結果の検証（枚数一致チェック）
                     mismatch = False
                     for i in opp_ids:
                         if len(assignment_hands[i]) != len(g_new.players[i].hand):
                             mismatch = True
                             break
+                    
                     if not mismatch:
                         guided_used = True
-                        try:
+                        if hasattr(agent, '_det_stats'):
                             agent._det_stats['guided_assignments'] = agent._det_stats.get('guided_assignments', 0) + 1
-                        except Exception:
-                            pass
-                except Exception:
+                except (KeyError, IndexError, TypeError, ValueError, AttributeError) as e:
+                    # 想定される例外のみ捕捉（デバッグ情報付き）
                     guided_used = False
+                    if hasattr(agent, '_det_stats'):
+                        agent._det_stats['guided_failures'] = agent._det_stats.get('guided_failures', 0) + 1
+                except Exception as e:
+                    # 予期しない例外は再スローして問題を可視化
+                    guided_used = False
+                    raise
 
             if not guided_used:
                 _r.shuffle(unknown)

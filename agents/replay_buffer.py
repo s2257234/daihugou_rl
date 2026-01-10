@@ -882,6 +882,8 @@ class ReplayBuffer:
         self._next_id = 0
         # prioritized replay support: uid -> priority (float)
         self._priorities: Dict[int, float] = {}
+        # cache current maximum priority to avoid O(n) scans during extend/append
+        self._max_priority: float = 1.0
         self.maxlen = maxlen
         self.default_path = path
         self._lock = threading.RLock()
@@ -1052,6 +1054,19 @@ class ReplayBuffer:
                         evicted["in_buffer"] = False
                     except Exception:
                         pass
+                    # remove evicted priority to keep dict bounded
+                    try:
+                        ev_uid = evicted.get('uid')
+                        if ev_uid is not None and ev_uid in self._priorities:
+                            ev_p = self._priorities.pop(ev_uid)
+                            if ev_p == self._max_priority:
+                                # recompute max only when necessary
+                                try:
+                                    self._max_priority = max(self._priorities.values()) if self._priorities else 1.0
+                                except Exception:
+                                    self._max_priority = 1.0
+                    except Exception:
+                        pass
             sample["uid"] = self._next_id
             self._next_id += 1
             # initialize priority: if provided use it, else use max existing or 1.0
@@ -1059,12 +1074,14 @@ class ReplayBuffer:
                 if 'priority' in sample and isinstance(sample['priority'], (int, float)):
                     p = float(sample['priority'])
                 else:
-                    p = max(self._priorities.values()) if self._priorities else 1.0
+                    p = self._max_priority
             except Exception:
                 p = 1.0
             sample['priority'] = float(p)
             try:
                 self._priorities[sample['uid']] = float(p)
+                if p > self._max_priority:
+                    self._max_priority = float(p)
             except Exception:
                 pass
             sample["in_buffer"] = True
@@ -1083,31 +1100,36 @@ class ReplayBuffer:
 
         Returns list of assigned uids (same order as input). This minimizes
         Python-level call overhead compared to calling `append` repeatedly.
+        Optimized for large batches: prealloc init once, batch float16 conversion.
         """
         if not isinstance(samples, (list, tuple)):
             return []
+        if not samples:
+            return []
+        
+        # Filter valid samples
+        valid_samples = [s for s in samples if isinstance(s, dict)]
+        if not valid_samples:
+            return []
+        
         assigned = []
         to_add = []
         with self._lock:
-            # 最適化: _prioritiesが空の場合は1.0を使用（rebuild_replayでclear後は常に空）
-            # 空でない場合のみ最大値を計算（一度だけ、ループ外で）
-            default_priority = 1.0
-            if self._priorities:
-                default_priority = max(self._priorities.values())
-            
-            # lazy prealloc init may depend on first samples; call per-sample but under single lock
-            # 最適化: 最初のサンプルでのみ初期化を試行（既に初期化済みなら早期リターン）
-            first_sample_init_done = False
-            for sample in samples:
-                if not isinstance(sample, dict):
-                    continue
+            # Initialize prealloc once with first sample if needed
+            prealloc_initialized = False
+            if not self._prealloc_active and valid_samples:
                 try:
-                    if not first_sample_init_done:
-                        self._maybe_init_prealloc(sample)
-                        first_sample_init_done = True
+                    self._maybe_init_prealloc(valid_samples[0])
+                    prealloc_initialized = True
                 except Exception:
                     pass
-                # prepare sample metadata
+            
+            prealloc_dim = self._prealloc_dim
+            prealloc_active = self._prealloc_active
+            
+            # Prepare sample metadata and store into prealloc
+            for idx, sample in enumerate(valid_samples):
+                # Evict if needed
                 if len(self._data) == self.maxlen:
                     evicted = self._data.popleft()
                     if isinstance(evicted, dict):
@@ -1115,44 +1137,94 @@ class ReplayBuffer:
                             evicted["in_buffer"] = False
                         except Exception:
                             pass
+                        # remove evicted priority to keep dict bounded
+                        try:
+                            ev_uid = evicted.get('uid')
+                            if ev_uid is not None and ev_uid in self._priorities:
+                                ev_p = self._priorities.pop(ev_uid)
+                                if ev_p == self._max_priority:
+                                    try:
+                                        self._max_priority = max(self._priorities.values()) if self._priorities else 1.0
+                                    except Exception:
+                                        self._max_priority = 1.0
+                        except Exception:
+                            pass
+                
+                # Assign UID
                 sample["uid"] = self._next_id
                 self._next_id += 1
-                # priority - 最適化: 事前計算したdefault_priorityを使用（max()を毎回呼ばない）
+                
+                # Priority
                 try:
                     if 'priority' in sample and isinstance(sample['priority'], (int, float)):
                         p = float(sample['priority'])
                     else:
-                        p = default_priority  # 変更: max()を毎回呼ばない
+                        p = self._max_priority
                 except Exception:
-                    p = default_priority
+                    p = 1.0
                 sample['priority'] = float(p)
                 try:
                     self._priorities[sample['uid']] = float(p)
+                    if p > self._max_priority:
+                        self._max_priority = float(p)
                 except Exception:
                     pass
+                
                 sample['in_buffer'] = True
                 try:
                     self._normalize_value_fields(sample)
                 except Exception:
                     pass
-                # prealloc store
-                try:
-                    if self._prealloc_active:
-                        self._store_into_prealloc(sample)
-                except Exception:
-                    pass
+                
+                # Optimized prealloc store: batch float16 conversion
+                if prealloc_active and prealloc_dim is not None:
+                    try:
+                        slot = self._prealloc_write_pos
+                        self._prealloc_write_pos = (self._prealloc_write_pos + 1) % self.maxlen
+                        st = sample.get('state') or {}
+                        fi = st.get('full_input')
+                        
+                        if fi is not None:
+                            fi = self._tensor_to_numpy(fi)
+                            if isinstance(fi, _np.ndarray) and fi.ndim == 1 and fi.shape[0] == prealloc_dim:
+                                # Direct assignment with type check (avoid redundant conversion)
+                                if fi.dtype == _np.float16:
+                                    self._full_input_arr[slot] = fi[:prealloc_dim]
+                                else:
+                                    # Convert once and assign
+                                    self._full_input_arr[slot] = fi.astype(_np.float16, copy=False)[:prealloc_dim]
+                                self._full_input_occupancy[slot] = True
+                                st['full_input'] = None
+                                st['full_input_slot'] = slot
+                                st['full_input_dim'] = prealloc_dim
+                                st['full_input_dtype'] = 'float16'
+                        
+                        # pi_q handling
+                        pi_q = sample.get('pi_q')
+                        if isinstance(pi_q, _np.ndarray):
+                            self._pi_q_slots[slot] = pi_q.astype(pi_q.dtype, copy=True)
+                            sample['pi_q_slot'] = slot
+                    except Exception:
+                        # Fallback to original method on error
+                        try:
+                            self._store_into_prealloc(sample)
+                        except Exception:
+                            pass
+                
                 to_add.append(sample)
                 assigned.append(sample['uid'])
-            # bulk extend
+            
+            # Bulk extend
             try:
                 self._data.extend(to_add)
             except Exception:
-                # fallback to per-item append
+                # Fallback to per-item append
                 for s in to_add:
                     try:
                         self._data.append(s)
                     except Exception:
                         pass
+        
         return assigned
 
     # ---------------- Async Append ----------------
@@ -1713,6 +1785,11 @@ class ReplayBuffer:
                     except Exception:
                         pass
             self._data.clear()
+            try:
+                self._priorities.clear()
+                self._max_priority = 1.0
+            except Exception:
+                pass
             # Free preallocated contiguous storage to release RAM
             try:
                 self._prealloc_active = False
@@ -1744,6 +1821,14 @@ class ReplayBuffer:
                     if isinstance(ev, dict):
                         try:
                             ev["in_buffer"] = False
+                        except Exception:
+                            pass
+                        try:
+                            ev_uid = ev.get('uid')
+                            if ev_uid is not None and ev_uid in self._priorities:
+                                ev_p = self._priorities.pop(ev_uid)
+                                if ev_p == self._max_priority:
+                                    self._max_priority = max(self._priorities.values()) if self._priorities else 1.0
                         except Exception:
                             pass
                     removed += 1
@@ -2175,6 +2260,12 @@ class ReplayBuffer:
                                 v_float = None
                             if v_float is not None:
                                 s['value'] = v_float
+                    # restore priority if present
+                    try:
+                        if 'priority' in s:
+                            rb._priorities[int(s['uid'])] = float(s.get('priority', 1.0) or 1.0)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 rb._data.append(s)
@@ -2183,12 +2274,20 @@ class ReplayBuffer:
                 rb._next_id = max(rb._next_id, nxt)
             except Exception:
                 pass
+            try:
+                rb._max_priority = max(rb._priorities.values()) if rb._priorities else 1.0
+            except Exception:
+                rb._max_priority = 1.0
             return rb
         # Legacy list/dict format
         data_list = obj.get("data")
         if data_list is None and isinstance(obj, list):
             data_list = obj
         if not data_list:
+            try:
+                rb._max_priority = 1.0
+            except Exception:
+                pass
             return rb
         for s in data_list:
             if "uid" not in s:
@@ -2205,6 +2304,10 @@ class ReplayBuffer:
             except Exception:
                 pass
             rb._data.append(s)
+        try:
+            rb._max_priority = max(rb._priorities.values()) if rb._priorities else 1.0
+        except Exception:
+            rb._max_priority = 1.0
         return rb
 
     def update_priorities(self, uid_to_priority: Dict[int, float]):
@@ -2227,6 +2330,10 @@ class ReplayBuffer:
                         s['priority'] = float(self._priorities[uid])
             except Exception:
                 pass
+            try:
+                self._max_priority = max(self._priorities.values()) if self._priorities else 1.0
+            except Exception:
+                self._max_priority = 1.0
 
     @property
     def has_prioritized(self) -> bool:

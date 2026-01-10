@@ -51,7 +51,7 @@ def main():
     p.add_argument('--log-dir', type=str, default='logs')
     p.add_argument('--checkpoint-dir', type=str, default='checkpoints')
     p.add_argument('--config-json', type=str, default=None)
-    p.add_argument('--version-interval', type=int, default=0, help='更新間隔タグ付き ckpt (0=無効)')
+    p.add_argument('--version-interval', type=int, default=10000, help='更新間隔タグ付き ckpt (デフォルト: 10000エピソードごと, 0=無効)')
     p.add_argument('--device', type=str, default=None, help='auto/cpu/cuda 指定')
     p.add_argument('--seed', type=int, default=None)
     p.add_argument('--batch-size', type=int, default=None)

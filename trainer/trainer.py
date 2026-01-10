@@ -854,7 +854,22 @@ class Trainer:
             except Exception as e:
                 print(f"[WARN] revert to baseline failed: {e}")
 
+        # 学習後の最終検証を実行
+        final_val_value_loss = None
+        try:
+            # 最終検証を実行
+            final_val_metrics = self.agents[0].validate_step(batch_size=self.config.get("val_batch_size") or self.config.get("batch_size", 256))
+            if isinstance(final_val_metrics, dict):
+                final_val_value_loss = final_val_metrics.get("value_loss")
+                # 検証結果をログに記録
+                if self.logger:
+                    self.logger.log_validation(final_val_metrics)
+        except Exception as e:
+            if self.logger:
+                self.logger.log_text(f"[WARN] final validation failed: {e}")
+        
         # 保存実行（gated_pass に応じて self.model は適切な方がセットされている）
+        # policy_value_latest.ptは学習フェーズの最後に必ず保存
         self._save_checkpoint()
         # 学習直後の最新モデルもスナップショット (自己対局前に世代差が明確になる)
         if self.keep_prev_model:
@@ -889,7 +904,7 @@ class Trainer:
     def _save_checkpoint(self):  # backward compatibility name
         self._save_checkpoint(version_tag=None)
 
-    def _save_checkpoint(self, version_tag: str | None = None, *, model_path_override: str | None = None, skip_model_save: bool = False):
+    def _save_checkpoint(self, version_tag: str | None = None, *, model_path_override: str | None = None, skip_model_save: bool = False, skip_latest_save: bool = False):
         os.makedirs(self.config["checkpoint_dir"], exist_ok=True)
         # アトミック保存ヘルパ
         def _atomic_save(fn, save_callable):
@@ -911,8 +926,10 @@ class Trainer:
 
         # 最新モデル保存 (atomic)
         latest_path = self.config["checkpoint_path"] if model_path_override is None else model_path_override
-        if (not skip_model_save) and self.model is not None:
+        if (not skip_model_save) and (not skip_latest_save) and self.model is not None:
             _atomic_save(latest_path, lambda p: self.model.save(p, force_sync=True))
+            if self.logger:
+                self.logger.log_text(f"[latest-ckpt] saved policy_value_latest.pt")
         # バージョン付き保存
         if version_tag:
             ver_path = os.path.join(self.config["checkpoint_dir"], f"policy_value_{version_tag}.pt")

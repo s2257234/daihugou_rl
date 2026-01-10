@@ -41,21 +41,56 @@ import time
 import hashlib
 import glob
 import random
+import gc
 from typing import Any, Dict, List
 import warnings
-
 import joblib
 
-# Ensure project root is on sys.path when run as a script
+# Ensure project root is known early (used below)
 _PROJ_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if _PROJ_ROOT not in sys.path:
-	sys.path.insert(0, _PROJ_ROOT)
 
-from agents.config import ALPHA_ZERO_CONFIG
-from agents.factory import create_env_and_agents
+# Ensure joblib temporary folder is placed inside the project to avoid
+# deletion/permission issues when joblib creates memmap temp folders.
+try:
+	import tempfile as _tempfile
+	_joblib_temp_dir = os.path.join(_PROJ_ROOT, '.joblib_temp')
+	os.makedirs(_joblib_temp_dir, exist_ok=True)
+	os.environ.setdefault('JOBLIB_TEMP_FOLDER', _joblib_temp_dir)
+except Exception:
+	pass
+
 from agents.drl_agent import AlphaZeroAgent
 from agents.replay_buffer import ReplayBuffer
 from utils.logger import TrainingLogger
+from agents.config import ALPHA_ZERO_CONFIG
+from agents.factory import create_env_and_agents
+from agents.factory import create_env_and_agents
+
+
+def _maybe_collect_gc(cfg: Dict[str, Any]):
+	"""Run garbage collection if aggressive_gc is enabled."""
+	if not bool(cfg.get('aggressive_gc', False)):
+		return
+	try:
+		gc.collect()
+	except Exception:
+		pass
+
+
+def _log_memory_usage(logger: TrainingLogger | None, cfg: Dict[str, Any], note: str):
+	"""Log RSS memory usage via psutil when available."""
+	try:
+		import psutil
+	except ImportError:
+		psutil = None
+	if logger is None or not bool(cfg.get('log_memory_usage', True)) or psutil is None:
+		return
+	try:
+		proc = psutil.Process(os.getpid())
+		rss_mb = proc.memory_info().rss / (1024 * 1024)
+		logger.log_text(f"[mem] {note} rss_mb={rss_mb:.2f}")
+	except Exception:
+		pass
 
 # --------------------------------------------------
 # Buffer State 永続化（過学習防止のためのスライディングウィンドウ）
@@ -386,6 +421,7 @@ def _load_samples_for_files(
 	logger: TrainingLogger | None,
 	cfg: Dict[str, Any],
 	preloaded: Dict[str, Dict[str, List[Dict[str, Any]]]] | None = None,
+	force_val_files: set | None = None,
 ):
 	"""Load samples, shuffle, split, return (train_list, val_list, total_train, total_val).
 
@@ -395,16 +431,47 @@ def _load_samples_for_files(
 	is provided the reused parts will be truncated to that limit.
 	"""
 	import random as _r
-	all_samples: List[Dict[str, Any]] = []
+	# Collect into per-file train/val lists based solely on file-level selection
+	train_list: List[Dict[str, Any]] = []
+	val_list: List[Dict[str, Any]] = []
 	# Parallelize per-file loading where possible. If preloaded mapping is provided,
 	# reuse entries; otherwise use joblib.Parallel to call _load_samples_from_file
 	# concurrently. We measure per-file load time and emit lightweight events when
 	# a logger is available.
 	try:
+		# Decide file-level val selection: use seed if provided for reproducibility
+		# allow caller to force a specific set via `force_val_files`
+		val_file_frac = float(cfg.get('active_file_val_fraction', 0.1) or 0.1)
+		# ファイルが1つしかない場合、すべてのサンプルをtrainに含めるため、val_file_countを0にする
+		if len(files) <= 1:
+			val_file_count = 0
+		else:
+			val_file_count = max(1, int(len(files) * val_file_frac))
+		if force_val_files is not None:
+			val_files_set = set(force_val_files)
+		else:
+			# Use seed for reproducible file selection
+			if seed is not None:
+				_r_seed = _r.Random(seed)
+				val_files_set = set(_r_seed.sample(files, val_file_count)) if val_file_count > 0 and len(files) >= val_file_count else set()
+			else:
+				val_files_set = set(_r.sample(files, val_file_count)) if val_file_count > 0 and len(files) >= val_file_count else set()
+		if logger:
+			try:
+				logger.log_text(f"[file-split] selected {len(val_files_set)} files as val out of {len(files)}")
+			except Exception:
+				pass
 		import time as _time, os as _os
 		from joblib import Parallel, delayed
-		# number of workers configurable via cfg; default to cpu_count
-		n_jobs = int(cfg.get('resume_load_workers', 10) or 10)
+		# Profiling timestamps
+		t_profile_start = _time.time()
+		# number of workers configurable via cfg; default to (cpu_count - 1)
+		_default_workers = 10
+		try:
+			_default_workers = max(1, ((_os.cpu_count() or 2) - 1))
+		except Exception:
+			_default_workers = 10
+		n_jobs = int(cfg.get('resume_load_workers', _default_workers) or _default_workers)
 		if n_jobs <= 0:
 			try:
 				import multiprocessing as _mp
@@ -412,8 +479,16 @@ def _load_samples_for_files(
 			except Exception:
 				n_jobs = 1
 
-		# prepare list of files to actually load
-		to_load = [fp for fp in files if not (preloaded is not None and fp in preloaded)]
+		# prepare list of files to actually load (deduplicate, skip preloaded)
+		seen_load: set[str] = set()
+		to_load: List[str] = []
+		for fp in files:
+			if preloaded is not None and fp in preloaded:
+				continue
+			if fp in seen_load:
+				continue
+			seen_load.add(fp)
+			to_load.append(fp)
 
 		def _load_with_timing(fp_local):
 			"""Wrapper to load a file and return (fp, parts, load_time_s, size_bytes, samples_count)."""
@@ -436,47 +511,70 @@ def _load_samples_for_files(
 
 		results = []
 		if to_load:
-			# Run parallel load; fall back to serial on any Parallel error
+			# Use loky backend for true parallelization (avoids GIL limitations of threading)
+			# This enables parallel decompression of joblib files across multiple CPU cores
 			try:
-				results = Parallel(n_jobs=n_jobs, backend='loky')(delayed(_load_with_timing)(fp) for fp in to_load)
+				workers = max(1, min(n_jobs, len(to_load)))
+				results = Parallel(n_jobs=workers, backend='loky')(delayed(_load_with_timing)(fp) for fp in to_load)
 			except Exception:
 				# fallback serial
 				results = [_load_with_timing(fp) for fp in to_load]
+		t_load_done = _time.time()
+		if logger:
+			try:
+				logger.log_text(f"[profile-load] parallel_load took={t_load_done - t_profile_start:.2f}s files={len(to_load)}")
+			except Exception:
+				pass
 		# build mapping fp -> parts
 		parts_map: Dict[str, tuple] = {}
 		for fp, parts_local, load_t, sz, cnt in results:
+			if fp in parts_map:
+				# 既に登録済み（重複読み込み）は無視
+				continue
 			parts_map[fp] = (parts_local, load_t, sz, cnt)
 		# include preloaded entries with zero load time
 		if preloaded is not None:
 			for fp in files:
-				if fp in preloaded:
+				if fp in preloaded and fp not in parts_map:
 					parts_map[fp] = (preloaded[fp], 0.0, 0, (len(preloaded[fp].get('train', []) or []) + len(preloaded[fp].get('val', []) or [])))
 
-		# iterate in original order and append samples
+		# iterate in original order and append samples to train_list or val_list
 		# Note: max_samples_per_file truncation is already applied in _load_samples_from_file
 		for fp in files:
 			entry = parts_map.get(fp, ({'train': [], 'val': []}, 0.0, 0, 0))
 			parts = entry[0]
-			load_t = entry[1]
-			sz = entry[2]
-			cnt = entry[3]
 			try:
 				tr = parts.get('train', []) or []
 				vl = parts.get('val', []) or []
 			except Exception:
 				tr = []
 				vl = []
+			if fp in val_files_set:
+				try:
+					val_list.extend(tr)
+					val_list.extend(vl)
+				except Exception:
+					pass
+			else:
+				try:
+					train_list.extend(tr)
+				except Exception:
+					pass
+		# メモリ効率化: parts_mapをクリア（train_list/val_listに追加済みなので不要）
+		try:
+			del parts_map
+		except Exception:
+			pass
+		t_split_done = _time.time()
+		if logger:
 			try:
-				all_samples.extend(tr)
-			except Exception:
-				pass
-			try:
-				all_samples.extend(vl)
+				logger.log_text(f"[profile-load] list_building took={t_split_done - t_load_done:.2f}s train={len(train_list)} val={len(val_list)}")
 			except Exception:
 				pass
 	except Exception:
-		# If anything went wrong with parallel path, fallback to original serial loop
-		all_samples = []
+		# If anything went wrong with parallel path, fallback to serial per-file load
+		train_list = []
+		val_list = []
 		for fp in files:
 			parts = None
 			try:
@@ -486,53 +584,63 @@ def _load_samples_for_files(
 					parts = _load_samples_from_file(fp, max_samples=(max_samples_per_file if max_samples_per_file else None))
 			except Exception:
 				parts = {'train': [], 'val': []}
-
-			# Note: max_samples_per_file truncation is already applied in _load_samples_from_file
 			try:
 				tr = parts.get('train', []) or []
 				vl = parts.get('val', []) or []
 			except Exception:
 				tr = []
 				vl = []
-
-			try:
-				all_samples.extend(tr)
-			except Exception:
-				pass
-			try:
-				all_samples.extend(vl)
-			except Exception:
-				pass
+			if fp in val_files_set:
+				try:
+					val_list.extend(tr)
+					val_list.extend(vl)
+				except Exception:
+					pass
+			else:
+				try:
+					train_list.extend(tr)
+				except Exception:
+					pass
 
 	# 毎セッションで異なるシャッフルを実現するため、時刻ベースの動的seedを使用
-	# これにより、同じファイル群でも毎回異なるサンプル順序になる
-	dynamic_seed = None
+	# シャッフルは train_list のみ行い、val_list はファイル単位で保持する
 	try:
 		import time as _time
-		# 基本seedと現在時刻を組み合わせて毎回異なるseedを生成
 		base_seed = int(seed) if seed is not None else 0
 		dynamic_seed = (base_seed + int(_time.time() * 1000)) % (2**31)
-		_r.Random(dynamic_seed).shuffle(all_samples)
-		# ログ出力（loggerがある場合）
-		if logger:
-			logger.log_text(f"[shuffle] dynamic_seed={dynamic_seed} samples={len(all_samples)}")
-	except Exception:
-		# フォールバック: 単純なランダムシャッフル
+		t_shuffle_start = _time.time()
+		# Use numpy.random.permutation for faster shuffling than random.shuffle
 		try:
-			_r.shuffle(all_samples)
-			if logger:
-				logger.log_text(f"[shuffle] fallback random shuffle samples={len(all_samples)}")
+			import numpy as _np
+			rng = _np.random.default_rng(dynamic_seed)
+			indices = rng.permutation(len(train_list))
+			train_list = [train_list[i] for i in indices]
+		except Exception:
+			# Fallback to Python random.shuffle
+			_r.Random(dynamic_seed).shuffle(train_list)
+		t_shuffle_done = _time.time()
+		if logger:
+			try:
+				logger.log_text(f"[shuffle] dynamic_seed={dynamic_seed} train_samples={len(train_list)} val_samples={len(val_list)} took={t_shuffle_done - t_shuffle_start:.2f}s")
+			except Exception:
+				pass
+	except Exception:
+		try:
+			_r.shuffle(train_list)
 		except Exception:
 			pass
 
-	# バリデーション用サンプルはシャッフル後の先頭から val_ratio 分を取得
-	split_idx = int(len(all_samples) * val_ratio)
-	val_part = all_samples[:split_idx]
-	train_part = all_samples[split_idx:]
-	return train_part, val_part, len(train_part), len(val_part)
+	return train_list, val_list, len(train_list), len(val_list), val_files_set
 
 
-def _rebuild_replay(shared_rb: ReplayBuffer, train_part: List[Dict[str, Any]], val_part: List[Dict[str, Any]], logger=None):
+def _rebuild_replay(
+	shared_rb: ReplayBuffer,
+	train_part: List[Dict[str, Any]],
+	val_part: List[Dict[str, Any]],
+	logger=None,
+	*,
+	chunk_size: int | None = None,  # legacy arg (ignored; no chunking)
+):
 	"""Clear and repopulate replay buffer with provided parts."""
 	import time as _time
 	t0 = _time.time()
@@ -543,56 +651,87 @@ def _rebuild_replay(shared_rb: ReplayBuffer, train_part: List[Dict[str, Any]], v
 	t1 = _time.time()
 	train_total = 0
 	val_total = 0
-	# Prepare combined list to bulk-extend for lower overhead
-	combined = []
 	t2 = _time.time()
-	for s in train_part:
-		if isinstance(s, dict):
-			try:
-				s['split'] = 'train'
-				combined.append(s)
-			except Exception:
-				pass
-	for s in val_part:
-		if isinstance(s, dict):
-			try:
-				s['split'] = 'val'
-				combined.append(s)
-			except Exception:
-				pass
+	# デバッグ: train_partとval_partのplayer_id=0のサンプル数を確認
+	try:
+		train_pid0_count = sum(1 for s in train_part if isinstance(s, dict) and s.get('player_id') == 0)
+		val_pid0_count = sum(1 for s in val_part if isinstance(s, dict) and s.get('player_id') == 0)
+		print(f"[DEBUG_VALUE_MIX] _rebuild_replay: train_part={len(train_part)} (pid=0: {train_pid0_count}), val_part={len(val_part)} (pid=0: {val_pid0_count})")
+	except Exception:
+		pass
+	# 全件を一括で処理する（チャンク分割は廃止）
+	# メモリ消費を抑えたい場合は上流でリストを絞り込むこと
+
 	t3 = _time.time()
 	# Use ReplayBuffer.extend when available
 	try:
 		uids = []
 		t4 = _time.time()
 		if hasattr(shared_rb, 'extend'):
-			uids = shared_rb.extend(combined)
+			for s in train_part:
+				if isinstance(s, dict):
+					try:
+						s['split'] = 'train'
+					except Exception:
+						pass
+			for s in val_part:
+				if isinstance(s, dict):
+					try:
+						s['split'] = 'val'
+					except Exception:
+						pass
+			if train_part:
+				train_uids = shared_rb.extend(train_part)
+				if isinstance(train_uids, list):
+					uids.extend(train_uids)
+				train_total += len(train_part)
+			if val_part:
+				val_uids = shared_rb.extend(val_part)
+				if isinstance(val_uids, list):
+					uids.extend(val_uids)
+				val_total += len(val_part)
 			t5 = _time.time()
-			# estimate counts from uids length proportional to train/val ordering
-			train_total = sum(1 for s in combined if s.get('split') == 'train')
-			val_total = sum(1 for s in combined if s.get('split') == 'val')
 			# Debug timing (always log for now to diagnose)
 			if logger:
 				try:
-					logger.log_text(f"[rebuild-timing] clear={t1-t0:.2f}s build_combined={t3-t2:.2f}s extend={t5-t4:.2f}s total={t5-t0:.2f}s samples={len(combined)}")
+					logger.log_text(
+						f"[rebuild-timing] clear={t1-t0:.2f}s set_split={t3-t2:.2f}s extend={t5-t4:.2f}s "
+						f"total={t5-t0:.2f}s samples={train_total+val_total} chunk_size=-1"
+					)
 				except Exception:
 					pass
 		else:
 			t5a = _time.time()
-			for s in combined:
+			for s in train_part:
+				if isinstance(s, dict):
+					try:
+						s['split'] = 'train'
+					except Exception:
+						pass
 				try:
 					shared_rb.append(s)
-					if s.get('split') == 'train':
-						train_total += 1
-					else:
-						val_total += 1
+					train_total += 1
+				except Exception:
+					pass
+			for s in val_part:
+				if isinstance(s, dict):
+					try:
+						s['split'] = 'val'
+					except Exception:
+						pass
+				try:
+					shared_rb.append(s)
+					val_total += 1
 				except Exception:
 					pass
 			t6a = _time.time()
 			# Debug timing
 			if logger:
 				try:
-					logger.log_text(f"[rebuild-timing] clear={t1-t0:.2f}s build_combined={t3-t2:.2f}s append_loop={t6a-t5a:.2f}s total={t6a-t0:.2f}s samples={len(combined)}")
+					logger.log_text(
+						f"[rebuild-timing] clear={t1-t0:.2f}s set_split={t3-t2:.2f}s append_loop={t6a-t5a:.2f}s "
+						f"total={t6a-t0:.2f}s samples={train_total+val_total} chunk_size=-1"
+					)
 				except Exception:
 					pass
 	except Exception:
@@ -600,21 +739,36 @@ def _rebuild_replay(shared_rb: ReplayBuffer, train_part: List[Dict[str, Any]], v
 		train_total = 0
 		val_total = 0
 		t7 = _time.time()
-		for s in combined:
+		for s in train_part:
 			if isinstance(s, dict):
 				try:
-					shared_rb.append(s)
-					if s.get('split') == 'train':
-						train_total += 1
-					else:
-						val_total += 1
+					s['split'] = 'train'
 				except Exception:
 					pass
+			try:
+				shared_rb.append(s)
+				train_total += 1
+			except Exception:
+				pass
+		for s in val_part:
+			if isinstance(s, dict):
+				try:
+					s['split'] = 'val'
+				except Exception:
+					pass
+			try:
+				shared_rb.append(s)
+				val_total += 1
+			except Exception:
+				pass
 		t8 = _time.time()
 		# Debug timing
 		if logger:
 			try:
-				logger.log_text(f"[rebuild-timing] clear={t1-t0:.2f}s build_combined={t3-t2:.2f}s fallback_append={t8-t7:.2f}s total={t8-t0:.2f}s samples={len(combined)}")
+				logger.log_text(
+					f"[rebuild-timing] clear={t1-t0:.2f}s set_split={t3-t2:.2f}s fallback_append={t8-t7:.2f}s "
+					f"total={t8-t0:.2f}s samples={train_total+val_total} chunk_size=-1"
+				)
 			except Exception:
 				pass
 	return train_total, val_total
@@ -723,7 +877,7 @@ def _compute_dynamic_file_and_sample_params(cfg: Dict[str, Any], train_updates_c
 		return None
 
 
-def _refresh_active_pool(active_files: List[str], all_files: List[str], cfg: Dict[str, Any], shared_rb: ReplayBuffer, val_ratio: float, seed: int | None, max_samples_per_file: int | None, logger: TrainingLogger | None, train_updates_cum: int = 0):
+def _refresh_active_pool(active_files: List[str], all_files: List[str], cfg: Dict[str, Any], shared_rb: ReplayBuffer, val_ratio: float, seed: int | None, max_samples_per_file: int | None, logger: TrainingLogger | None, train_updates_cum: int = 0, data_dir: str | None = None):
 	"""Active file pool refresh.
 
 	rebuild モード: 全ファイル再サンプリングしバッファをクリアして再構築。
@@ -743,6 +897,16 @@ def _refresh_active_pool(active_files: List[str], all_files: List[str], cfg: Dic
 	remain = [f for f in active_files if f not in evict]
 	add_n = min(replace_n, len(available))
 	new_add = _r.sample(available, add_n) if add_n > 0 else []
+	if new_add:
+		seen_active = set(remain)
+		seen_new: set[str] = set()
+		filtered_add: List[str] = []
+		for fp in new_add:
+			if fp in seen_active or fp in seen_new:
+				continue
+			seen_new.add(fp)
+			filtered_add.append(fp)
+		new_add = filtered_add
 	if newest_bias > 0.0 and pool_size > 0:
 		bias_count = int(min(pool_size, max(0, int(pool_size * newest_bias))))
 		latest_slice = all_files[-bias_count:] if bias_count > 0 else []
@@ -773,8 +937,30 @@ def _refresh_active_pool(active_files: List[str], all_files: List[str], cfg: Dic
 		max_samples_per_file = dynamic_samples
 	
 	if not incremental:
-		train_part, val_part, tcount, vcount = _load_samples_for_files(active_files_new, max_samples_per_file=max_samples_per_file, seed=seed, val_ratio=val_ratio, logger=logger, cfg=cfg)
-		loaded_train, loaded_val = _rebuild_replay(shared_rb, train_part, val_part, logger)
+		train_part, val_part, tcount, vcount, val_files_set = _load_samples_for_files(active_files_new, max_samples_per_file=max_samples_per_file, seed=seed, val_ratio=val_ratio, logger=logger, cfg=cfg)
+		chunk_sz = int(cfg.get('rebuild_chunk_size', 0) or 0)
+		loaded_train, loaded_val = _rebuild_replay(shared_rb, train_part, val_part, logger, chunk_size=chunk_sz)
+		# メモリ効率化: train_partとval_partを明示的にクリア（ReplayBufferに追加済みなので不要）
+		try:
+			del train_part
+			del val_part
+		except Exception:
+			pass
+
+		# If data_dir provided, persist removal of val files so they won't be reused
+		if data_dir and val_files_set:
+			try:
+				# remove selected val files from active pool and mark them as used
+				new_active = [f for f in active_files_new if f not in val_files_set]
+				_save_buffer_state(data_dir, new_active, used_files=list(val_files_set), logger=logger)
+				active_files_new = new_active
+			except Exception:
+				try:
+					if logger:
+						logger.log_text('[WARN] failed to persist val file removal to buffer_state')
+				except Exception:
+					pass
+
 		if logger:
 			logger.log_text(f"[active-pool] refresh(rebuild) replaced={replace_n} added={add_n} pool_size={len(active_files_new)} replay_size={len(shared_rb)} train={loaded_train} val={loaded_val}")
 		return active_files_new, {'replaced': replace_n, 'added': add_n, 'train': loaded_train, 'val': loaded_val, 'mode': 'rebuild'}
@@ -785,10 +971,59 @@ def _refresh_active_pool(active_files: List[str], all_files: List[str], cfg: Dic
 		# まず各ファイルからサンプルを収集（再読み込みを避ける）
 		per_file = []  # List[Tuple[List[dict], List[dict]]]
 		total_new = 0
+		seen_new_add: set[str] = set()
+		ordered_new: List[str] = []
 		for fp in new_add:
-			parts = _load_samples_from_file(fp, max_samples=(int(max_samples_per_file) if (max_samples_per_file is not None and max_samples_per_file > 0) else None))
-			tr = parts.get('train', []) or []
-			vl = parts.get('val', []) or []
+			if fp in seen_new_add:
+				continue
+			seen_new_add.add(fp)
+			ordered_new.append(fp)
+		parts_map: Dict[str, tuple[List[Dict[str, Any]], List[Dict[str, Any]]]] = {}
+		if ordered_new:
+			from joblib import Parallel, delayed
+			import time as _time
+			# Align worker count with resume_load_workers to keep behaviour consistent
+			_default_workers = 10
+			try:
+				_default_workers = max(1, ((os.cpu_count() or 2) - 1))
+			except Exception:
+				_default_workers = 10
+			n_jobs = int(cfg.get('resume_load_workers', _default_workers) or _default_workers)
+			if n_jobs <= 0:
+				try:
+					import multiprocessing as _mp
+					n_jobs = max(1, _mp.cpu_count() - 1)
+				except Exception:
+					n_jobs = 1
+			max_samples_arg = int(max_samples_per_file) if (max_samples_per_file is not None and max_samples_per_file > 0) else None
+			def _load_incremental(fp_local: str):
+				t_start = _time.time()
+				parts_local = {'train': [], 'val': []}
+				try:
+					parts_local = _load_samples_from_file(fp_local, max_samples=max_samples_arg)
+				except Exception:
+					parts_local = {'train': [], 'val': []}
+				t_end = _time.time()
+				tr_local = parts_local.get('train', []) or []
+				vl_local = parts_local.get('val', []) or []
+				return fp_local, tr_local, vl_local, float(t_end - t_start)
+			t_parallel_start = _time.time()
+			try:
+				workers = max(1, min(n_jobs, len(ordered_new)))
+				results = Parallel(n_jobs=workers, backend='threading')(delayed(_load_incremental)(fp) for fp in ordered_new)
+			except Exception:
+				results = [_load_incremental(fp) for fp in ordered_new]
+			t_parallel_end = _time.time()
+			for fp_local, tr_local, vl_local, _dur in results:
+				if fp_local not in parts_map:
+					parts_map[fp_local] = (tr_local, vl_local)
+			if logger:
+				try:
+					logger.log_text(f"[profile-load] incremental_parallel took={t_parallel_end - t_parallel_start:.2f}s files={len(ordered_new)}")
+				except Exception:
+					pass
+		for fp in ordered_new:
+			tr, vl = parts_map.get(fp, ([], []))
 			per_file.append((tr, vl))
 			total_new += len(tr) + len(vl)
 		# バッファ容量に応じて事前選別
@@ -874,6 +1109,15 @@ def _refresh_active_pool(active_files: List[str], all_files: List[str], cfg: Dic
 						app_train += 1
 				except Exception:
 					pass
+		# メモリ効率化: selectedリストとper_fileリストを明示的にクリア（ReplayBufferに追加済みなので不要）
+		try:
+			del selected
+		except Exception:
+			pass
+		try:
+			del per_file
+		except Exception:
+			pass
 	except Exception as e:
 		if logger:
 			logger.log_text(f"[WARN] incremental refresh load failed: {e}")
@@ -963,25 +1207,19 @@ def _load_samples_from_file(path: str, *, max_samples: int | None = None) -> Dic
 	samples = payload.get('samples') or []
 	train_list: List[Dict[str, Any]] = []
 	val_list: List[Dict[str, Any]] = []
+	# Treat all samples as train by default; file-level selection will move
+	# entire files to validation when needed.
 	for s in samples:
 		if not isinstance(s, dict):
 			continue
-		sp = s.get('split', 'train')
-		# ソースファイルを保持し、後段の差分更新や分析を可能にする
 		try:
 			s['source_file'] = path
 		except Exception:
 			pass
-		if sp == 'val':
-			val_list.append(s)
-		else:
-			train_list.append(s)
+		train_list.append(s)
 	if max_samples is not None and max_samples > 0:
 		if len(train_list) > max_samples:
-			# ランダムサンプリングで多様性を確保（過学習対策）
 			train_list = random.sample(train_list, max_samples)
-		if len(val_list) > max_samples:
-			val_list = random.sample(val_list, max_samples)
 	return {'train': train_list, 'val': val_list}
 
 
@@ -1085,10 +1323,11 @@ def _run_validation(learner: AlphaZeroAgent, logger: TrainingLogger, cfg: Dict[s
 			logger.log_text("[val] validation logging failed")
 		except Exception:
 			pass
+	return vinfo
 		
 
 
-def _save_checkpoint(bundle, cfg: Dict[str, Any], model_version: int, version_tag: str | None = None):
+def _save_checkpoint(bundle, cfg: Dict[str, Any], model_version: int, version_tag: str | None = None, logger=None):
 	os.makedirs(cfg['checkpoint_dir'], exist_ok=True)
 	model = bundle.model
 	learner = bundle.agents[cfg.get('learning_player_id', 0)]
@@ -1096,7 +1335,7 @@ def _save_checkpoint(bundle, cfg: Dict[str, Any], model_version: int, version_ta
 	def _atomic(pt: str):
 		tmp = pt + '.tmp'
 		try:
-			model.save(tmp, force_sync=True)  # type: ignore[arg-type]
+			model.save(tmp, force_sync=True, logger=logger)  # type: ignore[arg-type]
 			os.replace(tmp, pt)
 		except Exception:
 			try:
@@ -1104,7 +1343,7 @@ def _save_checkpoint(bundle, cfg: Dict[str, Any], model_version: int, version_ta
 					os.remove(tmp)
 			except Exception:
 				pass
-			model.save(pt)  # type: ignore[arg-type]
+			model.save(pt, logger=logger)  # type: ignore[arg-type]
 	if model is not None:
 		_atomic(latest_path)
 	if version_tag:
@@ -1147,6 +1386,38 @@ def _save_checkpoint(bundle, cfg: Dict[str, Any], model_version: int, version_ta
 
 
 def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: int | None, max_samples_per_file: int | None, updates: int, version_interval: int, files_override: List[str] | None = None):
+	# Early return if updates=0 to skip heavy initialization (model loading, sample loading, etc.)
+	updates = int(updates)
+	
+	# updates <= 0 でも buffer_state モードの場合、active_files を更新して保存する
+	buffer_window_size = int(cfg.get('buffer_window_size', 0) or 0)
+	if updates <= 0 and buffer_window_size > 0 and not files_override:
+		try:
+			# buffer_state の更新のみ実行（軽量処理）
+			all_files, _ = _scan_selfplay_files(data_dir)
+			buffer_state = _load_buffer_state(data_dir)
+			prev_files = buffer_state.get('active_files', [])
+			used_files = buffer_state.get('used_files', [])
+			enable_random_selection = bool(cfg.get('buffer_window_random_selection', True))
+			active_files, _ = _update_buffer_window(
+				prev_files, all_files, buffer_window_size,
+				used_files=used_files,
+				enable_random_selection=enable_random_selection,
+				logger=None  # logger は初期化前なので None
+			)
+			# active_files のみ更新（used_files は更新しない、学習が実行されていないため）
+			_save_buffer_state(data_dir, active_files, used_files=None, logger=None)
+		except Exception as e:
+			# buffer_state 更新エラーは無視して続行
+			print(f"[WARN] buffer_state update failed (updates=0): {e}")
+	
+	if updates <= 0:
+		# Load meta to get cumulative updates for logging
+		meta = _load_meta(data_dir)
+		train_updates_cum = int(meta.get('train_updates_cumulative', 0) or 0)
+		print(f"[INFO] training finished updates={updates} total_updates={train_updates_cum}")
+		return
+	
 	os.makedirs(data_dir, exist_ok=True)
 	os.makedirs(log_dir, exist_ok=True)
 	os.makedirs(cfg['checkpoint_dir'], exist_ok=True)
@@ -1159,56 +1430,13 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 		config=cfg,
 	)
 
-	# モデル/エージェント/環境生成 (今回は永続リプレイを使わずエフェメラル)
-	shared_rb = ReplayBuffer(maxlen=cfg.get('buffer_size', 50000), path=None)
-	# 直列モードではリプレイ縮小サイクルを無効化（設定・ロガー登録もしない）
-
-	bundle = create_env_and_agents(
-		cfg,
-		context='main',
-		model_path=cfg.get('checkpoint_path'),
-		shared_replay=shared_rb,
-		logger=logger,
-	)
-
-	learner: AlphaZeroAgent = bundle.agents[cfg.get('learning_player_id', 0)]
-
-	# モデル再開ログ（ロード成功時のみ）
-	try:
-		model_path = cfg.get('checkpoint_path') or os.path.join(cfg.get('checkpoint_dir', 'checkpoints'), 'policy_value_latest.pt')
-		if bool(getattr(bundle, 'loaded_from_checkpoint', False)) and os.path.isfile(model_path):
-			logger.log_text(f"[resume] loaded model from {model_path}")
-	except Exception:
-		pass
-
-	# optimizer / scheduler 再開
-	try:
-		opt_p = os.path.join(cfg['checkpoint_dir'], 'optimizer_latest.pt')
-		if os.path.isfile(opt_p):
-			if hasattr(learner, 'ensure_optimizer'):
-				learner.ensure_optimizer()
-			ok = False
-			if hasattr(learner, 'load_optimizer'):
-				ok = bool(learner.load_optimizer(opt_p, map_location=bundle.device))
-			
-	except Exception as e:
-		logger.log_text(f"[WARN] optimizer load failed: {e}")
-	try:
-		sch_p = os.path.join(cfg['checkpoint_dir'], 'scheduler_latest.pt')
-		if os.path.isfile(sch_p):
-			if hasattr(learner, 'ensure_scheduler'):
-				learner.ensure_scheduler()
-			ok = False
-			if hasattr(learner, 'load_scheduler'):
-				ok = bool(learner.load_scheduler(sch_p))
-			
-	except Exception as e:
-		logger.log_text(f"[WARN] scheduler load failed: {e}")
-
 	# meta.json + 既存CSV から累積アップデート数を復元（CSV優先）
 	meta = _load_meta(data_dir)
 	meta_updates = int(meta.get('train_updates_cumulative', 0) or 0)
 	episodes_cumulative = int(meta.get('episodes_cumulative', 0) or 0)
+	# last_checkpoint_episode を meta.json から取得（存在しない場合は0）
+	if 'last_checkpoint_episode' not in meta:
+		meta['last_checkpoint_episode'] = 0
 	# CSVの最終 update_step を取得
 	last_csv_step = 0
 	try:
@@ -1232,52 +1460,10 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 	# ロガーのカウンタへ適用
 	logger.update_step = int(train_updates_cum)
 
-	# --- 学習率スケジューラの同期修正 ---
-	# optimizer.load_state_dict() が古いlrを復元するため、
-	# schedulerを累積ステップ数に基づいて正しく再初期化し、optimizer lrを更新する
-	# 注意: train_updates_cum == 0 の場合も、古いチェックポイントから誤ったlrがロードされる可能性があるため、
-	# 常にlrを正しい値に設定する
-	try:
-		if hasattr(learner, '_optimizer') and learner._optimizer is not None:
-			import math as _math
-			base_lr = float(cfg.get('lr', 1e-4))
-			lr_min = float(cfg.get('lr_min', 1e-5))
-			warmup = int(cfg.get('lr_warmup_steps', 0) or 0)
-			tmax = int(cfg.get('lr_cosine_T_max_updates', 0) or 0)
-			min_scale = (lr_min / base_lr) if base_lr > 0 else 0.0
-			
-			# 累積ステップ数に基づく正しい学習率を計算
-			step = int(train_updates_cum)
-			if warmup > 0 and step < warmup:
-				lr_scale = max(1e-8, float(step + 1) / float(warmup))
-			elif tmax > warmup and tmax > 0:
-				prog = min(1.0, float(step - warmup) / float(max(1, tmax - warmup)))
-				cos_factor = 0.5 * (1.0 + _math.cos(_math.pi * prog))
-				lr_scale = min_scale + (1.0 - min_scale) * cos_factor
-			else:
-				lr_scale = min_scale
-			
-			correct_lr = base_lr * lr_scale
-			# Value Head用のスケール
-			value_head_lr_scale_cfg = float(cfg.get('value_head_lr_scale', 1.0))
-			
-			# optimizer の各 param_group の lr を強制更新
-			for idx, group in enumerate(learner._optimizer.param_groups):
-				if group.get('name') == 'value_head':
-					group['lr'] = correct_lr * value_head_lr_scale_cfg
-				else:
-					group['lr'] = correct_lr
-			
-			# scheduler の内部状態も同期 (last_epoch を累積ステップ数に設定)
-			if hasattr(learner, '_scheduler') and learner._scheduler is not None:
-				learner._scheduler.last_epoch = step
-			if hasattr(learner, '_update_step'):
-				learner._update_step = step
-			
-			logger.log_text(f"[lr-sync] synced lr to step={step}: correct_lr={correct_lr:.10e} lr_scale={lr_scale:.6f}")
-	except Exception as e:
-		logger.log_text(f"[WARN] lr-sync failed: {e}")
-	
+	# モデル/エージェント/環境生成前に共有リプレイバッファを用意
+	shared_rb = ReplayBuffer(maxlen=cfg.get('buffer_size', 50000), path=None)
+	# 直列モードではリプレイ縮小サイクルを無効化（設定・ロガー登録もしない）
+
 
 	# --- Active File Pool (modular) ---
 	all_files, pattern_attempts = _scan_selfplay_files(data_dir)
@@ -1313,7 +1499,9 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 		buffer_state_used = True
 		
 		# このセッションで使用するファイルを記録（改善案A: 次回除外するため）
-		used_files_for_session = list(active_files)
+		# 注意: used_files_for_session は学習が実際に実行された場合のみ設定される
+		# （学習ループ後の _save_buffer_state 呼び出し時に設定）
+		used_files_for_session = []
 		
 		if logger:
 			new_count = len([f for f in active_files if f not in set(prev_files)])
@@ -1369,10 +1557,36 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 			except Exception:
 				n = 40
 			# choose newest N from active_files (active_files is sorted ascending)
-			if active_files:
-				initial_active_files = list(active_files[-n:])
-			else:
-				initial_active_files = []
+			# Prefer buffer_state.json active_files if present (useful when buffer/window managed externally)
+			bs_path = os.path.join(data_dir, 'buffer_state.json')
+			initial_active_files = []
+			try:
+				if os.path.isfile(bs_path):
+					with open(bs_path, 'r', encoding='utf-8') as _bf:
+						_bs = json.load(_bf) or {}
+						bs_active = _bs.get('active_files') or []
+						# filter to existing files
+						bs_active = [f for f in bs_active if os.path.isfile(f)]
+						if bs_active:
+							# if bs_active larger than n, take the newest n
+							initial_active_files = list(bs_active[-n:]) if n and len(bs_active) > n else list(bs_active)
+							# Ensure the session's active_files uses the buffer_state canonical list
+							try:
+								active_files = list(bs_active)
+							except Exception:
+								pass
+				# fallback to active_files selection if buffer_state absent or empty
+				if not initial_active_files:
+					if active_files:
+						initial_active_files = list(active_files[-n:])
+					else:
+						initial_active_files = []
+			except Exception:
+				# on any error fallback to existing behavior
+				if active_files:
+					initial_active_files = list(active_files[-n:])
+				else:
+					initial_active_files = []
 			if logger:
 				logger.log_text(f"[INFO] resume_defer_preload enabled: limiting initial preload to latest {len(initial_active_files)} files (found_count={found_count})")
 		else:
@@ -1422,25 +1636,359 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 			logger.flush_buffers(force=True)
 	except Exception:
 		pass
-	# load samples with timing
-	t_load_start = time.time()
+	# サンプルロードを非同期で開始し、モデル初期化と並行させる
+	load_future = None
+	load_executor = None
+	t_load_start = None
+	train_part = []
+	val_part = []
+	train_samples_total = 0
+	val_samples_total = 0
+	initial_val_files = set()
+	if initial_active_files:
+		import concurrent.futures as _fut
+		t_load_start = time.time()
+		if logger:
+			try:
+				logger.log_text(f"[resume-timer] before_load_samples files={len(initial_active_files)}")
+				logger.flush_buffers(force=True)
+			except Exception:
+				pass
+		_log_memory_usage(logger, cfg, 'before_load_samples')
+		load_executor = _fut.ThreadPoolExecutor(max_workers=1)
+		load_future = load_executor.submit(
+			_load_samples_for_files,
+			initial_active_files,
+			max_samples_per_file=eff_max_samp,
+			seed=_seed,
+			val_ratio=val_ratio,
+			logger=logger,
+			cfg=cfg,
+			preloaded=preloaded,
+		)
+
+	# モデル/エージェント/環境生成 (今回は永続リプレイを使わずエフェメラル)
+	bundle = create_env_and_agents(
+		cfg,
+		context='main',
+		model_path=cfg.get('checkpoint_path'),
+		shared_replay=shared_rb,
+		logger=logger,
+	)
+
+	learner: AlphaZeroAgent = bundle.agents[cfg.get('learning_player_id', 0)]
+
+	# モデル再開ログ（ロード成功時のみ）
+	try:
+		model_path = cfg.get('checkpoint_path') or os.path.join(cfg.get('checkpoint_dir', 'checkpoints'), 'policy_value_latest.pt')
+		if bool(getattr(bundle, 'loaded_from_checkpoint', False)) and os.path.isfile(model_path):
+			logger.log_text(f"[resume] loaded model from {model_path}")
+	except Exception:
+		pass
+
+	# optimizer / scheduler 再開
+	try:
+		opt_p = os.path.join(cfg['checkpoint_dir'], 'optimizer_latest.pt')
+		# If model checkpoint exists, try a permissive model reload (strict=False)
+		# and detect param-key mismatches. If the model structure changed, recreate optimizer
+		# instead of loading possibly-incompatible optimizer.state_dict().
+		model_path = cfg.get('checkpoint_path') or os.path.join(cfg.get('checkpoint_dir', 'checkpoints'), 'policy_value_latest.pt')
+		mismatch_detected = False
+		if model_path and os.path.isfile(model_path):
+				import torch as _torch
+				# load ckpt meta (weights_only if available)
+				try:
+					ck = _torch.load(model_path, map_location='cpu', weights_only=True)
+				except TypeError:
+					ck = _torch.load(model_path, map_location='cpu')
+				state_dict = None
+				if isinstance(ck, dict) and 'state_dict' in ck:
+					state_dict = ck.get('state_dict')
+				elif isinstance(ck, dict):
+					state_dict = ck
+				# Try permissive load into current model to allow head changes
+				if state_dict is not None:
+					try:
+						missing_keys, unexpected_keys = learner.model.load_state_dict(state_dict, strict=False)  # type: ignore[arg-type]
+						
+						# If new parameters were added (missing_keys), reinitialize them properly
+						if missing_keys:
+							logger.log_text(f"[resume] missing keys detected (新しいパラメータを再初期化): {missing_keys}")
+							# Reinitialize missing parameters
+							for key in missing_keys:
+								try:
+									# Get the parameter/buffer
+									parts = key.split('.')
+									module = learner.model
+									for part in parts[:-1]:
+										module = getattr(module, part)
+									param_name = parts[-1]
+									param = getattr(module, param_name)
+									
+									# Reinitialize with proper initialization (not zero)
+									if 'weight' in param_name:
+										_torch.nn.init.xavier_uniform_(param)
+										logger.log_text(f"[resume] reinitialized {key} with xavier_uniform")
+									elif 'bias' in param_name:
+										_torch.nn.init.zeros_(param)
+								except Exception as e:
+									logger.log_text(f"[resume] failed to reinitialize {key}: {e}")
+						
+						# Detect already-present parameters that are all-zero (common after struct changes)
+						critical_params = [
+							'self_encoder.0.weight',
+							'context_encoder.0.weight',
+							'policy_head.0.weight',
+							'value_head.0.weight',
+							'hand_head.0.weight',
+						]
+						for key in critical_params:
+							if key in learner.model.state_dict():
+								try:
+									param = learner.model.state_dict()[key]
+									if hasattr(param, 'abs') and float(param.abs().max().item()) < 1e-8:
+										parts = key.split('.')
+										module = learner.model
+										for part in parts[:-1]:
+											module = getattr(module, part)
+										param_name = parts[-1]
+										p = getattr(module, param_name)
+										_torch.nn.init.xavier_uniform_(p)
+										logger.log_text(f"[resume] reinitialized zeroed param: {key}")
+								except Exception as e:
+									logger.log_text(f"[resume] failed to inspect/reinit {key}: {e}")
+						
+						if unexpected_keys:
+							logger.log_text(f"[resume] unexpected keys (古いパラメータを無視): {unexpected_keys}")
+					except Exception as e:
+						# best-effort permissive load failed -> ignore and continue
+						logger.log_text(f"[resume] model load failed: {e}")
+				try:
+					model_keys = set(list(learner.model.state_dict().keys()))
+					ck_keys = set(list(state_dict.keys())) if state_dict is not None else set()
+					if model_keys != ck_keys:
+						mismatch_detected = True
+				except Exception:
+					mismatch_detected = False
+
+		if os.path.isfile(opt_p):
+			if hasattr(learner, 'ensure_optimizer'):
+				# If model mismatched, recreate optimizer (ensure) but skip loading state
+				if mismatch_detected:
+					learner.ensure_optimizer()
+					logger.log_text(f"[resume] model-param mismatch detected, recreated optimizer instead of loading {opt_p}")
+					ok = False
+				else:
+					learner.ensure_optimizer()
+					ok = False
+					if hasattr(learner, 'load_optimizer'):
+						ok = bool(learner.load_optimizer(opt_p, map_location=bundle.device))
+		
+	except Exception as e:
+		logger.log_text(f"[WARN] optimizer load failed: {e}")
+	# スケジューラの読み込みは学習率同期コードで行うため、ここではスキップ
+	# (load_scheduler() が _update_step を設定してしまうため、学習率同期コードと競合する)
+	try:
+		sch_p = os.path.join(cfg['checkpoint_dir'], 'scheduler_latest.pt')
+		# スケジューラファイルが存在しても、学習率同期コードで再構築するため読み込まない
+		# if os.path.isfile(sch_p):
+		# 	if hasattr(learner, 'ensure_scheduler'):
+		# 		learner.ensure_scheduler()
+		# 	ok = False
+		# 	if hasattr(learner, 'load_scheduler'):
+		# 		ok = bool(learner.load_scheduler(sch_p))
+		pass
+	except Exception as e:
+		logger.log_text(f"[WARN] scheduler load failed: {e}")
+
+	# --- 学習率スケジューラの同期修正 ---
+	# optimizer.load_state_dict() が古いlrを復元するため、
+	# schedulerを累積ステップ数に基づいて正しく再初期化し、optimizer lrを更新する
+	# 注意: train_updates_cum == 0 の場合も、古いチェックポイントから誤ったlrがロードされる可能性があるため、
+	# 常にlrを正しい値に設定する
+	
+	# _update_stepの設定はoptimizerの有無に関係なく実行（学習ステップカウントの整合性を保つため）
+	step = int(train_updates_cum)
+	if not hasattr(learner, '_update_step'):
+		learner._update_step = 0
+	learner._update_step = step  # train_updates_cum に基づく正しいステップ数に設定
+	logger.log_text(f"[lr-sync] set learner._update_step = {step} (train_updates_cum)")
+	
+	try:
+		# Optimizerが存在することを保証
+		if not hasattr(learner, '_optimizer') or learner._optimizer is None:
+			if hasattr(learner, 'ensure_optimizer'):
+				learner.ensure_optimizer()
+				logger.log_text(f"[lr-sync] ensured optimizer exists")
+		
+		if hasattr(learner, '_optimizer') and learner._optimizer is not None:
+			import math as _math
+			base_lr = float(cfg.get('lr', 1e-4))
+			lr_min = float(cfg.get('lr_min', 1e-5))
+			warmup = int(cfg.get('lr_warmup_steps', 0) or 0)
+			tmax = int(cfg.get('lr_cosine_T_max_updates', 0) or 0)
+			min_scale = (lr_min / base_lr) if base_lr > 0 else 0.0
+			
+			# 累積ステップ数に基づく正しい学習率を計算
+			step = int(train_updates_cum)
+			if warmup > 0 and step < warmup:
+				lr_scale = max(1e-8, float(step + 1) / float(warmup))
+			elif tmax > warmup and tmax > 0:
+				prog = min(1.0, float(step - warmup) / float(max(1, tmax - warmup)))
+				cos_factor = 0.5 * (1.0 + _math.cos(_math.pi * prog))
+				lr_scale = min_scale + (1.0 - min_scale) * cos_factor
+			else:
+				lr_scale = min_scale
+			
+			correct_lr = base_lr * lr_scale
+			# Value Head用のスケール
+			value_head_lr_scale_cfg = float(cfg.get('value_head_lr_scale', 1.0))
+			
+			# スケジューラの状態確認と同期
+			sched = getattr(learner, '_scheduler', None)
+			need_recreate = False
+			
+			if sched is not None:
+				# 既存のスケジューラのlast_epochをチェック
+				current_last_epoch = getattr(sched, 'last_epoch', None)
+				expected_last_epoch = step - 1  # 次のstep()でstepになる想定
+				# last_epochが大きくずれている、またはNoneの場合は再作成
+				if current_last_epoch is None or abs(current_last_epoch - expected_last_epoch) > 2:
+					need_recreate = True
+					logger.log_text(f"[lr-sync] scheduler last_epoch mismatch: current={current_last_epoch} expected={expected_last_epoch}, recreating")
+			
+			if need_recreate or sched is None:
+				# スケジューラを（再）作成
+				if hasattr(learner, '_scheduler'):
+					learner._scheduler = None
+				if hasattr(learner, 'ensure_scheduler'):
+					learner.ensure_scheduler()
+					sched = getattr(learner, '_scheduler', None)
+					if sched is not None:
+						# 累積ステップに合わせてlast_epochを補正
+						sched.last_epoch = step - 1
+						logger.log_text(f"[lr-sync] scheduler created/reset with last_epoch={getattr(sched, 'last_epoch', None)} (expected {step-1})")
+			
+			# スケジューラが正常に存在する場合、学習率を更新
+			# 注意: scheduler.step()はoptimizer.step()の後に呼ばれるべきなので、
+			# ここではlast_epochを設定するだけで、実際のstep()はtrain_step内で実行される
+			if sched is not None:
+				try:
+					# last_epochを累積ステップに揃える（step()は呼ばない）
+					sched.last_epoch = step - 1
+					# 学習率を手動で設定（scheduler.step()の代わり）
+					# これにより、optimizer.step()の前にscheduler.step()が呼ばれることを防ぐ
+					for idx, group in enumerate(learner._optimizer.param_groups):
+						if group.get('name') == 'value_head':
+							group['lr'] = correct_lr * value_head_lr_scale_cfg
+						else:
+							group['lr'] = correct_lr
+					current_lr = learner._optimizer.param_groups[0]['lr'] if learner._optimizer else None
+					lr_str = f"{current_lr:.10e}" if current_lr is not None else "None"
+					logger.log_text(f"[lr-sync] scheduler last_epoch set to {getattr(sched, 'last_epoch', None)}, lr manually set to {lr_str}")
+				except Exception as e:
+					logger.log_text(f"[lr-sync] scheduler setup failed: {e}")
+		else:
+			# スケジューラがない場合のみ手動でlrを設定
+			logger.log_text(f"[lr-sync] no scheduler, setting lr manually")
+			for idx, group in enumerate(learner._optimizer.param_groups):
+				if group.get('name') == 'value_head':
+					group['lr'] = correct_lr * value_head_lr_scale_cfg
+				else:
+					group['lr'] = correct_lr
+			
+		logger.log_text(f"[lr-sync] synced lr to step={step}: correct_lr={correct_lr:.10e} lr_scale={lr_scale:.6f}")
+	except Exception as e:
+		logger.log_text(f"[WARN] lr-sync failed: {e}")
+	# 非同期ロード完了を待機
+	t_load_end = t_load_start
+	if load_future is not None:
+		try:
+			train_part, val_part, train_samples_total, val_samples_total, initial_val_files = load_future.result()
+			t_load_end = time.time()
+		except Exception:
+			# 失敗時も以降の処理は継続
+			train_part = train_part or []
+			val_part = val_part or []
+		finally:
+			try:
+				if load_executor is not None:
+					load_executor.shutdown(wait=False)
+			except Exception:
+				pass
+	else:
+		if t_load_end is None:
+			t_load_end = time.time()
+
+	# メモリ効率化: preloaded辞書をクリア（_load_samples_for_filesで使用済みなので不要）
+	try:
+		if 'preloaded' in locals() and preloaded is not None:
+			preloaded.clear()
+			del preloaded
+	except Exception:
+		pass
+	# デバッグ: 読み込まれたサンプルにvalue_qが含まれているか確認
+	if bool(cfg.get('debug_value_mix', False)) and train_part:
+		try:
+			from agents.agent_utills.training import _extract_value_q
+			q_count = sum(1 for s in train_part[:min(100, len(train_part))] if _extract_value_q(s) is not None)
+			player_id_count = sum(1 for s in train_part[:min(100, len(train_part))] if s.get('player_id') is not None)
+			print(f"[DEBUG_VALUE_MIX] train_part size={len(train_part)}, samples_with_q (first 100)={q_count}, samples_with_player_id (first 100)={player_id_count}")
+		except Exception as e:
+			print(f"[DEBUG_VALUE_MIX] failed to check train_part: {e}")
+
+	# ロード時間の計測結果をログ出力
 	if logger:
 		try:
-			logger.log_text(f"[resume-timer] before_load_samples files={len(initial_active_files)}")
+			logger.log_text(
+				f"[resume-timer] load_samples took={(t_load_end - t_load_start) if t_load_start is not None and t_load_end is not None else 0.0:.3f}s "
+				f"files={len(initial_active_files)} samples_train={train_samples_total} samples_val={val_samples_total}"
+			)
 			logger.flush_buffers(force=True)
 		except Exception:
 			pass
-	train_part, val_part, train_samples_total, val_samples_total = _load_samples_for_files(initial_active_files, max_samples_per_file=eff_max_samp, seed=_seed, val_ratio=val_ratio, logger=logger, cfg=cfg, preloaded=preloaded)
-	t_load_end = time.time()
-	try:
-		if logger:
-			logger.log_text(f"[resume-timer] load_samples took={t_load_end - t_load_start:.3f}s files={len(initial_active_files)} samples_train={train_samples_total} samples_val={val_samples_total}")
-			logger.flush_buffers(force=True)
-	except Exception:
-		pass
+	_log_memory_usage(logger, cfg, 'after_load_samples')
+	_maybe_collect_gc(cfg)
+	if bool(cfg.get('aggressive_gc', False)):
+		_log_memory_usage(logger, cfg, 'after_load_samples_gc')
+		
 	# rebuild replay with timing
 	t_rebuild_start = time.time()
-	train_samples_total, val_samples_total = _rebuild_replay(shared_rb, train_part, val_part, logger)
+	chunk_sz = int(cfg.get('rebuild_chunk_size', 0) or 0)
+	train_samples_total, val_samples_total = _rebuild_replay(shared_rb, train_part, val_part, logger, chunk_size=chunk_sz)
+	t_rebuild_end = time.time()
+	# メモリ効率化: train_partとval_partを明示的にクリア（ReplayBufferに追加済みなので不要）
+	try:
+		del train_part
+		del val_part
+	except Exception:
+		pass
+	_maybe_collect_gc(cfg)
+	if bool(cfg.get('aggressive_gc', False)):
+		_log_memory_usage(logger, cfg, 'after_rebuild_gc')
+	# デバッグ: リプレイバッファに追加されたサンプルにvalue_qが含まれているか確認
+	if bool(cfg.get('debug_value_mix', False)) and len(shared_rb) > 0:
+		try:
+			from agents.agent_utills.training import _extract_value_q
+			# ReplayBufferからサンプルを取得（iter_allまたは直接アクセス）
+			if hasattr(shared_rb, 'iter_all'):
+				rb_samples_all = list(shared_rb.iter_all(owner_pid=None))[:min(100, len(shared_rb))]
+				rb_samples_pid0 = list(shared_rb.iter_all(owner_pid=0))[:min(100, len(shared_rb))]
+			else:
+				rb_samples_all = list(shared_rb)[:min(100, len(shared_rb))]
+				rb_samples_pid0 = []
+			q_count_rb_all = sum(1 for s in rb_samples_all if _extract_value_q(s) is not None)
+			q_count_rb_pid0 = sum(1 for s in rb_samples_pid0 if _extract_value_q(s) is not None)
+			player_id_count_rb = sum(1 for s in rb_samples_all if s.get('player_id') is not None)
+			print(f"[DEBUG_VALUE_MIX] replay_buffer size={len(shared_rb)}, samples_with_q (all, first 100)={q_count_rb_all}, samples_with_q (pid=0, first 100)={q_count_rb_pid0}, samples_with_player_id (first 100)={player_id_count_rb}")
+		except Exception as e:
+			print(f"[DEBUG_VALUE_MIX] failed to check replay_buffer: {e}")
+	
+		if logger:
+			# _rebuild_replayの返り値を使用（再カウント不要）
+			logger.log_text(f"[resume-timer] rebuild_replay took={t_rebuild_end - t_rebuild_start:.3f}s train={train_samples_total} val={val_samples_total} total={len(shared_rb)}")
+			logger.flush_buffers(force=True)
+		
 	t_rebuild_end = time.time()
 	try:
 		if logger:
@@ -1449,6 +1997,7 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 			logger.flush_buffers(force=True)
 	except Exception:
 		pass
+	_log_memory_usage(logger, cfg, 'after_rebuild')
 	# 集約進捗表示 (episodes は meta から取得した累積値)
 	# replay_size は実際のリプレイバッファ長を表示する
 	try:
@@ -1466,7 +2015,7 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 		_run_validation(learner, logger, cfg, note='pre-train')
 
 	# 学習ループ
-	updates = int(updates)
+	# updates is already converted to int at the beginning of the function
 	val_every = int(cfg.get('val_eval_every_updates', 0) or 0)
 	batch_size = int(cfg.get('batch_size', 256) or 256)
 	version_interval = int(version_interval or 0)
@@ -1474,24 +2023,158 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 	# バリデーションをログ出力と同一タイミングに揃える: ログ間隔を val_every (設定されていれば) に合わせる
 	log_interval = val_every if val_every > 0 else int(cfg.get('train_log_every_updates', 1) or 1)
 
+	# ベストモデル保存用 (打ち切りは行わない)
+	early_min_delta = float(cfg.get('early_stop_min_delta', 0.0) or 0.0)
+	early_gap_delta = float(cfg.get('early_stop_gap_min_delta', 0.0) or 0.0)
+	early_best: tuple[float | None, float | None] | None = None  # (val_value_loss, gap)
+	early_best_path = os.path.join(cfg.get('checkpoint_dir', 'checkpoints'), 'policy_value_best.pt')
+
 	last_loss_info = None
 	# --- 学習ループ + プールリフレッシュ ---
 	for i in range(updates):
 		loss_info = learner.train_step(batch_size=batch_size)
+		_maybe_collect_gc(cfg)
+		
+		# 50ステップごとに勾配ノルムを表示
+		current_step = train_updates_cum + i + 1
+		if (current_step % 50) == 0:
+			try:
+				import math as _m
+				import torch as _t
+				
+				grad_norm = None
+				value_head_grad_norm = None
+				policy_head_grad_norm = None
+				hand_head_grad_norm = None
+				
+				if isinstance(loss_info, dict):
+					grad_norm = loss_info.get('grad_norm')
+					value_head_grad_norm = loss_info.get('value_head_grad_norm')
+				
+				# モデルから直接各ヘッドの勾配ノルムを計算
+				if learner.model is not None:
+					try:
+						# Policy Headの勾配ノルム
+						policy_sq = 0.0
+						policy_count = 0
+						for name, param in learner.model.named_parameters():
+							if 'policy_head' in name and param.requires_grad and param.grad is not None:
+								policy_sq += float(param.grad.detach().data.norm(2).item() ** 2)
+								policy_count += 1
+						if policy_count > 0:
+							policy_head_grad_norm = float(_m.sqrt(policy_sq))
+					except Exception:
+						pass
+					
+					try:
+						# Hand Headの勾配ノルム
+						hand_sq = 0.0
+						hand_count = 0
+						for name, param in learner.model.named_parameters():
+							if 'hand_head' in name and param.requires_grad and param.grad is not None:
+								hand_sq += float(param.grad.detach().data.norm(2).item() ** 2)
+								hand_count += 1
+						if hand_count > 0:
+							hand_head_grad_norm = float(_m.sqrt(hand_sq))
+					except Exception:
+						pass
+				
+				# ログ出力（ヘッド別勾配ノルム）
+				try:
+					def _fmt(v):
+						return f"{v:.6f}" if v is not None else "None"
+					msg = (
+						f"[grad-norm-head] step={current_step} "
+						f"total={_fmt(grad_norm)} policy={_fmt(policy_head_grad_norm)} "
+						f"value={_fmt(value_head_grad_norm)} hand={_fmt(hand_head_grad_norm)}"
+					)
+					if logger:
+						logger.log_text(msg)
+				except Exception:
+					pass
+			except Exception as e:
+				# エラーは無視して続行
+				pass
+		
+		if ((i + 1) % log_interval) == 0 or (i + 1) == updates:
+			_log_memory_usage(logger, cfg, f"train_loop_step={train_updates_cum + i + 1}")
 		# 空データ回避ログ
 		if isinstance(loss_info, dict) and loss_info.get('loss') is None and loss_info.get('reason') == 'no_data':
-			logger.log_text('[warn] train_step skipped (no_data)')
-		# アクティブファイルプール刷新（更新回数ベース）
-		if pool_size > 0 and refresh_every > 0 and ((train_updates_cum + i + 1) % refresh_every == 0):
+			# リプレイバッファの状態を詳細にログ出力
 			try:
-				active_files, _stats = _refresh_active_pool(active_files, all_files, cfg, shared_rb, val_ratio, _seed, eff_max_samp, logger, train_updates_cum=train_updates_cum + i + 1)
+				rb_size = len(shared_rb) if shared_rb else 0
+				# 学習プレイヤー（player_id=0）のサンプルを確認
+				if hasattr(shared_rb, 'iter_all'):
+					all_samples_pid0 = list(shared_rb.iter_all(owner_pid=0))
+					train_samples_pid0 = [s for s in all_samples_pid0 if isinstance(s, dict) and s.get('split') != 'val']
+					has_value_samples_pid0 = [s for s in train_samples_pid0 if s.get('value') is not None]
+					logger.log_text(
+						f'[warn] train_step skipped (no_data) '
+						f'replay_buffer_size={rb_size} '
+						f'player_id=0_total={len(all_samples_pid0)} '
+						f'player_id=0_train={len(train_samples_pid0)} '
+						f'player_id=0_train_with_value={len(has_value_samples_pid0)}'
+					)
+				else:
+					all_samples = list(shared_rb) if shared_rb else []
+					train_samples = [s for s in all_samples if isinstance(s, dict) and s.get('split') != 'val']
+					has_value_samples = [s for s in train_samples if s.get('value') is not None]
+					logger.log_text(
+						f'[warn] train_step skipped (no_data) '
+						f'replay_buffer_size={rb_size} '
+						f'train_samples={len(train_samples)} '
+						f'train_with_value={len(has_value_samples)}'
+					)
+			except Exception as e:
+				logger.log_text(f'[warn] train_step skipped (no_data) - 詳細確認失敗: {e}')
+		# アクティブファイルプール刷新（更新回数ベース）
+		# sliding_window モード (buffer_window_size > 0) の場合はリフレッシュをスキップ
+		if pool_size > 0 and refresh_every > 0 and buffer_window_size == 0 and ((train_updates_cum + i + 1) % refresh_every == 0):
+			try:
+				active_files, _stats = _refresh_active_pool(active_files, all_files, cfg, shared_rb, val_ratio, _seed, eff_max_samp, logger, train_updates_cum=train_updates_cum + i + 1, data_dir=data_dir)
 			except Exception as e:
 				logger.log_text(f"[WARN] active-pool refresh failed: {e}")
 
 		# ログ間隔に到達したときのみ検証 & ログ出力
 		if ((i + 1) % log_interval) == 0:
 			if val_every > 0:  # バリデーション間隔設定がある場合はそのタイミングで実施
-				_run_validation(learner, logger, cfg, batch_size=batch_size, note=f'update={train_updates_cum + i + 1}')
+				val_metrics = _run_validation(learner, logger, cfg, batch_size=batch_size, note=f'update={train_updates_cum + i + 1}')
+				# ベストモデル更新判定 (val_value_loss 最小、同値なら Train/Val Gap 最小を優先)
+				try:
+					val_v = None
+					if isinstance(val_metrics, dict):
+						val_v = val_metrics.get('value_loss')
+					train_v = None
+					if isinstance(loss_info, dict):
+						train_v = loss_info.get('value_loss') or loss_info.get('loss')
+					gap = None
+					if val_v is not None and train_v is not None:
+						try:
+							gap = abs(float(val_v) - float(train_v))
+						except Exception:
+							gap = None
+					improved = False
+					if val_v is not None:
+						if early_best is None:
+							improved = True
+						else:
+							best_val, best_gap = early_best
+							if best_val is None or val_v < best_val - early_min_delta:
+								improved = True
+							elif best_val is not None and abs(val_v - best_val) <= early_min_delta:
+								if gap is not None:
+									if best_gap is None or gap < best_gap - early_gap_delta:
+										improved = True
+					if improved:
+						early_best = (val_v, gap)
+						try:
+							os.makedirs(os.path.dirname(early_best_path), exist_ok=True)
+							if hasattr(learner, 'model') and learner.model is not None:
+								learner.model.save(early_best_path, logger=logger, force_sync=True)  # type: ignore[arg-type]
+						except Exception:
+							pass
+				except Exception:
+					pass
 			if isinstance(loss_info, dict) and loss_info.get('loss') is not None:
 				try:
 					loss_info.setdefault('train_count', train_updates_cum + i + 1)
@@ -1557,25 +2240,86 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 			pass
 
 	# 最後に最新モデル保存 (version_tag なし)
-	_save_checkpoint(bundle, cfg, model_version, version_tag=None)
-
-	# エピソード累計に基づくバージョン保存: 指定間隔ごとに ep タグで保存
+	# 保存前にモデルのパラメータを検証
 	try:
-		if version_interval > 0 and episodes_cumulative > 0 and (episodes_cumulative % version_interval == 0):
+		model = bundle.model
+		if model is not None:
+			state_dict = model.state_dict()
+			critical_params = [
+				'self_encoder.0.weight',
+				'context_encoder.0.weight',
+				'backbone_proj.weight',
+				'backbone.0.lin1.weight',
+				'backbone.0.lin2.weight',
+				'policy_head.0.weight',
+				'value_head.0.weight',
+			]
+			zero_params = []
+			for key in critical_params:
+				if key in state_dict:
+					param = state_dict[key]
+					if hasattr(param, 'abs'):
+						abs_max = param.abs().max().item()
+						if abs_max < 1e-8:
+							zero_params.append(key)
+			
+			if zero_params:
+				if logger:
+					logger.log_text(f"[WARN] Before save_checkpoint: Found zero weight parameters: {zero_params[:5]}{'...' if len(zero_params) > 5 else ''}")
+				print(f"[WARN] Before save_checkpoint: Found zero weight parameters: {zero_params[:5]}{'...' if len(zero_params) > 5 else ''}")
+				# ゼロパラメータが見つかった場合、保存をスキップ
+				if logger:
+					logger.log_text(f"[WARN] Skipping checkpoint save due to zero parameters")
+				print(f"[WARN] Skipping checkpoint save due to zero parameters")
+				return
+	except Exception as e:
+		if logger:
+			logger.log_text(f"[WARN] Parameter validation before save failed: {e}")
+		print(f"[WARN] Parameter validation before save failed: {e}")
+	
+	_save_checkpoint(bundle, cfg, model_version, version_tag=None, logger=logger)
+
+	# エピソード累計に基づくバージョン保存:
+	# 10000, 20000, 30000... のちょうどの倍数でのみ1回保存する
+	checkpoint_interval = int(version_interval or 0) if int(version_interval or 0) > 0 else int(cfg.get('checkpoint_interval_episodes', 10000) or 10000)
+	last_saved_episode = int(meta.get('last_checkpoint_episode', 0) or 0)
+	if checkpoint_interval > 0 and episodes_cumulative >= checkpoint_interval:
+		# 現在到達している最大の倍数を計算（例: 30600 → 30000）
+		target_multiple = (episodes_cumulative // checkpoint_interval) * checkpoint_interval
+		# 前回保存した倍数より大きい倍数に到達した場合のみ保存
+		# 例: last_saved=20000, target=30000 → 保存
+		#     last_saved=30000, target=30000 → 保存しない（既に保存済み）
+		if target_multiple > 0 and target_multiple > last_saved_episode:
 			model_version += 1
-			_save_checkpoint(bundle, cfg, model_version, version_tag=f'ep{episodes_cumulative}')
-			logger.log_text(f"[ckpt] saved version={model_version} at episode={episodes_cumulative}")
-	except Exception:
-		pass
+			_save_checkpoint(bundle, cfg, model_version, version_tag=f'ep{target_multiple}', logger=logger)
+			if logger:
+				logger.log_text(
+					f"[ckpt] saved version={model_version} at episode={target_multiple} (current_episodes={episodes_cumulative})"
+				)
+			# 保存した倍数を記録（次回はこれより大きい倍数に到達するまで保存しない）
+			meta['last_checkpoint_episode'] = target_multiple
+			try:
+				_update_meta(data_dir, meta)
+			except Exception:
+				pass
 
 	# 学習後の最終検証を一度実施（intervalに依らず終端の値を残す）
 	_run_validation(learner, logger, cfg, batch_size=batch_size, note='post-train')
+	_maybe_collect_gc(cfg)
+	_log_memory_usage(logger, cfg, 'after_train_loop')
 
 	train_updates_cum += updates
 	# consumed_files は使用しない (毎回全ファイルを対象)
 	meta['train_updates_cumulative'] = train_updates_cum
 	meta['model_version'] = model_version
 	meta['episodes_cumulative'] = episodes_cumulative  # 既存値保持 (self-play 側で更新済み想定)
+	# last_checkpoint_episode は既にチェックポイント保存時に更新されているが、
+	# 学習ループ終了時にも保持する（既存の値が上書きされないように）
+	# meta は _load_meta で読み込まれているので、既存の last_checkpoint_episode は既に含まれている
+	# チェックポイント保存時に更新された場合は新しい値が設定されている
+	# ここでは明示的に設定する必要はないが、存在しない場合はデフォルト値0を設定
+	if 'last_checkpoint_episode' not in meta:
+		meta['last_checkpoint_episode'] = 0
 	# リプレイサイズを meta に記録しておくと self-play 側から軽量に参照できる
 	# meta へも全選択ファイル合計サンプル数を記録（学習に使った一部だけでなく全体規模を把握する目的）
 	# リプレイサイズを meta に記録（表示/自己対局側参照用）。実メモリ内のバッファ長を採用。
@@ -1600,9 +2344,60 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 	# --- Buffer State 保存（スライディングウィンドウモード時）---
 	# 次回学習時に同じファイルを再度読み込まないよう、現在のウィンドウ状態を永続化
 	# 改善案A: 使用済みファイルを記録して次回除外
-	if buffer_state_used:
+	# 注意: 学習が実際に実行された場合（updates > 0 かつ学習ループが実行された場合）のみ used_files を更新
+	# 注意: updates <= 0 の場合の active_files 保存は早期リターン前で処理済み
+	if buffer_state_used and updates > 0:
 		try:
-			_save_buffer_state(data_dir, active_files, used_files=used_files_for_session, logger=logger)
+			# 学習が実行された場合のみ、使用したファイルを記録
+			used_files_for_session = list(active_files)
+			# Ensure active_files is filled up to window_size before persisting.
+			try:
+				desired = int(buffer_window_size)
+			except Exception:
+				desired = 0
+			if desired > 0:
+				try:
+					# buffer_state may contain historical used_files
+					prev_used = set(buffer_state.get('used_files', [])) if isinstance(buffer_state, dict) else set()
+					# candidates: prefer unused files first
+					candidates = [f for f in all_files if f not in active_files and f not in prev_used and os.path.isfile(f)]
+					# sort by mtime ascending, pick newest later
+					try:
+						candidates.sort(key=lambda x: os.path.getmtime(x))
+					except Exception:
+						pass
+					need = desired - len(active_files)
+					if need > 0 and candidates:
+						add = candidates[-need:]
+						active_files = list(active_files) + add
+						need = desired - len(active_files)
+					# if still need, allow reusing used files (oldest-first)
+					if need > 0:
+						reuse = [f for f in all_files if f not in active_files and os.path.isfile(f)]
+						try:
+							reuse.sort(key=lambda x: os.path.getmtime(x))
+						except Exception:
+							pass
+						if reuse:
+							add2 = reuse[-need:]
+							active_files = list(active_files) + add2
+				# final clamp
+					if len(active_files) > desired:
+						active_files = active_files[-desired:]
+				except Exception:
+					# if anything fails, keep existing active_files
+					pass
+			# Also persist initial val selection as used to avoid reusing those files
+			try:
+				if initial_val_files:
+					# remove initial val files from active list
+					active_files = [f for f in active_files if f not in initial_val_files]
+					_save_buffer_state(data_dir, active_files, used_files=list(initial_val_files), logger=logger)
+				else:
+					_save_buffer_state(data_dir, active_files, used_files=used_files_for_session, logger=logger)
+			except Exception:
+				# fallback to saving full used_files_for_session
+				_save_buffer_state(data_dir, active_files, used_files=used_files_for_session, logger=logger)
 		except Exception as e:
 			if logger:
 				logger.log_text(f"[WARN] buffer_state save failed: {e}")
@@ -1646,7 +2441,7 @@ def main():
 	parser.add_argument('--updates', type=int, default=500, help='今回実行する train_step 回数')
 	parser.add_argument('--max-files', type=int, default=None, help='一度の取り込みで処理する新規 selfplay ファイル上限')
 	parser.add_argument('--max-samples-per-file', type=int, default=None, help='各ファイルの取り込みサンプル上限 (train/val それぞれ)')
-	parser.add_argument('--version-interval', type=int, default=0, help='このエピソード累計間隔ごとに世代タグ付き ckpt 保存 (0=無効)')
+	parser.add_argument('--version-interval', type=int, default=10000, help='このエピソード累計間隔ごとに世代タグ付き ckpt 保存 (0=無効)')
 	parser.add_argument('--device', type=str, default=None, help='デバイス指定 (auto/cpu/cuda)')
 	parser.add_argument('--seed', type=int, default=None, help='乱数シード override')
 	args = parser.parse_args()

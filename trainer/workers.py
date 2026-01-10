@@ -318,6 +318,20 @@ class SelfplayDaemonWorker:
         # 通番更新
         self._local_episode_counter += 1
         ep_index = self._local_episode_counter - 1
+        
+        # エピソードごとにシードを再設定（カードシャッフルの多様性を確保）
+        try:
+            base_seed = int(self.config.get("seed", 42))
+            episode_seed = base_seed + 10000 * int(self.worker_id) + ep_index
+            random.seed(episode_seed)
+            try:
+                import numpy as _np
+                _np.random.seed(episode_seed % (2**32 - 1))
+            except Exception:
+                pass
+        except Exception:
+            pass  # シード設定に失敗しても続行
+        
         if hasattr(self.env, 'reset'):
             self.env.reset()
         for ag in self.agents:

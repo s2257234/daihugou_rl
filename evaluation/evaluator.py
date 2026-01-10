@@ -30,6 +30,7 @@ from agents.drl_agent import AlphaZeroAgent
 from agents.config import ALPHA_ZERO_CONFIG
 from agents.random_agent import RandomAgent
 from agents.rule_based_agent import RuleBasedAgent
+from agents.ucb_mcts_agent import UCBMCTSAgent
 from game.environment import DaifugoSimpleEnv
 from evaluation.rating import RatingManager, EloConfig
 
@@ -75,7 +76,7 @@ def _parallel_eval_init(checkpoint_path: str,
     if det_mode_eval is not None:
         cfg["determinization_mode_eval"] = det_mode_eval
     _EV_CFG = cfg
-    _EV_BASELINE_MIX = list(baseline_mix or ["rule", "random", "random"])
+    _EV_BASELINE_MIX = list(baseline_mix or ["mcts", "rule", "random"])
     _EV_PAST_CKPTS = list(past_checkpoints or [])
     _EV_SEAT_ROTATION = True  # 座席回転の有無は呼び出し側でエピソード順に渡すため常に有効扱い
     _EV_VALUE_THRESHOLD = float(value_threshold)
@@ -269,28 +270,44 @@ class Evaluator:
         self.device = device or self._auto_device()
         self.num_simulations = num_simulations or ALPHA_ZERO_CONFIG.get("num_simulations", 32)
         self.elo = RatingManager(save_dir=elo_dir, config=EloConfig())
-        # baseline_mix 例: ["rule", "random", "random"] -> 学習エージェント + 3 baseline
-        self.baseline_mix = baseline_mix or ["rule", "random", "random"]
+        # baseline_mix 例: ["mcts", "rule", "random"] -> 学習エージェント + 3 baseline
+        # 既定で単体MCTS(UCBMCTSAgent)、ルールベース、ランダムを含める
+        self.baseline_mix = baseline_mix or ["mcts", "rule", "random"]
         # 過去モデルのチェックポイント群（最大3枠まで採用）
         self.past_checkpoints = list(past_checkpoints or [])
         self.config = dict(ALPHA_ZERO_CONFIG)
         self.config["num_simulations"] = self.num_simulations
         self.config["device"] = self.device
         # 評価ではメモリ削減を優先: MCTS TT と並列デタミニゼーションプールを無効化
-        try:
-            self.config["enable_mcts_tt"] = False
+        if isinstance(self.config, dict):
+            self.config["enable_mcts_tt"] = True
             self.config["enable_parallel_determinization"] = False
-        except Exception:
-            pass
+        else:
+            try:
+                setattr(self.config, "enable_mcts_tt", True)
+                setattr(self.config, "enable_parallel_determinization", False)
+            except (AttributeError, TypeError):
+                import warnings
+                warnings.warn(f"Could not set MCTS config (type: {type(self.config)}), using defaults")
         # 評価フェーズでは探索ノイズOFF・温度0・序盤ランダム無効化を徹底
         # （AlphaZeroAgent.select_action(training=False) でも低温/ノイズ無効になるが、明示的に設定）
-        try:
+        # config が辞書型でない場合や読み取り専用の場合は KeyError/TypeError が発生する可能性がある
+        if isinstance(self.config, dict):
             self.config["inference_dirichlet"] = False  # 推論時のルートDirichletを無効化
             self.config["dirichlet_epsilon"] = 0.0      # 念のため係数も0に
             self.config["temperature"] = 0.0            # 温度0（_select_temperatureで非学習時は1e-6だが整合のため）
             self.config["opening_random_enable"] = False
-        except Exception:
-            pass
+        else:
+            # config が辞書型でない場合は setattr を試行（読み取り専用プロパティの可能性）
+            try:
+                setattr(self.config, "inference_dirichlet", False)
+                setattr(self.config, "dirichlet_epsilon", 0.0)
+                setattr(self.config, "temperature", 0.0)
+                setattr(self.config, "opening_random_enable", False)
+            except (AttributeError, TypeError):
+                # 設定できない場合は警告を出力して続行
+                import warnings
+                warnings.warn(f"Could not set evaluation config (type: {type(self.config)}), using defaults")
         # 評価時の determinization モードを上書き（デフォルトで fixed_once）。
         if determinization_mode_override is not None:
             self.config["determinization_mode_eval"] = determinization_mode_override
@@ -364,6 +381,7 @@ class Evaluator:
                     num_players=self.config["num_players"],
                     device=self.device,
                     full_feature_dim=full_dim,
+                    context_out_dim=self.config.get("hidden_size", 128),  # hidden_sizeに合わせる（過学習防止）
                 )
         else:
             print(f"[WARN] checkpoint not found: {self.checkpoint_path}. Using random initialized model.")
@@ -374,6 +392,7 @@ class Evaluator:
                 num_players=self.config["num_players"],
                 device=self.device,
                 full_feature_dim=full_dim,
+                context_out_dim=self.config.get("hidden_size", 128),  # hidden_sizeに合わせる（過学習防止）
             )
         # 念のため新規作成時も eval() を明示
         try:
@@ -457,8 +476,22 @@ class Evaluator:
                 pass
 
     def _make_baseline_agent(self, spec: str, player_id: int):
-        if spec == "rule":
+        # 指定文字列に応じてベースラインエージェントを生成
+        s = (spec or "").lower()
+        if s in ("mcts", "ucb_mcts", "ucbmcts"):
+            try:
+                # UCBMCTSAgent のコンストラクタはオプション引数を受け取る可能性があるため柔軟に対応
+                return UCBMCTSAgent(player_id=player_id, num_simulations=self.num_simulations)
+            except TypeError:
+                try:
+                    return UCBMCTSAgent(player_id=player_id)
+                except Exception:
+                    return RandomAgent(player_id=player_id)
+            except Exception:
+                return RandomAgent(player_id=player_id)
+        if s == "rule":
             return RuleBasedAgent(player_id=player_id)
+        # default: random
         return RandomAgent(player_id=player_id)
 
     def _make_alpha_zero_eval_agent_from_ckpt(self, player_id: int, ckpt_path: str):

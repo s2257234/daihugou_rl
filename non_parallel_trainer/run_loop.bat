@@ -17,7 +17,7 @@ IF NOT DEFINED WORKERS SET WORKERS=16
 IF NOT DEFINED TRAIN_UPDATES SET TRAIN_UPDATES=200
 IF NOT DEFINED MAX_FILES_PER_TRAIN SET MAX_FILES_PER_TRAIN=100
 REM data/ の保存上限（FIFO）。100を既定に設定
-IF NOT DEFINED DATA_MAX_FILES SET DATA_MAX_FILES=100
+IF NOT DEFINED DATA_MAX_FILES SET DATA_MAX_FILES=70
 IF NOT DEFINED DATA_DIR SET DATA_DIR=data
 IF NOT DEFINED LOG_DIR SET LOG_DIR=logs
 IF NOT DEFINED CKPT_DIR SET CKPT_DIR=checkpoints
@@ -32,14 +32,43 @@ IF EXIST "%VENV_PY%" (
   SET "PYTHON_EXE=python"
 )
 
-REM Loop count
-SET LOOP_COUNT=%1
-IF "%LOOP_COUNT%"=="" SET LOOP_COUNT=5000
+IF NOT DEFINED WARMUP_UPDATES SET WARMUP_UPDATES=15000
+
+REM Parse CLI args: first*p count, flag --train-warmup enables train-only warmup
+SET "TRAIN_WARMUP=0"
+SET "LOOP_COUNT="
+FOR %%A IN (%*) DO (
+  IF /I "%%~A"=="--train-warmup" (
+    SET "TRAIN_WARMUP=1"
+  ) ELSE IF NOT DEFINED LOOP_COUNT (
+    SET "LOOP_COUNT=%%~A"
+  )
+)
+IF NOT DEFINED LOOP_COUNT SET LOOP_COUNT=5000
 
 ECHO [RUN-LOOP] Start episodes/gen=%EPISODES_PER_GEN% workers=%WORKERS% updates/train=%TRAIN_UPDATES% loop_count=%LOOP_COUNT%
 ECHO [RUN-LOOP] Data=%DATA_DIR% Log=%LOG_DIR% Checkpoints=%CKPT_DIR% Python=%PYTHON_EXE%
 ECHO [RUN-LOOP] version_interval(episodes)=%VERSION_INTERVAL%
+IF "%TRAIN_WARMUP%"=="1" (
+  ECHO [MODE] Train-first warmup enabled (updates=%WARMUP_UPDATES%)
+) ELSE (
+  ECHO [MODE] Standard loop (self-play -> train)
+)
 ECHO [RUN-LOOP] Press Ctrl+C to stop.
+
+IF "%TRAIN_WARMUP%"=="1" (
+  ECHO.
+  ECHO [WARMUP] Starting train-only phase: updates=%WARMUP_UPDATES% max-files=%MAX_FILES_PER_TRAIN%
+  "%PYTHON_EXE%" -m non_parallel_trainer.non_parallel_trainer --data-dir "%DATA_DIR%" --log-dir "%LOG_DIR%" --checkpoint-dir "%CKPT_DIR%" --updates %WARMUP_UPDATES% --max-files %MAX_FILES_PER_TRAIN% --version-interval %VERSION_INTERVAL%
+  SET TR_EXIT=!ERRORLEVEL!
+  ECHO [DEBUG] warmup trainer exit code=!TR_EXIT!
+  IF !TR_EXIT! NEQ 0 (
+    ECHO [ERROR] warmup training returned non-zero exit code !TR_EXIT!
+    GOTO ERROR_PAUSE
+  )
+  IF %VERBOSE_PHASE_LOG%==1 ECHO [TIME] warmup training finished at %DATE% %TIME%
+  ECHO [WARMUP] Completed. Switching to self-play + train loop.
+)
 
 SET ITER=0
 
@@ -79,12 +108,12 @@ IF !FILE_COUNT! LSS 30 (
   ECHO [PHASE] Warm-up: files=!FILE_COUNT!/30 episodes=!CUMULATIVE_EPISODES! training=SKIP
 ) ELSE IF !CUMULATIVE_EPISODES! LSS 100000 (
   REM Phase 2: 30+ files but less than 100k episodes - updates=50
-  SET "CURRENT_UPDATES=50"
-  ECHO [PHASE] Early training: files=!FILE_COUNT! episodes=!CUMULATIVE_EPISODES! updates=50
+  SET "CURRENT_UPDATES=100"
+  ECHO [PHASE] Early training: files=!FILE_COUNT! episodes=!CUMULATIVE_EPISODES! updates=100
 ) ELSE (
   REM Phase 3: 30+ files and 100k+ episodes - updates=90
-  SET "CURRENT_UPDATES=90"
-  ECHO [PHASE] Full training: files=!FILE_COUNT! episodes=!CUMULATIVE_EPISODES! updates=90
+  SET "CURRENT_UPDATES=100"
+  ECHO [PHASE] Full training: files=!FILE_COUNT! episodes=!CUMULATIVE_EPISODES! updates=100
 )
 
 REM ---- Phase 1: Self-play data generation ----

@@ -642,15 +642,16 @@ def run_self_play(cfg: Dict[str, Any], episodes: int, workers: int, model_path: 
 	# 圧縮レベル:
 	# 直列モード (non-parallel) は memmap 利用とI/O高速化を優先し compress=0 を強制。
 	# 並列モードと区別するための設定キー selfplay_joblib_compress があってもここでは無視。
-	# 必要なら config-json で selfplay_force_compress>=0 を指定して上書き可能。
-	force_c = cfg.get('selfplay_force_compress', None)
+	# 必要なら config-json で selfplay_joblib_compress>=0 を指定して上書き可能。
+	# デフォルトは0（無圧縮）でロード時のCPU展開コストを削減し、高速化を優先。
+	force_c = cfg.get('selfplay_joblib_compress', None)
 	if force_c is not None:
 		try:
 			compress_lv = int(force_c)
 		except Exception:
 			compress_lv = 0
 	else:
-		compress_lv = 0  # non-parallel 強制無圧縮
+		compress_lv = 0  # non-parallel 強制無圧縮（高速化優先）
 	try:
 		if not cfg.get('disable_data_writes', False):
 			tmp = out_path + '.tmp'

@@ -411,16 +411,14 @@ def train_concurrent(
                         print(line, end='\r', flush=True)
                     if trainer.logger and isinstance(loss_info, dict) and loss_info.get("loss") is not None and not getattr(trainer.agents[0], '_logged_inside', False):
                         trainer.logger.log_train(loss_info)
-                    try:
-                        val_every = int(trainer.config.get("val_eval_every_updates", 0) or 0)
-                    except Exception:
-                        val_every = 0
-                    if trainer.logger and val_every > 0 and (train_it % val_every == 0):
+                    # 検証: 毎回実行してログ出力（検証ロスは毎回計算し、train_updates.csvに記録する）
+                    if trainer.logger:
                         try:
                             vinfo = trainer.agents[0].validate_step(batch_size=trainer.config.get("val_batch_size") or trainer.config.get("batch_size", 256))
                         except Exception:
                             vinfo = {"policy_loss": None, "value_loss": None, "entropy": None}
-                        if isinstance(vinfo, dict) and (vinfo.get("policy_loss") is not None or vinfo.get("value_loss") is not None):
+                        # 検証結果をログに記録（None値でも記録して、CSVの列を埋める）
+                        if isinstance(vinfo, dict):
                             trainer.logger.log_validation(vinfo)
 
                 last_train_ts = time.time()

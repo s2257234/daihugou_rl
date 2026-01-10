@@ -321,6 +321,9 @@ class TrainingLogger:
     def log_train(self, metrics: Dict[str, Any]):
         if self._disk_full:
             return
+        # 検証ロスを取得してからupdate_stepをインクリメント
+        # これにより、log_validationが保存した値（update_step + 1）を正しく取得できる
+        current_step_before_inc = self.update_step
         self.update_step += 1
         # 旧バージョンの train_updates.csv に追記しようとして列不足になるケースを検出し再生成 (一度だけ)
         try:
@@ -374,10 +377,22 @@ class TrainingLogger:
             (self.update_step % self.csv_train_every) == 0 or getattr(self, '_train_rows_written', 0) == 0
         )
         if should_write:
-            # 毎トレイン行に直近の検証ロスを必ず同梱（検証が未実施なら None）
-            vpl, vvl = self._last_val_pair
-            vhl = self._last_val_hand
-            vhr = self._last_val_hand_recall
+            # 毎トレイン行に現在のステップに対応する検証ロスを必ず同梱（検証が未実施なら None）
+            # 優先順位: 1) metricsに直接含まれている値、2) _val_losses_by_stepから取得、3) _last_val_pair
+            # これにより、log_trainが呼ばれる直前に計算された検証ロスを確実に使用できる
+            vpl = metrics.get('val_policy_loss')
+            vvl = metrics.get('val_value_loss')
+            vhl = metrics.get('val_hand_pred_loss')
+            vhr = metrics.get('val_hand_recall')
+            
+            # metricsに含まれていない場合、_val_losses_by_stepから取得
+            if vpl is None and vvl is None:
+                vpl, vvl = self._val_losses_by_step.get(self.update_step, self._last_val_pair)
+            # hand_pred_lossとhand_recallがmetricsに含まれていない場合、最新値を使用
+            if vhl is None:
+                vhl = self._last_val_hand
+            if vhr is None:
+                vhr = self._last_val_hand_recall
 
             # train_count を常に update_step と一致させる（直列モードでの二重カウント差異解消）
             row = [
@@ -453,7 +468,12 @@ class TrainingLogger:
         """
         if self._disk_full:
             return
-        step = self.update_step  # 学習と同じステップ番号で整列
+        # 注意: log_trainは最初にself.update_step += 1を実行するため、
+        # log_trainが呼ばれる直前にlog_validationが呼ばれる場合、
+        # log_trainでインクリメント後のupdate_stepで取得できるようにする
+        # つまり、現在のupdate_step + 1で保存する
+        # ただし、log_trainが呼ばれる直前にlog_validationが呼ばれることを前提とする
+        step = self.update_step + 1  # 次の学習ステップ番号で整列（log_trainでインクリメント後の値）
         # 検証ロスを保持（lossのみ）
         try:
             vp = metrics.get("policy_loss")
@@ -461,7 +481,7 @@ class TrainingLogger:
             vh = metrics.get("hand_pred_loss")
             vhr = metrics.get("hand_recall")
             self._val_losses_by_step[step] = (vp, vv)
-            # 直近値を更新（毎トレイン行に同梱するため）
+            # 直近値を更新（フォールバック用）
             self._last_val_pair = (vp, vv)
             self._last_val_hand = vh
             self._last_val_hand_recall = vhr
