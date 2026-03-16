@@ -31,8 +31,25 @@ from agents.config import ALPHA_ZERO_CONFIG
 from agents.random_agent import RandomAgent
 from agents.rule_based_agent import RuleBasedAgent
 from agents.ucb_mcts_agent import UCBMCTSAgent
+from agents.replay_buffer import canonicalize_state
 from game.environment import DaifugoSimpleEnv
 from evaluation.rating import RatingManager, EloConfig
+import atexit
+
+_EVAL_FALLBACK_LOGGED = set()
+
+
+def _log_eval_fallback_once(key: str, msg: str, exc: Exception | None = None) -> None:
+    if key in _EVAL_FALLBACK_LOGGED:
+        return
+    _EVAL_FALLBACK_LOGGED.add(key)
+    try:
+        if exc is not None:
+            print(f"{msg} ({type(exc).__name__}: {exc})")
+        else:
+            print(msg)
+    except Exception:
+        pass
 
 # ======================================================
 # 並列評価用ワーカー (Windows 対応: トップレベル関数)
@@ -47,6 +64,7 @@ _EV_BASELINE_MIX: List[str] | None = None
 _EV_SEAT_ROTATION: bool = True
 _EV_VALUE_THRESHOLD: float = 0.5
 _EV_WRITE_ZERO_ON_MISSING: bool = False
+_EV_NUM_SIMULATIONS: int = 400
 
 def _parallel_eval_init(checkpoint_path: str,
                         device: str,
@@ -55,15 +73,17 @@ def _parallel_eval_init(checkpoint_path: str,
                         det_mode_eval: str | None,
                         past_checkpoints: List[str] | None,
                         seed: int | None,
+                        num_simulations: int = 400,
                         value_threshold: float = 0.5,
                         write_zero_on_missing: bool = False):
     # グローバルを書き換え
-    global _EV_CFG, _EV_DEVICE, _EV_CKPT, _EV_MODEL, _EV_PAST_MODELS, _EV_PAST_CKPTS, _EV_BASELINE_MIX, _EV_SEAT_ROTATION
+    global _EV_CFG, _EV_DEVICE, _EV_CKPT, _EV_MODEL, _EV_PAST_MODELS, _EV_PAST_CKPTS, _EV_BASELINE_MIX, _EV_SEAT_ROTATION, _EV_NUM_SIMULATIONS
     import random as _rnd
     if seed is not None:
         _rnd.seed(seed + os.getpid())
     _EV_DEVICE = device
     _EV_CKPT = checkpoint_path
+    _EV_NUM_SIMULATIONS = int(num_simulations)
     # 評価時の安定設定を適用した config を構築
     cfg = dict(base_cfg)
     try:
@@ -71,13 +91,28 @@ def _parallel_eval_init(checkpoint_path: str,
         cfg["dirichlet_epsilon"] = 0.0
         cfg["temperature"] = 0.0
         cfg["opening_random_enable"] = False
-    except Exception:
-        pass
+        # バッチ推論サイズが設定されていない場合、デフォルト値（32）を設定
+        if "mcts_batch_eval_size" not in cfg or cfg.get("mcts_batch_eval_size", 1) == 1:
+            # ALPHA_ZERO_CONFIGから取得、またはデフォルト値32を使用
+            from agents.config import ALPHA_ZERO_CONFIG as _AZC
+            default_batch_size = _AZC.get("mcts_batch_eval_size", 32)
+            cfg["mcts_batch_eval_size"] = default_batch_size
+        # MCTS TTを有効化（評価時の高速化）
+        cfg["enable_mcts_tt"] = True
+        cfg["enable_parallel_determinization"] = True
+    except Exception as e:
+        _log_eval_fallback_once(
+            "eval_init_config_apply_failed",
+            "[eval-fallback] failed to apply inference-stable config; using base config",
+            e,
+        )
     if det_mode_eval is not None:
         cfg["determinization_mode_eval"] = det_mode_eval
     _EV_CFG = cfg
-    _EV_BASELINE_MIX = list(baseline_mix or ["mcts", "rule", "random"])
+    _EV_BASELINE_MIX = list(baseline_mix or ["ucb_mcts", "random", "rule"])
     _EV_PAST_CKPTS = list(past_checkpoints or [])
+    # num_simulations は cfg から取得（もし base_cfg に含まれていない場合はデフォルト200）
+    _EV_NUM_SIMULATIONS = int(cfg.get("num_simulations", 200))
     _EV_SEAT_ROTATION = True  # 座席回転の有無は呼び出し側でエピソード順に渡すため常に有効扱い
     _EV_VALUE_THRESHOLD = float(value_threshold)
     _EV_WRITE_ZERO_ON_MISSING = bool(write_zero_on_missing)
@@ -94,8 +129,33 @@ def _parallel_eval_init(checkpoint_path: str,
         except Exception:
             pass
     except Exception as e:
+        _log_eval_fallback_once(
+            "eval_init_main_model_load_failed",
+            "[eval-fallback] failed to load main model; using None",
+            e,
+        )
         print(f"[WARN] eval worker failed to load main model: {e}")
         _EV_MODEL = None
+    # ワーカー終了時に CUDA IPC ハンドルを回収する登録
+    try:
+        def _worker_ipc_cleanup():
+            try:
+                import torch
+                if getattr(torch, 'cuda', None) is not None and torch.cuda.is_available():
+                    try:
+                        torch.cuda.ipc_collect()
+                    except Exception:
+                        pass
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        atexit.register(_worker_ipc_cleanup)
+    except Exception:
+        pass
     # 過去モデル読み込み（最大3つまで使用）
     _EV_PAST_MODELS = []
     if _EV_PAST_CKPTS:
@@ -113,6 +173,11 @@ def _parallel_eval_init(checkpoint_path: str,
                     pass
                 _EV_PAST_MODELS.append((p, m))
             except Exception as _e:
+                _log_eval_fallback_once(
+                    f"eval_init_past_model_load_failed:{p}",
+                    "[eval-fallback] failed to load past model; skipping",
+                    _e,
+                )
                 print(f"[WARN] eval worker failed to load past model '{p}': {_e}")
 
 def _parallel_eval_one(ep_index: int) -> Dict[str, Any]:
@@ -120,6 +185,7 @@ def _parallel_eval_one(ep_index: int) -> Dict[str, Any]:
     from agents.drl_agent import AlphaZeroAgent as _AZ
     from agents.rule_based_agent import RuleBasedAgent as _RB
     from agents.random_agent import RandomAgent as _RA
+    from agents.ucb_mcts_agent import UCBMCTSAgent as _UCB
     from game.environment import DaifugoSimpleEnv as _Env
     # グローバル参照
     cfg = dict(_EV_CFG or {})
@@ -131,29 +197,78 @@ def _parallel_eval_one(ep_index: int) -> Dict[str, Any]:
     ag_eval = _AZ(player_id=0, model=_EV_MODEL, config=cfg)
     agents.append(ag_eval)
     labels.append("AlphaZeroAgent")
-    # 過去モデル最大3
-    for p, m in (_EV_PAST_MODELS or [])[:3]:
-        pid = len(agents)
-        ag = _AZ(player_id=pid, model=m, config=cfg)
-        agents.append(ag)
-        labels.append(f"AlphaZeroAgent@{os.path.basename(p)}")
-    # 不足分は baseline_m mix で補完
-    needed = 4 - len(agents)
-    mix = list(_EV_BASELINE_MIX or [])
-    while len(mix) < needed:
-        mix.append("random")
-    class_counts: Dict[str, int] = {}
-    for spec in mix[:needed]:
-        pid = len(agents)
-        if spec == "rule":
-            ag = _RB(player_id=pid)
-            cname = "RuleBasedAgent"
-        else:
-            ag = _RA(player_id=pid)
-            cname = "RandomAgent"
-        agents.append(ag)
-        class_counts[cname] = class_counts.get(cname, 0) + 1
-        labels.append(f"{cname}#{class_counts[cname]}")
+    needed = 4 - len(agents)  # 必ず3になる
+    
+    # 過去モデルが指定されている場合は使用
+    if _EV_PAST_MODELS:
+        import os as _os
+        for i, (ckpt_path, past_model) in enumerate(_EV_PAST_MODELS[:needed]):
+            pid = len(agents)
+            try:
+                ag = _AZ(player_id=pid, model=past_model, config=cfg)
+                try:
+                    setattr(ag, "is_past_model", True)
+                except Exception:
+                    pass
+                # ラベル用にベース名を保持
+                try:
+                    setattr(ag, "checkpoint_name", _os.path.basename(ckpt_path))
+                except Exception:
+                    pass
+                agents.append(ag)
+                labels.append(f"AlphaZeroAgent@{_os.path.basename(ckpt_path)}")
+            except Exception as e:
+                print(f"[WARN] Failed to create agent from past checkpoint '{ckpt_path}': {e}")
+    
+    # 過去モデルが不足する場合はbaselineエージェントで補完
+    remaining = 4 - len(agents)
+    if remaining > 0:
+        mix = list(_EV_BASELINE_MIX or ["ucb_mcts", "random", "rule"])
+        while len(mix) < remaining:
+            mix.append("random")
+        class_counts: Dict[str, int] = {}
+        num_sims = _EV_NUM_SIMULATIONS
+        for spec in mix[:remaining]:
+            pid = len(agents)
+            spec_lower = (spec or "").lower()
+            if spec_lower == "rule":
+                ag = _RB(player_id=pid)
+                cname = "RuleBasedAgent"
+            elif spec_lower in ("mcts", "ucb_mcts", "ucbmcts"):
+                try:
+                    ag = _UCB(player_id=pid, num_simulations=num_sims)
+                    cname = "UCBMCTSAgent"
+                except TypeError:
+                    # num_simulations引数がサポートされていない場合は引数なしで再試行
+                    try:
+                        ag = _UCB(player_id=pid)
+                        cname = "UCBMCTSAgent"
+                    except Exception as e:
+                        # UCBMCTSAgentの生成に失敗した場合は警告を出力してRandomAgentにフォールバック
+                        _log_eval_fallback_once(
+                            f"eval_ucb_init_failed:{pid}",
+                            "[eval-fallback] failed to create UCBMCTSAgent; fallback to RandomAgent",
+                            e,
+                        )
+                        print(f"[WARN] Failed to create UCBMCTSAgent for player {pid}: {e}, falling back to RandomAgent")
+                        ag = _RA(player_id=pid)
+                        cname = "RandomAgent"
+                except Exception as e:
+                    # 予期しないエラーの場合も警告を出力
+                    _log_eval_fallback_once(
+                        f"eval_ucb_init_exception:{pid}",
+                        "[eval-fallback] unexpected UCBMCTSAgent init error; fallback to RandomAgent",
+                        e,
+                    )
+                    print(f"[WARN] Failed to create UCBMCTSAgent for player {pid}: {e}, falling back to RandomAgent")
+                    ag = _RA(player_id=pid)
+                    cname = "RandomAgent"
+            else:
+                ag = _RA(player_id=pid)
+                cname = "RandomAgent"
+            agents.append(ag)
+            class_counts[cname] = class_counts.get(cname, 0) + 1
+            labels.append(f"{cname}#{class_counts[cname]}")
     agents = agents[:4]
     labels = labels[:4]
     # 座席回転
@@ -170,78 +285,204 @@ def _parallel_eval_one(ep_index: int) -> Dict[str, Any]:
     # 対戦
     env = _Env(num_players=4, agent_classes=None)
     env.agents = agents
-    if hasattr(ag_eval, 'set_env_ref'):
-        try:
-            ag_eval.set_env_ref(env)
-        except Exception:
-            pass
+    # すべての AlphaZeroAgent に env_ref を渡す（並列デタミニゼーション有効化のため）
+    for _ag in env.agents:
+        if hasattr(_ag, 'set_env_ref'):
+            try:
+                _ag.set_env_ref(env)
+            except Exception:
+                pass
     env.reset()
+    # デタミニゼーションプールを事前に起動し、warmup待機
+    import time as _tpool
+    for _ag in env.agents:
+        if hasattr(_ag, '_maybe_start_det_pool') and hasattr(_ag, 'config'):
+            try:
+                if _ag.config.get('enable_parallel_determinization') and _ag.config.get('enable_determinization'):
+                    _ag._maybe_start_det_pool(env)
+                    # プールが十分に満たされるまで待機（最大2秒）
+                    _wait_start = _tpool.time()
+                    while (_tpool.time() - _wait_start) < 2.0:
+                        with getattr(_ag, '_det_pool_lock', None) or _tpool:
+                            if hasattr(_ag, '_det_pool') and _ag._det_pool and len(_ag._det_pool) >= 5:
+                                break
+                        _tpool.sleep(0.01)
+            except Exception:
+                pass
     step_limit = 1000
     steps = 0
     eval_preds: List[float] = []
+    # 手札予測データ収集用
+    hand_pred_data_list: List[Dict[str, Any]] = []
+    # 初回ステップでエージェント使用ログ出力
+    _agent_usage_logged = False
+    # 時間計測用
+    import time
+    timings = {
+        'alpha_zero_select': 0.0,
+        'ucb_mcts_select': 0.0,
+        'other_agent_select': 0.0,
+        'env_step': 0.0,
+        'hand_pred_collection': 0.0,
+        'total': 0.0
+    }
+    az_action_count = 0
+    ucb_action_count = 0
+    other_action_count = 0
     while not getattr(env.game, 'done', False):
         if steps >= step_limit:
             break
         current_player_id = env.game.turn
         agent = env.agents[current_player_id]
+        # 初回のみエージェント使用ログ出力
+        if not _agent_usage_logged and steps == 0:
+            agent_type = type(agent).__name__
+            agent_label = labels[current_player_id] if current_player_id < len(labels) else "Unknown"
+            print(f"[EVAL] Episode {ep_index}: First action by Player {current_player_id} using {agent_label} (type: {agent_type})")
+            _agent_usage_logged = True
+        
+        step_start = time.time()
+        
         if isinstance(agent, _AZ):
-            # collect value prediction for the evaluated model instance
-            try:
-                # only collect preds from the main evaluated agent object (ag_eval)
-                if agent is ag_eval:
-                    _, v = agent._policy_value(env)
-                    if isinstance(v, dict):
-                        v_prob = float(v.get(getattr(agent, 'player_id', 0), 0.0))
-                    elif isinstance(v, (list, tuple)):
-                        pid = int(getattr(agent, 'player_id', 0) or 0)
-                        try:
-                            v_prob = float(v[pid])
-                        except Exception:
-                            v_prob = float(v[0]) if v else 0.0
-                    else:
-                        v_prob = float(v)
-                    eval_preds.append(v_prob if v_prob is not None else 0.0)
-            except Exception:
+            # 手札予測評価のため、推論結果を取得
+            az_start = time.time()
+            import torch
+            with torch.inference_mode():
+                # Optional debug: compare raw vs canonicalized state per-seat and model top-policies
                 try:
-                    eval_preds.append(0.5)
+                    if os.environ.get('EVAL_DEBUG_CANON'):
+                        import numpy as _np
+                        st_dbg = agent._extract_state(env)
+                        st_can_dbg = canonicalize_state(agent, st_dbg)
+                        print(f"[DEBUG-EVAL] ep={ep_index} seat={getattr(agent,'player_id',None)} agent={type(agent).__name__} state_keys={list(st_dbg.keys()) if isinstance(st_dbg,dict) else type(st_dbg)} canon_self={st_can_dbg.get('self_player_id')}")
+                        try:
+                            for k in ('full_input','hand_labels'):
+                                if isinstance(st_dbg, dict) and k in st_dbg and k in st_can_dbg:
+                                    a0 = _np.asarray(st_dbg[k]).ravel()[:8]
+                                    a1 = _np.asarray(st_can_dbg[k]).ravel()[:8]
+                                    diff = (_np.abs(a0 - a1) > 1e-6).any()
+                                    print(f"[DEBUG-EVAL] seat={getattr(agent,'player_id',None)} field={k} differs={diff} before={a0.tolist()} after={a1.tolist()}")
+                        except Exception:
+                            pass
+                        # model top-k (if available)
+                        if getattr(agent, 'model', None) is not None and hasattr(agent.model, 'forward_with_belief'):
+                            try:
+                                out = agent.model.forward_with_belief(st_can_dbg)
+                                # try to extract policy logits
+                                pol = None
+                                if isinstance(out, tuple) or isinstance(out, list):
+                                    pol = out[0]
+                                elif isinstance(out, dict) and 'policy_logits' in out:
+                                    pol = out['policy_logits']
+                                elif isinstance(out, dict) and 'pi' in out:
+                                    pol = out['pi']
+                                if pol is not None:
+                                    pol_arr = _np.asarray(pol).ravel()
+                                    idx = _np.argsort(-pol_arr)[:5].tolist()
+                                    vals = pol_arr[idx].tolist()
+                                    print(f"[DEBUG-EVAL] seat={getattr(agent,'player_id',None)} top_pi_idx={idx} top_pi_vals={vals}")
+                            except Exception as _e:
+                                print(f"[DEBUG-EVAL] model forward/top-pi failed: {_e}")
                 except Exception:
                     pass
-            action = agent.select_action(env, training=False)
+                # forward_with_beliefで推論結果を取得
+                try:
+                    # ensure inference-time state is canonical (self==0 viewpoint)
+                    state_dict = agent._extract_state(env)
+                    # If this agent is a past checkpoint, skip canonicalization to preserve its original view
+                    if not getattr(agent, 'is_past_model', False):
+                        state_dict = canonicalize_state(agent, state_dict)
+                    if agent.model is not None and hasattr(agent.model, 'forward_with_belief'):
+                        policy_logits, value_logit, hand_logits = agent.model.forward_with_belief(state_dict)
+                    else:
+                        hand_logits = None
+                    # hand_logitsから手札予測データを収集（計算はメインプロセスで行う）
+                    if hand_logits is not None and 'hand_labels' in state_dict:
+                        hand_labels = state_dict['hand_labels']
+                        mask_unknown = state_dict.get('mask_unknown', None)
+                        # 相手の手札枚数を取得
+                        opponent_hand_sizes = {}
+                        for i in range(4):
+                            if i != current_player_id:
+                                try:
+                                    opponent_hand_sizes[i] = len(env.game.players[i].hand)
+                                except Exception:
+                                    opponent_hand_sizes[i] = 0
+                        # データを収集（Evaluatorメソッドをここで呼べないため）
+                        import numpy as np
+                        hand_logits_np = hand_logits.cpu().numpy() if isinstance(hand_logits, torch.Tensor) else np.array(hand_logits)
+                        hand_pred_data_list.append({
+                            'step': steps,
+                            'hand_logits': hand_logits_np.tolist(),
+                            'hand_labels': hand_labels,
+                            'mask_unknown': mask_unknown,
+                            'opponent_hand_sizes': opponent_hand_sizes
+                        })
+                except Exception as e:
+                    print(f"[WARN] Hand prediction data collection failed: {e}")
+
+                action = agent.select_action(env, training=False)
+            timings['alpha_zero_select'] += time.time() - az_start
+            az_action_count += 1
+        elif isinstance(agent, _UCB):
+            # UCBMCTSAgent: 環境オブジェクトを渡す
+            ucb_start = time.time()
+            import torch
+            with torch.inference_mode():
+                action = agent.select_action(env, legal_actions=None)
+            timings['ucb_mcts_select'] += time.time() - ucb_start
+            ucb_action_count += 1
         else:
+            other_start = time.time()
             current_player = env.game.players[current_player_id]
             hand = current_player.hand
             field = env.game.current_field[:]
             legal_actions = env._generate_legal_actions(hand, field)
             obs_simple = {'hand': hand, 'field': field}
             action = agent.select_action(obs_simple, legal_actions=legal_actions)
+            timings['other_agent_select'] += time.time() - other_start
+            other_action_count += 1
+        
+        step_time = time.time() - step_start
+        timings['total'] += step_time
+        
+        env_start = time.time()
         try:
             env.step(external_action=action)
         except TypeError:
             env.step(action)
+        timings['env_step'] += time.time() - env_start
         steps += 1
     rankings: List[int] = list(getattr(env.game, 'rankings', []))
     if len(rankings) != 4:
         remaining = [i for i in range(4) if i not in rankings]
         rankings += remaining
-    # compute recall for evaluated model (ag_eval)
-    recall = None
-    try:
-        try:
-            eval_seat = agents.index(ag_eval)
-        except Exception:
-            eval_seat = 0
-        won = (len(rankings) > 0 and rankings[0] == eval_seat)
-        if won:
-            tp = sum(1 for p in eval_preds if p > 0.5)
-            fn = sum(1 for p in eval_preds if p <= 0.5)
-            denom = tp + fn
-            recall = (tp / denom) if denom > 0 else None
-        else:
-            recall = None
-    except Exception:
-        recall = None
+    
+    # 時間計測結果をログ出力（ゲーム終了時）
+    if steps > 0:
+        avg_step_time = timings['total'] / steps
+        print(f"[PERF] Episode {ep_index} timing summary:")
+        print(f"  Total time: {timings['total']:.2f}s ({steps} steps, avg {avg_step_time:.3f}s/step)")
+        if az_action_count > 0:
+            avg_az_time = timings['alpha_zero_select'] / az_action_count
+            print(f"  AlphaZeroAgent: {timings['alpha_zero_select']:.2f}s ({az_action_count} actions, avg {avg_az_time:.3f}s/action)")
+        if ucb_action_count > 0:
+            avg_ucb_time = timings['ucb_mcts_select'] / ucb_action_count
+            print(f"  UCBMCTSAgent: {timings['ucb_mcts_select']:.2f}s ({ucb_action_count} actions, avg {avg_ucb_time:.3f}s/action)")
+        if other_action_count > 0:
+            avg_other_time = timings['other_agent_select'] / other_action_count
+            print(f"  Other agents: {timings['other_agent_select']:.2f}s ({other_action_count} actions, avg {avg_other_time:.3f}s/action)")
+        print(f"  Env step: {timings['env_step']:.2f}s")
+    
     # ラベル順（席番号順）を返し、親で Elo を更新できるようにする
-    return {"ep": ep_index, "rankings": rankings, "labels": labels, "steps": steps, "recall": recall}
+    return {
+        "ep": ep_index, 
+        "rankings": rankings, 
+        "labels": labels, 
+        "steps": steps,
+        "hand_pred_data": hand_pred_data_list,
+        "timings": timings
+    }
 
 
 class Evaluator:
@@ -257,36 +498,61 @@ class Evaluator:
         use_tensorboard: bool = True,
         seat_rotation: bool = True,
         # 評価安定化のため既定で fixed_once を適用（推論/実運用は config 側デフォルトの "stochastic" を維持）
-        determinization_mode_override: str | None = "fixed_once",
+        determinization_mode_override: str | None = "stochastic",
         past_checkpoints: List[str] | None = None,
         # 閾値: value 予測を陽性と見なすカットオフ
         value_threshold: float = 0.5,
         # 指標が計算できないときに 0.0 を出力するか (False -> 空欄)
         write_zero_on_missing_metrics: bool = False,
+        # 圧倒的無駄遣いの禁止（Dominated Moves）フィルタリング
+        filter_dominated_moves: bool = False,
     ):
         if seed is not None:
             random.seed(seed)
         self.checkpoint_path = checkpoint_path
         self.device = device or self._auto_device()
-        self.num_simulations = num_simulations or ALPHA_ZERO_CONFIG.get("num_simulations", 32)
+        self.elo_dir = elo_dir
         self.elo = RatingManager(save_dir=elo_dir, config=EloConfig())
-        # baseline_mix 例: ["mcts", "rule", "random"] -> 学習エージェント + 3 baseline
-        # 既定で単体MCTS(UCBMCTSAgent)、ルールベース、ランダムを含める
-        self.baseline_mix = baseline_mix or ["mcts", "rule", "random"]
+        # baseline_mix 例: ["ucb_mcts", "random", "rule"] -> 学習エージェント + 3 baseline
+        # 既定でUCBMCTSAgent、ランダム、ルールベースを含める
+        self.baseline_mix = baseline_mix or ["ucb_mcts", "random", "rule"]
         # 過去モデルのチェックポイント群（最大3枠まで採用）
         self.past_checkpoints = list(past_checkpoints or [])
         self.config = dict(ALPHA_ZERO_CONFIG)
-        self.config["num_simulations"] = self.num_simulations
+        # num_simulationsはconfigの値を使用（上書きしない）
         self.config["device"] = self.device
-        # 評価ではメモリ削減を優先: MCTS TT と並列デタミニゼーションプールを無効化
+        # num_simulationsはconfigから取得（後方互換性のためself.num_simulationsも設定）
+        self.num_simulations = self.config.get("num_simulations", 400)
+        # グローバル変数も更新（並列処理用）
+        global _EV_NUM_SIMULATIONS
+        _EV_NUM_SIMULATIONS = self.num_simulations
+        # 評価でも並列デタミニゼーションプールを有効化（速度改善・ログ抑制）
+        # バッチ推論サイズを明示的に設定（評価時の高速化）
         if isinstance(self.config, dict):
             self.config["enable_mcts_tt"] = True
-            self.config["enable_parallel_determinization"] = False
+            self.config["enable_parallel_determinization"] = True
+            # バッチ推論サイズが設定されていない場合、デフォルト値（32）を設定
+            if "mcts_batch_eval_size" not in self.config or self.config.get("mcts_batch_eval_size", 1) == 1:
+                # ALPHA_ZERO_CONFIGから取得、またはデフォルト値32を使用
+                default_batch_size = ALPHA_ZERO_CONFIG.get("mcts_batch_eval_size", 32)
+                self.config["mcts_batch_eval_size"] = default_batch_size
+                print(f"[EVAL] mcts_batch_eval_size set to {default_batch_size} for evaluation")
+            else:
+                print(f"[EVAL] mcts_batch_eval_size: {self.config.get('mcts_batch_eval_size')}")
         else:
             try:
                 setattr(self.config, "enable_mcts_tt", True)
-                setattr(self.config, "enable_parallel_determinization", False)
-            except (AttributeError, TypeError):
+                setattr(self.config, "enable_parallel_determinization", True)
+                # バッチ推論サイズも設定を試みる
+                if not hasattr(self.config, "mcts_batch_eval_size") or getattr(self.config, "mcts_batch_eval_size", 1) == 1:
+                    default_batch_size = ALPHA_ZERO_CONFIG.get("mcts_batch_eval_size", 32)
+                    setattr(self.config, "mcts_batch_eval_size", default_batch_size)
+            except (AttributeError, TypeError) as e:
+                _log_eval_fallback_once(
+                    "eval_set_config_attr_failed",
+                    "[eval-fallback] could not set MCTS config attributes; using defaults",
+                    e,
+                )
                 import warnings
                 warnings.warn(f"Could not set MCTS config (type: {type(self.config)}), using defaults")
         # 評価フェーズでは探索ノイズOFF・温度0・序盤ランダム無効化を徹底
@@ -304,7 +570,12 @@ class Evaluator:
                 setattr(self.config, "dirichlet_epsilon", 0.0)
                 setattr(self.config, "temperature", 0.0)
                 setattr(self.config, "opening_random_enable", False)
-            except (AttributeError, TypeError):
+            except (AttributeError, TypeError) as e:
+                _log_eval_fallback_once(
+                    "eval_set_eval_config_failed",
+                    "[eval-fallback] could not set evaluation config; using defaults",
+                    e,
+                )
                 # 設定できない場合は警告を出力して続行
                 import warnings
                 warnings.warn(f"Could not set evaluation config (type: {type(self.config)}), using defaults")
@@ -317,7 +588,7 @@ class Evaluator:
         if not os.path.exists(self.metrics_csv):
             try:
                 with open(self.metrics_csv, "w", encoding="utf-8") as f:
-                    f.write("episode,win_rate,avg_rank,rating_p0,raw_rank,steps,recall,precision,auc\n")
+                    f.write("episode,win_rate,avg_rank,rating_p0,raw_rank,steps\n")
             except Exception:
                 pass
         # 各エージェント別の順位分布/勝率ログ（縦持ち, 累積）
@@ -373,6 +644,11 @@ class Evaluator:
                 except Exception:
                     pass
             except Exception as e:
+                _log_eval_fallback_once(
+                    "eval_checkpoint_load_failed",
+                    "[eval-fallback] checkpoint load failed; fallback to new model",
+                    e,
+                )
                 print(f"[WARN] checkpoint load failed ({e}) -> fallback new model")
                 full_dim = 56 * self.config["num_players"] + 22
                 self.model = PolicyValueNet(
@@ -384,6 +660,10 @@ class Evaluator:
                     context_out_dim=self.config.get("hidden_size", 128),  # hidden_sizeに合わせる（過学習防止）
                 )
         else:
+            _log_eval_fallback_once(
+                "eval_checkpoint_missing",
+                "[eval-fallback] checkpoint not found; using random initialized model",
+            )
             print(f"[WARN] checkpoint not found: {self.checkpoint_path}. Using random initialized model.")
             full_dim = 56 * self.config["num_players"] + 22
             self.model = PolicyValueNet(
@@ -481,13 +761,24 @@ class Evaluator:
         if s in ("mcts", "ucb_mcts", "ucbmcts"):
             try:
                 # UCBMCTSAgent のコンストラクタはオプション引数を受け取る可能性があるため柔軟に対応
-                return UCBMCTSAgent(player_id=player_id, num_simulations=self.num_simulations)
+                # UCBMCTSAgentは独自の探索回数200回を使用
+                return UCBMCTSAgent(player_id=player_id, num_simulations=200)
             except TypeError:
                 try:
                     return UCBMCTSAgent(player_id=player_id)
-                except Exception:
+                except Exception as e:
+                    _log_eval_fallback_once(
+                        f"eval_make_baseline_ucb_failed:{player_id}",
+                        "[eval-fallback] UCBMCTSAgent init failed; fallback to RandomAgent",
+                        e,
+                    )
                     return RandomAgent(player_id=player_id)
-            except Exception:
+            except Exception as e:
+                _log_eval_fallback_once(
+                    f"eval_make_baseline_ucb_exception:{player_id}",
+                    "[eval-fallback] UCBMCTSAgent unexpected error; fallback to RandomAgent",
+                    e,
+                )
                 return RandomAgent(player_id=player_id)
         if s == "rule":
             return RuleBasedAgent(player_id=player_id)
@@ -508,6 +799,11 @@ class Evaluator:
             except Exception:
                 pass
         except Exception as e:
+            _log_eval_fallback_once(
+                f"eval_past_ckpt_load_failed:{ckpt_path}",
+                "[eval-fallback] failed to load past checkpoint; using None model",
+                e,
+            )
             print(f"[WARN] failed to load past checkpoint '{ckpt_path}': {e}")
             model = None
         ag = AlphaZeroAgent(player_id=player_id, model=model, config=cfg)
@@ -521,23 +817,25 @@ class Evaluator:
 
     def _build_agents(self) -> List[Any]:
         agents: List[Any] = [self.eval_agent]
-        # まず過去モデルを最大3枠まで採用
-        added = 0
-        for ckpt in self.past_checkpoints:
-            if added >= 3:
-                break
-            pid = len(agents)
-            agents.append(self._make_alpha_zero_eval_agent_from_ckpt(player_id=pid, ckpt_path=ckpt))
-            added += 1
-        # 不足分は baseline_mix で補完
-        needed = 4 - len(agents)
-        if needed > 0:
+        needed = 4 - len(agents)  # 必ず3になる
+        
+        # 過去モデルが指定されている場合は使用
+        if self.past_checkpoints:
+            for i, ckpt_path in enumerate(self.past_checkpoints[:needed]):
+                pid = len(agents)
+                ag = self._make_alpha_zero_eval_agent_from_ckpt(pid, ckpt_path)
+                agents.append(ag)
+        
+        # 過去モデルが不足する場合はbaselineエージェントで補完
+        remaining = 4 - len(agents)
+        if remaining > 0:
             mix = list(self.baseline_mix)
-            while len(mix) < needed:
+            while len(mix) < remaining:
                 mix.append("random")
-            for spec in mix[:needed]:
+            for spec in mix[:remaining]:
                 pid = len(agents)
                 agents.append(self._make_baseline_agent(spec, player_id=pid))
+        
         # 安全のため4人に制限
         return agents[:4]
 
@@ -571,129 +869,346 @@ class Evaluator:
             labels.append(self._agent_label_map.get(id(ag), type(ag).__name__))
         return labels
 
+    def _calculate_hand_prediction_accuracy(
+        self,
+        hand_logits: Any,  # torch.Tensor or np.ndarray
+        hand_labels: Any,  # np.ndarray
+        opponent_hand_sizes: Dict[int, int],  # 座席ID -> 残り手札枚数
+        mask_unknown: Any,  # np.ndarray
+        num_players: int = 4,
+        apply_constraint: bool = True,   # デフォルトで制約なし（学習時と同条件で公平な比較）
+    ) -> List[Dict[str, Any]]:
+        """
+        各相手プレイヤーごとにTop-HandSize Accuracyを計算
+        
+        hand_logitsの構造:
+        - [0:53]: 相手プレイヤー0（自分の次のプレイヤー）の53次元
+        - [53:106]: 相手プレイヤー1の53次元
+        - [106:159]: 相手プレイヤー2の53次元（4人対戦の場合）
+        
+        Args:
+            apply_constraint: True の場合、カード枚数制約を適用して予測確率を正規化
+        
+        Returns:
+            List of dicts, each containing:
+            {
+                'opponent_seat_id': int,  # 座席ID（0-2）
+                'opponent_hand_size': int,  # 残り手札枚数
+                'ai_accuracy': float,       # Top-HandSize Accuracy
+                'baseline_accuracy': float, # ランダムベースライン精度（理論値）
+                'relative_improvement': float
+            }
+        """
+        import numpy as np
+        import torch
+        
+        results = []
+        
+        try:
+            # hand_logitsをnumpy配列に変換
+            if isinstance(hand_logits, torch.Tensor):
+                hand_logits_np = hand_logits.detach().cpu().numpy()
+            else:
+                hand_logits_np = np.asarray(hand_logits, dtype=np.float32)
+            
+            # sigmoidで確率に変換
+            hand_probs = 1.0 / (1.0 + np.exp(-hand_logits_np))
+            
+            # カード枚数制約を適用（各カードについて全相手の予測確率の合計が4を超えないように正規化）
+            if apply_constraint:
+                try:
+                    from agents.validation import apply_hand_prediction_constraint
+                    hand_probs = apply_hand_prediction_constraint(hand_probs, num_opponents=num_players-1)
+                except Exception as e:
+                    print(f"[WARN] Failed to apply hand prediction constraint: {e}")
+            
+            # hand_labelsとmask_unknownをnumpy配列に変換
+            if isinstance(hand_labels, torch.Tensor):
+                hand_labels_np = hand_labels.detach().cpu().numpy()
+            else:
+                hand_labels_np = np.asarray(hand_labels, dtype=np.float32)
+            
+            if isinstance(mask_unknown, torch.Tensor):
+                mask_unknown_np = mask_unknown.detach().cpu().numpy()
+            elif mask_unknown is not None:
+                mask_unknown_np = np.asarray(mask_unknown, dtype=np.float32)
+            else:
+                mask_unknown_np = None
+            
+            # mask_unknown_npが0次元配列（スカラー）の場合はスキップ
+            if mask_unknown_np is not None and mask_unknown_np.ndim == 0:
+                mask_unknown_np = None
+            
+            # 各相手プレイヤーごとに処理
+            num_opponents = num_players - 1
+            for opp_idx in range(num_opponents):
+                offset = opp_idx * 53
+                opp_probs = hand_probs[offset:offset+53]
+                opp_labels = hand_labels_np[offset:offset+53]
+                
+                # mask_unknownが有効な場合は使用、そうでなければ全て未知（全1）として扱う
+                if mask_unknown_np is not None and mask_unknown_np.ndim > 0:
+                    opp_mask = mask_unknown_np[offset:offset+53]
+                else:
+                    # mask_unknownが無効な場合は全て未知として扱う
+                    opp_mask = np.ones(53, dtype=np.float32)
+                
+                # 座席IDを取得（eval_agentの次のプレイヤーから順に0, 1, 2）
+                # 実際の座席IDは、eval_agentの座席ID + opp_idx + 1 (mod 4)
+                try:
+                    eval_seat = self.players.index(self.eval_agent)
+                    opponent_seat_id = (eval_seat + opp_idx + 1) % num_players
+                except Exception:
+                    opponent_seat_id = opp_idx
+                
+                # 相手の残り手札枚数を取得
+                opponent_hand_size = opponent_hand_sizes.get(opponent_seat_id, 0)
+                
+                # 手札0枚の場合は評価対象外
+                if opponent_hand_size <= 0:
+                    continue
+                
+                # 未知カードのインデックスを取得
+                unknown_indices = np.where(opp_mask > 0.5)[0]
+                if len(unknown_indices) == 0:
+                    continue
+                
+                # 未知カード数
+                N = len(unknown_indices)
+                k = opponent_hand_size
+                
+                if k > N:
+                    # 手札枚数が未知カード数を超える場合はスキップ（通常は発生しない）
+                    continue
+                
+                # Top-HandSize Accuracy: 未知カードの中で予測確率上位k枚を選択
+                unknown_probs = opp_probs[unknown_indices]
+                top_k_indices_in_unknown = np.argsort(unknown_probs)[-k:][::-1]  # 降順
+                top_k_card_indices = unknown_indices[top_k_indices_in_unknown]
+                
+                # 選択したk枚が実際に相手が持っているか確認
+                correct_count = np.sum(opp_labels[top_k_card_indices] > 0.5)
+                ai_accuracy = float(correct_count / k) if k > 0 else 0.0
+                
+                # ベースライン精度の計算
+                if apply_constraint:
+                    # 制約適用時: この相手について、制約を考慮せずランダムに選んだ場合の期待精度
+                    # （他の相手の予測を考慮しないナイーブなランダム選択）
+                    # 制約により予測確率が正規化されているため、単純なk/Nとの比較は不公平
+                    # ここでは「制約なしのランダム選択」として k/N を使用（保守的な下限）
+                    baseline_accuracy = float(k / N) if N > 0 else 0.0
+                else:
+                    # 制約なし: 単純な k / N
+                    baseline_accuracy = float(k / N) if N > 0 else 0.0
+                
+                # 相対改善度
+                relative_improvement = ai_accuracy - baseline_accuracy
+                
+                results.append({
+                    'opponent_seat_id': opponent_seat_id,
+                    'opponent_hand_size': opponent_hand_size,
+                    'ai_accuracy': ai_accuracy,
+                    'baseline_accuracy': baseline_accuracy,
+                    'relative_improvement': relative_improvement
+                })
+        except Exception as e:
+            # エラーが発生した場合は空のリストを返す
+            print(f"[WARN] _calculate_hand_prediction_accuracy failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+        
+        return results
+
     def play_one_game(self) -> Dict[str, Any]:
         env = DaifugoSimpleEnv(num_players=4, agent_classes=None)
         env.agents = self.players  # あらかじめ構築した順序 (P0=評価対象)
-        if hasattr(self.eval_agent, 'set_env_ref'):
-            self.eval_agent.set_env_ref(env)
+        # すべての AlphaZeroAgent に env_ref を渡す（並列デタミニゼーション有効化のため）
+        for _ag in env.agents:
+            if hasattr(_ag, 'set_env_ref'):
+                try:
+                    _ag.set_env_ref(env)
+                except Exception:
+                    pass
+        # エージェント使用ログ出力
+        labels = self._labels_for_players(self.players)
+        print(f"[EVAL] Game started: Agents assigned:")
+        for i, (ag, label) in enumerate(zip(self.players, labels)):
+            agent_type = type(ag).__name__
+            agent_id = getattr(ag, 'player_id', i)
+            print(f"  Player {agent_id}: {label} (type: {agent_type})")
         env.reset()
+        # デタミニゼーションプールを事前に起動し、warmup待機
+        import time as _tpool
+        for _ag in self.players:
+            if hasattr(_ag, '_maybe_start_det_pool') and hasattr(_ag, 'config'):
+                try:
+                    if _ag.config.get('enable_parallel_determinization') and _ag.config.get('enable_determinization'):
+                        _ag._maybe_start_det_pool(env)
+                        # プールが十分に満たされるまで待機（最大2秒）
+                        _wait_start = _tpool.time()
+                        while (_tpool.time() - _wait_start) < 2.0:
+                            with getattr(_ag, '_det_pool_lock', None) or _tpool:
+                                if hasattr(_ag, '_det_pool') and _ag._det_pool and len(_ag._det_pool) >= 5:
+                                    break
+                            _tpool.sleep(0.01)
+                except Exception:
+                    pass
         # 進行
         step_limit = 1000
         steps = 0
         prev_rankings: List[int] = list(getattr(env.game, 'rankings', []))
         # collect per-move value predictions for the eval agent
         eval_preds: List[float] = []
+        # collect hand prediction data for the eval agent
+        hand_pred_data_list: List[Dict[str, Any]] = []
+        # 初回ステップでエージェント使用ログ出力
+        _agent_usage_logged = False
+        # 時間計測用
+        import time
+        timings = {
+            'alpha_zero_select': 0.0,
+            'ucb_mcts_select': 0.0,
+            'other_agent_select': 0.0,
+            'env_step': 0.0,
+            'hand_pred_collection': 0.0,
+            'total': 0.0
+        }
+        az_action_count = 0
+        ucb_action_count = 0
+        other_action_count = 0
         while not getattr(env.game, 'done', False):
             if steps >= step_limit:
                 print(f"[WARN] step limit reached ({step_limit}) forcing termination")
                 break
             current_player_id = env.game.turn
             agent = env.agents[current_player_id]
+            # 初回のみエージェント使用ログ出力
+            if not _agent_usage_logged and steps == 0:
+                agent_type = type(agent).__name__
+                agent_label = labels[current_player_id] if current_player_id < len(labels) else "Unknown"
+                print(f"[EVAL] First action by Player {current_player_id} using {agent_label} (type: {agent_type})")
+                _agent_usage_logged = True
+            
+            step_start = time.time()
+            
             if isinstance(agent, AlphaZeroAgent):
-                # get a direct value prediction for this agent (probability of 'winning'/phase)
-                try:
-                    _, v = agent._policy_value(env)
-                    # extract scalar for this agent's seat if possible
-                    v_prob = None
-                    if isinstance(v, dict):
-                        v_prob = float(v.get(getattr(agent, 'player_id', 0), 0.0))
-                    elif isinstance(v, (list, tuple)):
-                        pid = int(getattr(agent, 'player_id', 0) or 0)
-                        try:
-                            v_prob = float(v[pid])
-                        except Exception:
-                            v_prob = float(v[0]) if v else 0.0
-                    else:
-                        v_prob = float(v)
-                    eval_preds.append(v_prob if v_prob is not None else 0.0)
-                except Exception:
-                    # fallback: unknown -> 0.5 (neutral)
+                # 手札予測評価のため、推論結果を取得
+                az_start = time.time()
+                import torch
+                with torch.inference_mode():
+                    # Optional debug (see EVAL_DEBUG_CANON env var)
                     try:
-                        eval_preds.append(0.5)
+                        if os.environ.get('EVAL_DEBUG_CANON'):
+                            import numpy as _np
+                            s_raw = agent._extract_state(env)
+                            s_can = canonicalize_state(agent, s_raw)
+                            print(f"[DEBUG-EVAL] seat={getattr(agent,'player_id',None)} keys={list(s_raw.keys()) if isinstance(s_raw,dict) else type(s_raw)} canon_self={s_can.get('self_player_id')}")
+                            try:
+                                for k in ('full_input','hand_labels'):
+                                    if isinstance(s_raw, dict) and k in s_raw and k in s_can:
+                                        a0 = _np.asarray(s_raw[k]).ravel()[:8]
+                                        a1 = _np.asarray(s_can[k]).ravel()[:8]
+                                        diff = (_np.abs(a0 - a1) > 1e-6).any()
+                                        print(f"[DEBUG-EVAL] seat={getattr(agent,'player_id',None)} field={k} differs={diff} before={a0.tolist()} after={a1.tolist()}")
+                            except Exception:
+                                pass
                     except Exception:
                         pass
-                action = agent.select_action(env, training=False)
+                    # forward_with_beliefで推論結果を取得
+                    try:
+                        # ensure inference-time state is canonical
+                        state_dict = agent._extract_state(env)
+                        # For past models we want to skip canonicalization (preserve original viewpoint)
+                        if not getattr(agent, 'is_past_model', False):
+                            state_dict = canonicalize_state(agent, state_dict)
+                        if agent.model is not None and hasattr(agent.model, 'forward_with_belief'):
+                            policy_logits, value_logit, hand_logits = agent.model.forward_with_belief(state_dict)
+                        else:
+                            hand_logits = None
+                        # hand_logitsから手札予測精度を計算
+                        if hand_logits is not None and 'hand_labels' in state_dict:
+                            hand_labels = state_dict['hand_labels']
+                            mask_unknown = state_dict.get('mask_unknown', None)
+                            # 相手の手札枚数を取得
+                            opponent_hand_sizes = {}
+                            for i in range(4):
+                                if i != current_player_id:
+                                    try:
+                                        opponent_hand_sizes[i] = len(env.game.players[i].hand)
+                                    except Exception:
+                                        opponent_hand_sizes[i] = 0
+                            # 精度計算
+                            hand_pred_results = self._calculate_hand_prediction_accuracy(
+                                hand_logits, hand_labels, opponent_hand_sizes, mask_unknown, num_players=4
+                            )
+                            # ターン番号を追加して収集
+                            for result in hand_pred_results:
+                                result['turn'] = steps
+                                hand_pred_data_list.append(result)
+                    except Exception as e:
+                        print(f"[WARN] Hand prediction evaluation failed: {e}")
+                    
+                    action = agent.select_action(env, training=False)
+                timings['alpha_zero_select'] += time.time() - az_start
+                az_action_count += 1
+            elif isinstance(agent, UCBMCTSAgent):
+                # UCBMCTSAgent: 環境オブジェクトを渡す
+                ucb_start = time.time()
+                import torch
+                with torch.inference_mode():
+                    action = agent.select_action(env, legal_actions=None)
+                timings['ucb_mcts_select'] += time.time() - ucb_start
+                ucb_action_count += 1
             else:
                 # baseline: シンプル観測
+                other_start = time.time()
                 current_player = env.game.players[current_player_id]
                 hand = current_player.hand
                 field = env.game.current_field[:]
                 legal_actions = env._generate_legal_actions(hand, field)
                 obs_simple = {'hand': hand, 'field': field}
                 action = agent.select_action(obs_simple, legal_actions=legal_actions)
+                timings['other_agent_select'] += time.time() - other_start
+                other_action_count += 1
+            
+            step_time = time.time() - step_start
+            timings['total'] += step_time
+            
+            env_start = time.time()
             try:
                 env.step(external_action=action)
             except TypeError:
                 env.step(action)
+            timings['env_step'] += time.time() - env_start
             steps += 1
         rankings: List[int] = list(getattr(env.game, 'rankings', []))
         if len(rankings) != 4:
             # 強制終了時など順位未確定は残りをランダム末尾扱い
             remaining = [i for i in range(4) if i not in rankings]
             rankings += remaining
-        # build labels: for now we treat the episode-level outcome as the true label
-        # i.e., each collected sample in this episode is labeled positive if eval agent won the episode
-        try:
-            p0_seat = self.players.index(self.eval_agent)
-        except Exception:
-            p0_seat = 0
-        won = (len(rankings) > 0 and rankings[0] == p0_seat)
-        true_label = 1 if won else 0
-        labels = [true_label] * len(eval_preds)
+        
+        # 時間計測結果をログ出力（ゲーム終了時）
+        if steps > 0:
+            avg_step_time = timings['total'] / steps
+            print(f"[PERF] Game timing summary:")
+            print(f"  Total time: {timings['total']:.2f}s ({steps} steps, avg {avg_step_time:.3f}s/step)")
+            if az_action_count > 0:
+                avg_az_time = timings['alpha_zero_select'] / az_action_count
+                print(f"  AlphaZeroAgent: {timings['alpha_zero_select']:.2f}s ({az_action_count} actions, avg {avg_az_time:.3f}s/action)")
+            if ucb_action_count > 0:
+                avg_ucb_time = timings['ucb_mcts_select'] / ucb_action_count
+                print(f"  UCBMCTSAgent: {timings['ucb_mcts_select']:.2f}s ({ucb_action_count} actions, avg {avg_ucb_time:.3f}s/action)")
+            if other_action_count > 0:
+                avg_other_time = timings['other_agent_select'] / other_action_count
+                print(f"  Other agents: {timings['other_agent_select']:.2f}s ({other_action_count} actions, avg {avg_other_time:.3f}s/action)")
+            print(f"  Env step: {timings['env_step']:.2f}s")
 
-        # compute precision/recall
-        precision = None
-        recall = None
-        auc = None
-        try:
-            thresh = float(getattr(self, 'value_threshold', 0.5))
-            preds_pos = [1 if p > thresh else 0 for p in eval_preds]
-            tp = sum(1 for p, t in zip(preds_pos, labels) if p == 1 and t == 1)
-            fp = sum(1 for p, t in zip(preds_pos, labels) if p == 1 and t == 0)
-            fn = sum(1 for p, t in zip(preds_pos, labels) if p == 0 and t == 1)
-            if (tp + fp) > 0:
-                precision = tp / (tp + fp)
-            if (tp + fn) > 0:
-                recall = tp / (tp + fn)
-            # AUC: only if both classes present
-            if labels and (any(l == 1 for l in labels) and any(l == 0 for l in labels)):
-                try:
-                    # simple ROC AUC implementation
-                    pairs = sorted(list(zip(eval_preds, labels)), key=lambda x: x[0], reverse=True)
-                    P = sum(1 for _, l in pairs if l == 1)
-                    N = sum(1 for _, l in pairs if l == 0)
-                    if P > 0 and N > 0:
-                        tp_cum = 0
-                        fp_cum = 0
-                        prev_tpr = 0.0
-                        prev_fpr = 0.0
-                        auc_acc = 0.0
-                        for score, lab in pairs:
-                            if lab == 1:
-                                tp_cum += 1
-                            else:
-                                fp_cum += 1
-                            tpr = tp_cum / P
-                            fpr = fp_cum / N
-                            auc_acc += (fpr - prev_fpr) * (tpr + prev_tpr) / 2.0
-                            prev_tpr = tpr
-                            prev_fpr = fpr
-                        auc = float(auc_acc)
-                except Exception:
-                    auc = None
-        except Exception:
-            precision = recall = auc = None
-
-        # If configured, write zeros instead of empty for missing metrics
-        if getattr(self, 'write_zero_on_missing_metrics', False):
-            if precision is None:
-                precision = 0.0
-            if recall is None:
-                recall = 0.0
-            if auc is None:
-                auc = 0.0
-
-        return {"rankings": rankings, "steps": steps, "recall": recall, "precision": precision, "auc": auc}
+        return {
+            "rankings": rankings, 
+            "steps": steps,
+            "hand_pred_data": hand_pred_data_list
+        }
 
     def run(self, num_episodes: int = 10, workers: int | None = None):
         # P0（評価対象: eval_agent）専用の勝率/順位集計はエピソードごとに座席が変わっても
@@ -705,6 +1220,9 @@ class Evaluator:
         games_by_label: Dict[str, int] = {}
         rank_sum_by_label: Dict[str, int] = {}
         rank_counts_by_label: Dict[str, Dict[int, int]] = {}
+        # 手札予測データの集計用
+        all_hand_pred_data: List[Dict[str, Any]] = []
+        
         # 並列実行の有無を判定
         workers = int(workers or 1)
         if workers <= 1:
@@ -719,11 +1237,16 @@ class Evaluator:
                     games_by_label = {lb: 0 for lb in cur_labels}
                     rank_sum_by_label = {lb: 0 for lb in cur_labels}
                     rank_counts_by_label = {lb: {1: 0, 2: 0, 3: 0, 4: 0} for lb in cur_labels}
-                # play_one_game now returns a dict with rankings, steps, recall
+                # play_one_game now returns a dict with rankings, steps, hand_pred_data
                 res = self.play_one_game()
                 rankings = res.get("rankings", [])
                 steps = res.get("steps")
-                recall = res.get("recall")
+                hand_pred_data = res.get("hand_pred_data", [])
+                
+                # 手札予測データを収集（game_idを追加）
+                for data in hand_pred_data:
+                    data['game_id'] = ep
+                    all_hand_pred_data.append(data)
                 # Elo 更新: エピソード内の現在座席に対応する固有ラベルで更新（重複不可）
                 ranking_names = [cur_labels[pid] for pid in rankings]
                 self.elo.update_from_rankings(ranking_names)
@@ -739,13 +1262,14 @@ class Evaluator:
                 win_rate = p0_wins / (ep + 1)
                 # 評価対象モデルの Elo は eval_label で取得
                 r = self.elo.get_rating(self.eval_label)
-                # CSV 追記 (recall 列を追加)
+                # CSV 追記
                 try:
-                    recall_str = '' if recall is None else f"{recall:.6f}"
                     with open(self.metrics_csv, "a", encoding="utf-8") as f:
-                        f.write(f"{ep+1},{win_rate:.6f},{avg_rank:.6f},{r:.2f},{'|'.join(map(str, rankings))},{'' if steps is None else steps},{recall_str}\n")
-                except Exception:
-                    pass
+                        f.write(f"{ep+1},{win_rate:.6f},{avg_rank:.6f},{r:.2f},{'|'.join(map(str, rankings))},{'' if steps is None else steps}\n")
+                except Exception as e:
+                    print(f"[ERROR] Failed to write to eval_metrics.csv: {e}")
+                    import traceback
+                    traceback.print_exc()
                 # 各エージェント別の勝率/平均順位を更新（追記は評価終了後に1回のみ）
                 try:
                     # rankings[0] は優勝プレイヤーID（0ベース席番号）
@@ -807,6 +1331,7 @@ class Evaluator:
                 self.config.get("determinization_mode_eval"),
                 self.past_checkpoints,
                 None,
+                self.num_simulations,
             )) as pool:
                 for res in pool.imap_unordered(_parallel_eval_one, list(range(num_episodes)), chunksize=1):
                     try:
@@ -839,6 +1364,7 @@ class Evaluator:
                 pool.join()
             # 欠損があれば落ちていないものを詰める
             results = [r for r in results_buf if r is not None]
+            print(f"[DEBUG] Collected {len(results)} results from {num_episodes} episodes")
             # ep順に並べ替え（ep 欄がないものは末尾へ）
             try:
                 results.sort(key=lambda x: x.get("ep", 10**9))
@@ -846,15 +1372,43 @@ class Evaluator:
                 pass
             # ラベル集合を初期化
             if results:
+                print(f"[DEBUG] Processing {len(results)} results for metrics")
                 all_labels = results[0].get("labels", [])
                 wins_by_label = {lb: 0 for lb in all_labels}
                 games_by_label = {lb: 0 for lb in all_labels}
                 rank_sum_by_label = {lb: 0 for lb in all_labels}
                 rank_counts_by_label = {lb: {1: 0, 2: 0, 3: 0, 4: 0} for lb in all_labels}
+            else:
+                print(f"[ERROR] No results collected from parallel execution!")
             # 集計と Elo 更新
             for idx, res in enumerate(results, start=1):
                 rankings = res.get("rankings", [0,1,2,3])
                 cur_labels = res.get("labels", [])
+                hand_pred_data = res.get("hand_pred_data", [])
+                steps = res.get("steps", None)
+                
+                # 手札予測データを処理して精度計算結果に変換
+                for data in hand_pred_data:
+                    try:
+                        hand_logits = data.get('hand_logits', [])
+                        hand_labels = data.get('hand_labels', [])
+                        mask_unknown = data.get('mask_unknown', None)
+                        opponent_hand_sizes = data.get('opponent_hand_sizes', {})
+                        step = data.get('step', 0)
+                        game_id = res.get("ep", idx - 1)
+                        
+                        # 精度計算
+                        hand_pred_results = self._calculate_hand_prediction_accuracy(
+                            hand_logits, hand_labels, opponent_hand_sizes, mask_unknown, num_players=4
+                        )
+                        # game_idとturnを追加して収集
+                        for result in hand_pred_results:
+                            result['game_id'] = game_id
+                            result['turn'] = step
+                            all_hand_pred_data.append(result)
+                    except Exception as e:
+                        print(f"[WARN] Failed to calculate hand prediction accuracy for ep {res.get('ep', idx-1)}: {e}")
+                
                 if idx == 1 and (not wins_by_label):
                     # 念のため初期化
                     wins_by_label = {lb: 0 for lb in cur_labels}
@@ -878,11 +1432,11 @@ class Evaluator:
                 # CSV 追記
                 try:
                     with open(self.metrics_csv, "a", encoding="utf-8") as f:
-                        recall = res.get('recall')
-                        recall_str = '' if recall is None else f"{recall:.6f}"
-                        f.write(f"{idx},{win_rate:.6f},{avg_rank:.6f},{r:.2f},{'|'.join(map(str, rankings))},{recall_str}\n")
-                except Exception:
-                    pass
+                        f.write(f"{idx},{win_rate:.6f},{avg_rank:.6f},{r:.2f},{'|'.join(map(str, rankings))},{'' if steps is None else steps}\n")
+                except Exception as e:
+                    print(f"[ERROR] Failed to write to eval_metrics.csv (parallel): {e}")
+                    import traceback
+                    traceback.print_exc()
                 # 各エージェント別の勝率・順位
                 try:
                     winner_pid = rankings[0] if len(rankings) > 0 else None
@@ -906,6 +1460,21 @@ class Evaluator:
                 if (idx % 5 == 0) or (idx == num_episodes):
                     print(f"[EVAL] ep={idx}/{num_episodes} win_rate={win_rate:.2%} avg_rank={avg_rank:.2f} rating(P0)={r:.1f}")
             # 並列集計はここまで（逐次ブロックの残骸を削除）
+        # 親プロセス側でも子プロセス終了後に CUDA IPC ハンドルを回収
+        try:
+            import torch
+            if getattr(torch, 'cuda', None) is not None and torch.cuda.is_available():
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # 評価終了後に勝率ログを1回だけ出力
         try:
             # 最終エピソード番号を episode 列に使う
@@ -949,6 +1518,77 @@ class Evaluator:
         if self.tb_writer is not None:
             self.tb_writer.flush()
             self.tb_writer.close()
+        
+        # 手札予測データのCSV出力と集計
+        if all_hand_pred_data:
+            try:
+                import csv
+                hand_pred_csv_path = os.path.join(self.elo_dir, "hand_prediction_evaluation.csv")
+                os.makedirs(os.path.dirname(hand_pred_csv_path), exist_ok=True)
+                
+                # CSVヘッダー
+                fieldnames = ['game_id', 'turn', 'opponent_seat_id', 'opponent_hand_size', 
+                             'ai_accuracy', 'baseline_accuracy', 'relative_improvement']
+                
+                # CSVに書き込み
+                with open(hand_pred_csv_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for data in all_hand_pred_data:
+                        writer.writerow({
+                            'game_id': data.get('game_id', 0),
+                            'turn': data.get('turn', 0),
+                            'opponent_seat_id': data.get('opponent_seat_id', 0),
+                            'opponent_hand_size': data.get('opponent_hand_size', 0),
+                            'ai_accuracy': f"{data.get('ai_accuracy', 0.0):.6f}",
+                            'baseline_accuracy': f"{data.get('baseline_accuracy', 0.0):.6f}",
+                            'relative_improvement': f"{data.get('relative_improvement', 0.0):.6f}"
+                        })
+                
+                # 集計結果を計算
+                import numpy as np
+                relative_improvements = [d.get('relative_improvement', 0.0) for d in all_hand_pred_data]
+                avg_relative_improvement = np.mean(relative_improvements) if relative_improvements else 0.0
+                
+                # 残り手札枚数ごとの平均精度を計算
+                hand_size_stats: Dict[int, Dict[str, List[float]]] = {}
+                for data in all_hand_pred_data:
+                    hand_size = data.get('opponent_hand_size', 0)
+                    if hand_size > 0:
+                        if hand_size not in hand_size_stats:
+                            hand_size_stats[hand_size] = {'ai': [], 'baseline': []}
+                        hand_size_stats[hand_size]['ai'].append(data.get('ai_accuracy', 0.0))
+                        hand_size_stats[hand_size]['baseline'].append(data.get('baseline_accuracy', 0.0))
+                
+                # 集計結果を出力
+                print(f"\n[EVAL] Hand Prediction Evaluation Summary:")
+                print(f"  Total samples: {len(all_hand_pred_data)}")
+                print(f"  Average relative improvement: {avg_relative_improvement:.6f}")
+                print(f"  CSV saved to: {hand_pred_csv_path}")
+                
+                if hand_size_stats:
+                    print(f"\n  Accuracy by hand size:")
+                    for hand_size in sorted(hand_size_stats.keys(), reverse=True):  # 13→1の順
+                        ai_accs = hand_size_stats[hand_size]['ai']
+                        baseline_accs = hand_size_stats[hand_size]['baseline']
+                        avg_ai = np.mean(ai_accs) if ai_accs else 0.0
+                        avg_baseline = np.mean(baseline_accs) if baseline_accs else 0.0
+                        count = len(ai_accs)
+                        print(f"    Hand size {hand_size:2d}: AI={avg_ai:.4f}, Baseline={avg_baseline:.4f}, Count={count}")
+                
+                # グラフ描画を実行
+                try:
+                    from evaluation.plot_hand_pred import plot_hand_prediction_accuracy
+                    plot_path = plot_hand_prediction_accuracy(hand_pred_csv_path, self.elo_dir)
+                    if plot_path:
+                        print(f"  Plot saved to: {plot_path}")
+                except Exception as e:
+                    print(f"  [WARN] Failed to plot hand prediction accuracy: {e}")
+            except Exception as e:
+                print(f"[WARN] Failed to save hand prediction evaluation data: {e}")
+                import traceback
+                traceback.print_exc()
+        
         # 戻り値: 今回の評価参加者ラベル一覧（表示/外部利用向け）
         try:
             return self.get_participant_labels()

@@ -26,6 +26,21 @@ class DaifugoSimpleEnv:
         self.turn_idx = 0  # ゲーム全体の手番番号
         # デバッグ用: env.step 内の合法手/選択手のミスマッチを詳細ログするフラグ
         self.debug_action_mismatch = True
+        # フォールバックログの重複抑制
+        self._fallback_logged = set()
+
+    def _log_fallback_once(self, key: str, msg: str, exc: Exception | None = None) -> None:
+        try:
+            if key in self._fallback_logged:
+                return
+            self._fallback_logged.add(key)
+        except Exception:
+            pass
+        try:
+            text = f"{msg} ({type(exc).__name__}: {exc})" if exc is not None else msg
+            print(text)
+        except Exception:
+            pass
 
     def _is_pair(self, cards):
         """
@@ -191,6 +206,10 @@ class DaifugoSimpleEnv:
             except Exception:
                 return None
         if action_cards is not None and not isinstance(action_cards, list):
+            self._log_fallback_once(
+                "normalize_invalid_type",
+                f"[env-fallback] invalid action type -> None (type={type(action_cards).__name__})"
+            )
             return None
         return action_cards
 
@@ -290,7 +309,28 @@ class DaifugoSimpleEnv:
                     keep.append(a)
             filtered = keep
 
+        # Shibari constraint
+        if hasattr(self.game, 'shibari_active') and getattr(self.game, 'shibari_active', False):
+            lock_suits = getattr(self.game, 'lock_suits', None)
+            if lock_suits:
+                shibari_filtered = []
+                for action in filtered:
+                    if action is None:  # Pass always allowed
+                        shibari_filtered.append(action)
+                        continue
+                    # Extract suit pattern
+                    try:
+                        action_suits = sorted(set(c.suit for c in action if not getattr(c, 'is_joker', False)))
+                        # Check match
+                        if action_suits == lock_suits:
+                            shibari_filtered.append(action)
+                    except Exception:
+                        pass
+                # If no valid actions remain, ensure at least pass is available
+                filtered = shibari_filtered if shibari_filtered else [None]
+
         if not filtered:
+            # 合法手がない場合はパスのみ（正常動作なのでログ不要）
             filtered = [None]
         return filtered
 
@@ -342,6 +382,10 @@ class DaifugoSimpleEnv:
                 legal_actions_filtered = [a for a in legal_actions if a is not None]
                 allow_pass = any(a is None for a in legal_actions)
                 pool = legal_actions_filtered + ([None] if allow_pass else [])
+                self._log_fallback_once(
+                    "simulate_random_action",
+                    "[env-fallback] simulate=True -> random action chosen for MCTS/AlphaZero"
+                )
                 action_cards = random.choice(pool) if pool else None
             else:
                 # Try to obtain model policy/value for the current state (best-effort)
@@ -397,6 +441,11 @@ class DaifugoSimpleEnv:
         # 入力正規化（A-1）
         raw_action_cards = action_cards
         action_cards = self._normalize_action_input(action_cards)
+        if raw_action_cards is not None and action_cards is None:
+            self._log_fallback_once(
+                "normalize_to_none",
+                "[env-fallback] action normalization resulted in None"
+            )
 
         # 合法手チェック（A-4）: 生成済み合法手に含まれない出しはパス or 合法手へ矯正
         try:
@@ -473,11 +522,11 @@ class DaifugoSimpleEnv:
                     # 2) フォールバック: 合法手が存在するならパスではなく何かを出す
                     non_pass_candidates = [a for a in legal_actions if a is not None]
                     if non_pass_candidates:
-                        # env 側表現に合わせて文字列化して渡す
+                        # env 側表現に合わせて文字列化して渡す（正常な修正動作なのでログ不要）
                         fallback = non_pass_candidates[0]
                         action_cards = [str(c) for c in fallback]
                     else:
-                        # 出せるカードが本当に無い場合のみパスにする
+                        # 出せるカードが本当に無い場合のみパスにする（正常動作なのでログ不要）
                         action_cards = None
 
                     # external_action の場合、矯正が発生したことを記録
@@ -606,6 +655,9 @@ class DaifugoSimpleEnv:
                 pass
             return obs, reward, self.done, info
         else:
+            # Shibari statistics (ゲーム終了時のみログ出力)
+            # shibari 統計はワーカー/上位ロジック側でまとめて出力するため、ここではログ出力しない
+            # ログ出力が必要な場合はワーカーが `env.game` の統計を収集してまとめて出力する。
             return obs, reward, self.done
         
         

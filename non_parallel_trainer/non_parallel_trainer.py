@@ -44,6 +44,7 @@ import random
 import gc
 from typing import Any, Dict, List
 import warnings
+import torch
 import joblib
 
 # Ensure project root is known early (used below)
@@ -85,10 +86,29 @@ def _log_memory_usage(logger: TrainingLogger | None, cfg: Dict[str, Any], note: 
 		psutil = None
 	if logger is None or not bool(cfg.get('log_memory_usage', True)) or psutil is None:
 		return
+	# throttle memory logging by configured interval (seconds)
+	try:
+		interval = float(cfg.get('memory_log_interval_sec', 3600) or 3600)
+	except Exception:
+		interval = 3600.0
+	# module-level last log timestamp
+	global _LAST_MEM_LOG_TS
+	try:
+		last = float(globals().get('_LAST_MEM_LOG_TS', 0.0) or 0.0)
+	except Exception:
+		last = 0.0
+	import time as _time
+	now = _time.time()
+	if (now - last) < max(0.0, interval):
+		return
 	try:
 		proc = psutil.Process(os.getpid())
 		rss_mb = proc.memory_info().rss / (1024 * 1024)
 		logger.log_text(f"[mem] {note} rss_mb={rss_mb:.2f}")
+		try:
+			globals()['_LAST_MEM_LOG_TS'] = now
+		except Exception:
+			pass
 	except Exception:
 		pass
 
@@ -549,6 +569,22 @@ def _load_samples_for_files(
 			except Exception:
 				tr = []
 				vl = []
+			# Apply max_samples_per_file limit to preloaded data as well
+			if max_samples_per_file is not None and max_samples_per_file > 0:
+				total_samples = len(tr) + len(vl)
+				if total_samples > max_samples_per_file:
+					combined = tr + vl
+					combined = _r.sample(combined, max_samples_per_file)
+					# Re-split into train/val (keep original ratio if possible)
+					if len(tr) > 0 and len(vl) > 0:
+						orig_val_ratio = len(vl) / total_samples
+						new_val_count = int(max_samples_per_file * orig_val_ratio)
+						vl = combined[:new_val_count]
+						tr = combined[new_val_count:]
+					else:
+						# All train or all val
+						tr = combined if len(tr) > 0 else []
+						vl = combined if len(vl) > 0 else []
 			if fp in val_files_set:
 				try:
 					val_list.extend(tr)
@@ -667,29 +703,39 @@ def _rebuild_replay(
 	try:
 		uids = []
 		t4 = _time.time()
+		if logger:
+			logger.log_text(f"[rebuild] Starting extend: train={len(train_part)} val={len(val_part)}")
 		if hasattr(shared_rb, 'extend'):
+			# splitタグを事前設定（高速化）
 			for s in train_part:
 				if isinstance(s, dict):
-					try:
-						s['split'] = 'train'
-					except Exception:
-						pass
+					s['split'] = 'train'
 			for s in val_part:
 				if isinstance(s, dict):
-					try:
-						s['split'] = 'val'
-					except Exception:
-						pass
-			if train_part:
-				train_uids = shared_rb.extend(train_part)
-				if isinstance(train_uids, list):
-					uids.extend(train_uids)
-				train_total += len(train_part)
+					s['split'] = 'val'
+			
+			# チャンク分割して進捗表示（大量サンプル時の体感速度改善）
+			# 重要: valサンプルを先に追加してバッファから押し出されないようにする
+			chunk_size = 50000
 			if val_part:
-				val_uids = shared_rb.extend(val_part)
-				if isinstance(val_uids, list):
-					uids.extend(val_uids)
-				val_total += len(val_part)
+				if logger:
+					logger.log_text(f"[rebuild] Extending val samples first: {len(val_part)}")
+				for i in range(0, len(val_part), chunk_size):
+					chunk = val_part[i:i+chunk_size]
+					val_uids = shared_rb.extend(chunk)
+					if isinstance(val_uids, list):
+						uids.extend(val_uids)
+					val_total += len(chunk)
+			
+			if train_part:
+				if logger:
+					logger.log_text(f"[rebuild] Extending train samples: {len(train_part)}")
+				for i in range(0, len(train_part), chunk_size):
+					chunk = train_part[i:i+chunk_size]
+					train_uids = shared_rb.extend(chunk)
+					if isinstance(train_uids, list):
+						uids.extend(train_uids)
+					train_total += len(chunk)
 			t5 = _time.time()
 			# Debug timing (always log for now to diagnose)
 			if logger:
@@ -1223,6 +1269,31 @@ def _load_samples_from_file(path: str, *, max_samples: int | None = None) -> Dic
 	return {'train': train_list, 'val': val_list}
 
 
+def _load_with_timing_worker(fp_local: str, max_samples_per_file: int | None):
+	"""Module-level worker for Parallel to avoid pickling nested functions.
+
+	Returns: (fp, parts, load_time_s, size_bytes, samples_count)
+	"""
+	import time as _time, os as _os
+	t0 = _time.time()
+	try:
+		parts_local = _load_samples_from_file(
+			fp_local, max_samples=(max_samples_per_file if max_samples_per_file else None)
+		)
+	except Exception:
+		parts_local = {'train': [], 'val': []}
+	t1 = _time.time()
+	sz = 0
+	try:
+		sz = int(_os.path.getsize(fp_local))
+	except Exception:
+		sz = 0
+	tr = parts_local.get('train', []) or []
+	vl = parts_local.get('val', []) or []
+	count = len(tr) + len(vl)
+	return (fp_local, parts_local, float(t1 - t0), int(sz), int(count))
+
+
 def _load_meta(data_dir: str) -> Dict[str, Any]:
 	meta_path = os.path.join(data_dir, 'meta.json')
 	if os.path.isfile(meta_path):
@@ -1264,6 +1335,17 @@ def _run_validation(learner: AlphaZeroAgent, logger: TrainingLogger, cfg: Dict[s
 		bs = int(batch_size or cfg.get('val_batch_size') or cfg.get('batch_size', 256) or 256)
 	except Exception:
 		bs = 256
+	# Ensure learner.config respects trainer-level validation overrides
+	try:
+		if hasattr(learner, 'config') and isinstance(learner.config, dict):
+			for _k in ('val_max_samples', 'val_use_full_split', 'val_batch_size'):
+				if _k in cfg:
+					try:
+						learner.config[_k] = cfg[_k]
+					except Exception:
+						pass
+	except Exception:
+		pass
 	try:
 		vinfo = learner.validate_step(batch_size=bs)
 	except Exception:
@@ -1614,19 +1696,20 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 	if val_ratio < 0.0: val_ratio = 0.0
 	if val_ratio > 0.9: val_ratio = 0.9
 	try:
-		# buffer_stateモード時は全件読み込み（サンプル数制限なし）
-		if buffer_state_used:
-			eff_max_samp = None
-			if logger:
-				logger.log_text(f"[buffer-state] no sample limit (full load)")
+		# 動的サンプルサイジング: total_updates に基づいてサンプル数を調整
+		# buffer_state_used が True でも fixed_total_samples を優先して制限を適用
+		dynamic_result = _compute_dynamic_file_and_sample_params(cfg, train_updates_cum, len(initial_active_files), logger)
+		if dynamic_result is not None:
+			_, eff_max_samp = dynamic_result  # サンプル数のみ使用（ファイル数は既に適用済み）
 		else:
-			# 動的サンプルサイジング: total_updates に基づいてサンプル数を調整
-			dynamic_result = _compute_dynamic_file_and_sample_params(cfg, train_updates_cum, len(initial_active_files), logger)
-			if dynamic_result is not None:
-				_, eff_max_samp = dynamic_result  # サンプル数のみ使用（ファイル数は既に適用済み）
+			eff_max_samp = max_samples_per_file if (max_samples_per_file is not None and max_samples_per_file > 0) else (cfg.get('ingest_max_samples_per_file') or None)
+		if eff_max_samp: eff_max_samp = int(eff_max_samp)
+		
+		if logger:
+			if buffer_state_used:
+				logger.log_text(f"[buffer-state] applying sample limit: eff_max_samp={eff_max_samp}")
 			else:
-				eff_max_samp = max_samples_per_file if (max_samples_per_file is not None and max_samples_per_file > 0) else (cfg.get('ingest_max_samples_per_file') or None)
-			if eff_max_samp: eff_max_samp = int(eff_max_samp)
+				logger.log_text(f"[sampling] eff_max_samp={eff_max_samp}")
 	except Exception:
 		eff_max_samp = None
 	# Use initial_active_files for the first rebuild to limit startup I/O when resume_defer_preload is set.
@@ -1677,6 +1760,42 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 	)
 
 	learner: AlphaZeroAgent = bundle.agents[cfg.get('learning_player_id', 0)]
+
+	# Log opponent assignment summary (which players use latest/past/rule)
+	try:
+		lines = []
+		for ag in bundle.agents:
+			pid = getattr(ag, 'player_id', None)
+			atype = type(ag).__name__
+			# prefer explicit flag if present
+			is_latest = None
+			try:
+				is_latest = bool(getattr(ag, 'is_using_latest_model', False))
+			except Exception:
+				is_latest = None
+			# checkpoint identifier if available
+			ck = getattr(ag, 'checkpoint_name', None)
+			# compare model identity to bundle.model
+			same_as_bundle = False
+			try:
+				same_as_bundle = (id(getattr(ag, 'model', None)) == id(getattr(bundle, 'model', None)))
+			except Exception:
+				same_as_bundle = False
+			if is_latest is True:
+				status = 'latest'
+			elif is_latest is False:
+				status = 'past'
+			else:
+				# fallback based on class
+				status = 'rule' if atype.lower().startswith('rule') else ('latest' if same_as_bundle else 'unknown')
+			lines.append(f"player={pid} type={atype} status={status} checkpoint={ck} same_as_bundle={same_as_bundle}")
+		msg = "[arena-init] " + "; ".join(lines)
+		if logger:
+			logger.log_text(msg)
+		else:
+			print(msg)
+	except Exception:
+		pass
 
 	# モデル再開ログ（ロード成功時のみ）
 	try:
@@ -1783,7 +1902,7 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 					ok = False
 					if hasattr(learner, 'load_optimizer'):
 						ok = bool(learner.load_optimizer(opt_p, map_location=bundle.device))
-		
+			
 	except Exception as e:
 		logger.log_text(f"[WARN] optimizer load failed: {e}")
 	# スケジューラの読み込みは学習率同期コードで行うため、ここではスキップ
@@ -1888,16 +2007,16 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 					logger.log_text(f"[lr-sync] scheduler last_epoch set to {getattr(sched, 'last_epoch', None)}, lr manually set to {lr_str}")
 				except Exception as e:
 					logger.log_text(f"[lr-sync] scheduler setup failed: {e}")
-		else:
-			# スケジューラがない場合のみ手動でlrを設定
-			logger.log_text(f"[lr-sync] no scheduler, setting lr manually")
-			for idx, group in enumerate(learner._optimizer.param_groups):
-				if group.get('name') == 'value_head':
-					group['lr'] = correct_lr * value_head_lr_scale_cfg
-				else:
-					group['lr'] = correct_lr
+			else:
+				# スケジューラがない場合のみ手動でlrを設定
+				logger.log_text(f"[lr-sync] no scheduler, setting lr manually")
+				for idx, group in enumerate(learner._optimizer.param_groups):
+					if group.get('name') == 'value_head':
+						group['lr'] = correct_lr * value_head_lr_scale_cfg
+					else:
+						group['lr'] = correct_lr
 			
-		logger.log_text(f"[lr-sync] synced lr to step={step}: correct_lr={correct_lr:.10e} lr_scale={lr_scale:.6f}")
+			logger.log_text(f"[lr-sync] synced lr to step={step}: correct_lr={correct_lr:.10e} lr_scale={lr_scale:.6f}")
 	except Exception as e:
 		logger.log_text(f"[WARN] lr-sync failed: {e}")
 	# 非同期ロード完了を待機
@@ -1911,14 +2030,11 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 			train_part = train_part or []
 			val_part = val_part or []
 		finally:
-			try:
-				if load_executor is not None:
-					load_executor.shutdown(wait=False)
-			except Exception:
-				pass
-	else:
-		if t_load_end is None:
-			t_load_end = time.time()
+			if load_executor is not None:
+				load_executor.shutdown(wait=False)
+							
+	if t_load_end is None:
+		t_load_end = time.time()
 
 	# メモリ効率化: preloaded辞書をクリア（_load_samples_for_filesで使用済みなので不要）
 	try:
@@ -1936,17 +2052,14 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 			print(f"[DEBUG_VALUE_MIX] train_part size={len(train_part)}, samples_with_q (first 100)={q_count}, samples_with_player_id (first 100)={player_id_count}")
 		except Exception as e:
 			print(f"[DEBUG_VALUE_MIX] failed to check train_part: {e}")
-
+	
 	# ロード時間の計測結果をログ出力
-	if logger:
-		try:
+		if logger:
 			logger.log_text(
 				f"[resume-timer] load_samples took={(t_load_end - t_load_start) if t_load_start is not None and t_load_end is not None else 0.0:.3f}s "
 				f"files={len(initial_active_files)} samples_train={train_samples_total} samples_val={val_samples_total}"
 			)
 			logger.flush_buffers(force=True)
-		except Exception:
-			pass
 	_log_memory_usage(logger, cfg, 'after_load_samples')
 	_maybe_collect_gc(cfg)
 	if bool(cfg.get('aggressive_gc', False)):
@@ -2020,24 +2133,78 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 	batch_size = int(cfg.get('batch_size', 256) or 256)
 	version_interval = int(version_interval or 0)
 	model_version = int(meta.get('model_version', 0) or 0)  # self-play と共有する番号を継続利用
-	# バリデーションをログ出力と同一タイミングに揃える: ログ間隔を val_every (設定されていれば) に合わせる
-	log_interval = val_every if val_every > 0 else int(cfg.get('train_log_every_updates', 1) or 1)
+	# CSVログ出力間隔（csv_train_log_every）を使用 - 検証とログを同じタイミングで実行
+	csv_log_interval = int(cfg.get('csv_train_log_every', 50) or 50)
+	log_interval = csv_log_interval
+	# CSVには検証結果も含めて出力したいため、log_intervalごとに検証も実行する
 
 	# ベストモデル保存用 (打ち切りは行わない)
 	early_min_delta = float(cfg.get('early_stop_min_delta', 0.0) or 0.0)
 	early_gap_delta = float(cfg.get('early_stop_gap_min_delta', 0.0) or 0.0)
 	early_best: tuple[float | None, float | None] | None = None  # (val_value_loss, gap)
 	early_best_path = os.path.join(cfg.get('checkpoint_dir', 'checkpoints'), 'policy_value_best.pt')
+	# In-memory snapshot of best model state_dict to avoid repeated disk writes
+	_best_state_dict_snapshot = None
 
 	last_loss_info = None
+	# hand head warmup: 設定で指定された最初の N 更新の間だけ hand_pred_loss_coef を一時上書き
+	hand_warmup_updates = int(cfg.get('hand_warmup_updates', 0) or 0)
+	hand_warmup_coef = cfg.get('hand_warmup_coef', None)
+	warmup_end = None
+	original_hand_coef = None
+	if hand_warmup_updates > 0 and hand_warmup_coef is not None:
+		warmup_end = int(train_updates_cum + hand_warmup_updates)
+		try:
+			original_hand_coef = float(cfg.get('hand_pred_loss_coef', 0.0) or 0.0)
+		except Exception:
+			original_hand_coef = 0.0
+		# resume 時に既にウォームアップ期間内であれば即時反映
+		if train_updates_cum < warmup_end:
+			try:
+				cfg['hand_pred_loss_coef'] = float(hand_warmup_coef)
+				if logger:
+					logger.log_text(f"[hand-warmup] enabled until update={warmup_end} hand_pred_loss_coef={hand_warmup_coef} (original={original_hand_coef})")
+			except Exception:
+				pass
 	# --- 学習ループ + プールリフレッシュ ---
+	# instrumentation timers (aggregate per-log-interval)
+	_t_train_acc = 0.0
+	_t_val_acc = 0.0
+	_t_refresh_acc = 0.0
+	_t_misc_acc = 0.0
+	_t_interval_start = time.time()
 	for i in range(updates):
+		# current absolute update index (cumulative)
+		current_step = train_updates_cum + i + 1
+		# Warmup期の適用/解除を毎ステップチェックして learner.config に反映
+		if warmup_end is not None:
+			if current_step <= warmup_end:
+				try:
+					learner.config['hand_pred_loss_coef'] = float(hand_warmup_coef)
+				except Exception:
+					pass
+			else:
+				# ウォームアップ終了時に元の係数へ復元
+				if original_hand_coef is not None:
+					try:
+						# only restore once
+						if float(learner.config.get('hand_pred_loss_coef', 0.0) or 0.0) != float(original_hand_coef):
+							learner.config['hand_pred_loss_coef'] = float(original_hand_coef)
+							if logger:
+								logger.log_text(f"[hand-warmup] ended at update={current_step-1}, restored hand_pred_loss_coef={original_hand_coef}")
+					except Exception:
+						pass
+		# measure train_step time
+		t0 = time.time()
 		loss_info = learner.train_step(batch_size=batch_size)
+		t1 = time.time()
+		t_train = t1 - t0
+		_t_train_acc += t_train
 		_maybe_collect_gc(cfg)
 		
 		# 50ステップごとに勾配ノルムを表示
 		current_step = train_updates_cum + i + 1
-		if (current_step % 50) == 0:
+		if (current_step % 300) == 0:
 			try:
 				import math as _m
 				import torch as _t
@@ -2130,58 +2297,96 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 		# アクティブファイルプール刷新（更新回数ベース）
 		# sliding_window モード (buffer_window_size > 0) の場合はリフレッシュをスキップ
 		if pool_size > 0 and refresh_every > 0 and buffer_window_size == 0 and ((train_updates_cum + i + 1) % refresh_every == 0):
+			# measure pool refresh time
+			t0r = time.time()
 			try:
 				active_files, _stats = _refresh_active_pool(active_files, all_files, cfg, shared_rb, val_ratio, _seed, eff_max_samp, logger, train_updates_cum=train_updates_cum + i + 1, data_dir=data_dir)
 			except Exception as e:
 				logger.log_text(f"[WARN] active-pool refresh failed: {e}")
+			t1r = time.time()
+			_t_refresh_acc += (t1r - t0r)
 
-		# ログ間隔に到達したときのみ検証 & ログ出力
+		# csv_train_log_every の間隔でのみ検証とCSVログ出力
 		if ((i + 1) % log_interval) == 0:
-			if val_every > 0:  # バリデーション間隔設定がある場合はそのタイミングで実施
-				val_metrics = _run_validation(learner, logger, cfg, batch_size=batch_size, note=f'update={train_updates_cum + i + 1}')
-				# ベストモデル更新判定 (val_value_loss 最小、同値なら Train/Val Gap 最小を優先)
-				try:
-					val_v = None
-					if isinstance(val_metrics, dict):
-						val_v = val_metrics.get('value_loss')
-					train_v = None
-					if isinstance(loss_info, dict):
-						train_v = loss_info.get('value_loss') or loss_info.get('loss')
-					gap = None
-					if val_v is not None and train_v is not None:
-						try:
-							gap = abs(float(val_v) - float(train_v))
-						except Exception:
-							gap = None
-					improved = False
-					if val_v is not None:
-						if early_best is None:
+			# 検証を実施（CSVに記録するため）
+			# measure validation time
+			t0v = time.time()
+			val_metrics = _run_validation(learner, logger, cfg, batch_size=batch_size, note=f'update={train_updates_cum + i + 1}')
+			t1v = time.time()
+			_t_val_acc += (t1v - t0v)
+			
+			# ベストモデル更新判定 (val_value_loss 最小、同値なら Train/Val Gap 最小を優先)
+			try:
+				val_v = None
+				if isinstance(val_metrics, dict):
+					val_v = val_metrics.get('value_loss')
+				train_v = None
+				if isinstance(loss_info, dict):
+					train_v = loss_info.get('value_loss') or loss_info.get('loss')
+				gap = None
+				if val_v is not None and train_v is not None:
+					try:
+						gap = abs(float(val_v) - float(train_v))
+					except Exception:
+						gap = None
+				improved = False
+				if val_v is not None:
+					if early_best is None:
+						improved = True
+					else:
+						best_val, best_gap = early_best
+						if best_val is None or val_v < best_val - early_min_delta:
 							improved = True
-						else:
-							best_val, best_gap = early_best
-							if best_val is None or val_v < best_val - early_min_delta:
-								improved = True
-							elif best_val is not None and abs(val_v - best_val) <= early_min_delta:
-								if gap is not None:
-									if best_gap is None or gap < best_gap - early_gap_delta:
-										improved = True
-					if improved:
-						early_best = (val_v, gap)
-						try:
-							os.makedirs(os.path.dirname(early_best_path), exist_ok=True)
-							if hasattr(learner, 'model') and learner.model is not None:
-								learner.model.save(early_best_path, logger=logger, force_sync=True)  # type: ignore[arg-type]
-						except Exception:
-							pass
-				except Exception:
-					pass
+						elif best_val is not None and abs(val_v - best_val) <= early_min_delta:
+							if gap is not None:
+								if best_gap is None or gap < best_gap - early_gap_delta:
+									improved = True
+				if improved:
+					early_best = (val_v, gap)
+					# Snapshot model state_dict into memory (CPU tensors) to save once after training
+					try:
+						if hasattr(learner, 'model') and learner.model is not None:
+							# copy to CPU and clone to detach from GPU tensors
+							try:
+								_best_state_dict_snapshot = {k: v.cpu().clone() for k, v in learner.model.state_dict().items()}
+							except Exception:
+								# fallback: shallow copy
+								_best_state_dict_snapshot = dict(learner.model.state_dict())
+					except Exception:
+						_best_state_dict_snapshot = None
+			except Exception:
+				pass
+			
+			# CSVにログを出力（検証結果も明示的に含める）
 			if isinstance(loss_info, dict) and loss_info.get('loss') is not None:
 				try:
 					loss_info.setdefault('train_count', train_updates_cum + i + 1)
+					# 検証結果を明示的に loss_info に追加
+					if isinstance(val_metrics, dict):
+						loss_info['val_policy_loss'] = val_metrics.get('policy_loss')
+						loss_info['val_value_loss'] = val_metrics.get('value_loss')
+						loss_info['val_hand_pred_loss'] = val_metrics.get('hand_pred_loss')
+						loss_info['val_hand_recall'] = val_metrics.get('hand_recall')
 				except Exception:
 					pass
 				logger.log_train(loss_info)
 				last_loss_info = loss_info
+				# instrumentation: report timing for this interval
+				try:
+					interval_now = time.time()
+					total_interval = interval_now - _t_interval_start
+					logger.log_text(
+						f"[time-prof] updates={train_updates_cum + i + 1 - (log_interval-1)}-{train_updates_cum + i + 1} "
+						f"train={_t_train_acc:.3f}s val={_t_val_acc:.3f}s refresh={_t_refresh_acc:.3f}s other={_t_misc_acc:.3f}s total={total_interval:.3f}s"
+					)
+				except Exception:
+					pass
+				# reset accumulators for next interval
+				_t_train_acc = 0.0
+				_t_val_acc = 0.0
+				_t_refresh_acc = 0.0
+				_t_misc_acc = 0.0
+				_t_interval_start = time.time()
 
 		# 100更新ごとに optimizer/scheduler の lr を events.log へ出力
 		try:
@@ -2305,6 +2510,41 @@ def train_loop(cfg: Dict[str, Any], *, data_dir: str, log_dir: str, max_files: i
 
 	# 学習後の最終検証を一度実施（intervalに依らず終端の値を残す）
 	_run_validation(learner, logger, cfg, batch_size=batch_size, note='post-train')
+	# If we captured an in-memory best-state snapshot during training, save it once now.
+	try:
+		if _best_state_dict_snapshot is not None:
+			from agents.models import PolicyValueNet
+			# Reconstruct a model with same architecture meta as current bundle.model
+			if bundle.model is not None:
+				meta_model = bundle.model
+				try:
+					best_model = PolicyValueNet(
+						max_policy_size=getattr(meta_model, 'max_policy_size', 128),
+						hidden_size=getattr(meta_model, 'hidden_size', 128),
+						num_players=getattr(meta_model, 'num_players', 4),
+						use_full_features=getattr(meta_model, 'use_full_features', True),
+						full_feature_dim=getattr(meta_model, 'full_feature_dim', None),
+						enable_hand_prediction_head=getattr(meta_model, 'enable_hand_prediction_head', True),
+						context_out_dim=getattr(meta_model, 'context_out_dim', 128),
+					)
+					# load snapshot
+					best_model.load_state_dict(_best_state_dict_snapshot)
+					# save best model to disk once
+					os.makedirs(os.path.dirname(early_best_path), exist_ok=True)
+					best_model.save(early_best_path, logger=logger, force_sync=True)  # type: ignore[arg-type]
+				except Exception:
+					# best-effort: try torch.save of state_dict if model construction fails
+					try:
+						ckpt = {'state_dict': _best_state_dict_snapshot}
+						torch.save(ckpt, early_best_path)
+					except Exception:
+						if logger:
+							logger.log_text(f"[save] WARNING: Failed to persist best-model snapshot: {_best_state_dict_snapshot is None}")
+						pass
+			# clear snapshot to free memory
+			_best_state_dict_snapshot = None
+	except Exception:
+		pass
 	_maybe_collect_gc(cfg)
 	_log_memory_usage(logger, cfg, 'after_train_loop')
 
@@ -2444,6 +2684,8 @@ def main():
 	parser.add_argument('--version-interval', type=int, default=10000, help='このエピソード累計間隔ごとに世代タグ付き ckpt 保存 (0=無効)')
 	parser.add_argument('--device', type=str, default=None, help='デバイス指定 (auto/cpu/cuda)')
 	parser.add_argument('--seed', type=int, default=None, help='乱数シード override')
+	parser.add_argument('--hand-warmup-updates', type=int, default=None, help='開始から何更新まで hand_pred_loss_coef を一時増加させる (override config)')
+	parser.add_argument('--hand-warmup-coef', type=float, default=None, help='ウォームアップ期間中に使用する一時的な hand_pred_loss_coef')
 	args = parser.parse_args()
 
 	base_cfg = _load_config(ALPHA_ZERO_CONFIG, args.config_json)
@@ -2455,6 +2697,11 @@ def main():
 		base_cfg['seed'] = int(args.seed)
 	if args.model_path is not None:
 		base_cfg['checkpoint_path'] = args.model_path
+	# optional hand-warmup overrides (applied via config for train_loop)
+	if args.hand_warmup_updates is not None:
+		base_cfg['hand_warmup_updates'] = int(args.hand_warmup_updates)
+	if args.hand_warmup_coef is not None:
+		base_cfg['hand_warmup_coef'] = float(args.hand_warmup_coef)
 	base_cfg['checkpoint_dir'] = args.checkpoint_dir
 	base_cfg['log_dir'] = args.log_dir
 	base_cfg['clear_logs_on_start'] = False  # 継続

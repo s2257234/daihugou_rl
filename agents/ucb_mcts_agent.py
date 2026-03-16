@@ -82,36 +82,81 @@ class UCBMCTSAgent:
         Returns:
             最も訪問回数が多い行動
         """
-        root_node = UCBMCTSNode()
+        import time
+        search_start = time.time()
+        
         root_player_id = self.player_id if self.player_id is not None else env.game.turn
         
+        # 合法手を取得
+        current_player_id = env.game.turn
+        hand = env.game.players[current_player_id].hand
+        field = env.game.current_field[:]
+        legal_actions = env._generate_legal_actions(hand, field)
+        
+        # 合法手が1つしかない場合は探索をスキップ（One Choice最適化）
+        if len(legal_actions) == 1:
+            return legal_actions[0]
+        
+        # 合法手がない場合
+        if not legal_actions:
+            return None
+        
+        root_node = UCBMCTSNode()
+        
+        # ルートノードですべての合法手を展開
+        for action in legal_actions:
+            child_node = UCBMCTSNode(parent=root_node, action=action)
+            root_node.children.append(child_node)
+        
+        # 時間計測用
+        copy_time = 0.0
+        sample_time = 0.0
+        selection_time = 0.0
+        expansion_time = 0.0
+        rollout_time = 0.0
+        backprop_time = 0.0
+        
         # 各シミュレーションを実行
-        for _ in range(self.num_simulations):
+        for sim_idx in range(self.num_simulations):
             # 環境をクローン
+            copy_start = time.time()
             env_copy = self._copy_env(env)
+            copy_time += time.time() - copy_start
             
             # 手札をサンプリング（決定化）
+            sample_start = time.time()
             self._sample_opponent_hands(env_copy, env, root_player_id)
+            sample_time += time.time() - sample_start
             
             # Selection → Expansion → Simulation → Backpropagation
             node = root_node
             current_env = env_copy
             
             # Selection: ルートから葉ノードまで選択
+            sel_start = time.time()
             while node.children:
                 node, current_env = self._uct_select(node, current_env, root_player_id)
+            selection_time += time.time() - sel_start
             
             # Expansion: 葉ノードを展開
+            exp_start = time.time()
             if not env_copy.game.done:
                 expanded_node, current_env = self._expand(node, current_env, root_player_id)
                 if expanded_node:
                     node = expanded_node
+            expansion_time += time.time() - exp_start
             
             # Simulation: ロールアウトを実行
+            rollout_start = time.time()
             reward = self._rollout(current_env, root_player_id)
+            rollout_time += time.time() - rollout_start
             
             # Backpropagation: 結果を逆伝播
+            backprop_start = time.time()
             self._backpropagate(node, reward)
+            backprop_time += time.time() - backprop_start
+        
+        total_time = time.time() - search_start
         
         # 最も訪問回数が多い子ノードのアクションを選択
         if not root_node.children:
@@ -137,13 +182,6 @@ class UCBMCTSAgent:
         Returns:
             (選択された子ノード, アクション適用後の環境状態)
         """
-        # 未訪問ノードを優先
-        for child in node.children:
-            if child.visits == 0:
-                new_env = self._copy_env(env)
-                self._apply_action(new_env, child.action)
-                return child, new_env
-        
         # UCB1値を計算
         uct_values = []
         for child in node.children:
@@ -182,13 +220,25 @@ class UCBMCTSAgent:
         field = env.game.current_field[:]
         legal_actions = env._generate_legal_actions(hand, field)
         
+        # アクションを文字列のタプルに変換して比較用のキーを作成
+        def _action_key(action):
+            """アクションをハッシュ可能なキーに変換"""
+            if action is None:
+                return None
+            try:
+                # Cardオブジェクトのリストを文字列のタプルに変換
+                return tuple(sorted(str(c) for c in action))
+            except (TypeError, AttributeError):
+                # リストでない場合やエラーの場合は文字列化
+                return (str(action),)
+        
         # 既に展開済みのアクションを除外
-        existing_actions = {id(child.action) if child.action is not None else None for child in node.children}
+        existing_actions = {_action_key(child.action) for child in node.children}
         
         # 新しい子ノードを作成
         for action in legal_actions:
-            action_id = id(action) if action is not None else None
-            if action_id not in existing_actions:
+            action_key = _action_key(action)
+            if action_key not in existing_actions:
                 child_node = UCBMCTSNode(parent=node, action=action)
                 node.children.append(child_node)
                 return child_node, env
@@ -206,8 +256,19 @@ class UCBMCTSAgent:
         Returns:
             報酬値
         """
+        import time
+        rollout_start = time.time()
         steps = 0
+        heuristic_time = 0.0
+        step_time = 0.0
+        
         while not env.game.done and steps < max_steps:
+            # 早期終了条件: 残りプレイヤーが1人以下になったら終了
+            rankings = getattr(env.game, 'rankings', [])
+            remaining_players = 4 - len(rankings)
+            if remaining_players <= 1:
+                break
+            
             current_player_id = env.game.turn
             hand = env.game.players[current_player_id].hand
             field = env.game.current_field[:]
@@ -215,13 +276,29 @@ class UCBMCTSAgent:
             
             if not legal_actions:
                 # 合法手がない場合はパス
+                step_start = time.time()
                 env.game.step(current_player_id, None)
+                step_time += time.time() - step_start
             else:
                 # 軽量ルールベース: 弱い順にソートして一番手前のものを出す
+                h_start = time.time()
                 best_action = min(legal_actions, key=self._rollout_heuristic)
+                heuristic_time += time.time() - h_start
+                step_start = time.time()
                 env.game.step(current_player_id, best_action)
+                step_time += time.time() - step_start
             
             steps += 1
+        
+        total_rollout_time = time.time() - rollout_start
+        # 0.1秒以上かかった場合のみログ出力（頻繁すぎないように）
+        if total_rollout_time > 0.1:
+            if not hasattr(self, '_rollout_log_counter'):
+                self._rollout_log_counter = 0
+            self._rollout_log_counter += 1
+            if self._rollout_log_counter % 50 == 0:  # 50回に1回のみ
+                print(f"[PERF] Rollout: {total_rollout_time:.3f}s ({steps} steps), "
+                      f"heuristic={heuristic_time:.3f}s, step={step_time:.3f}s")
         
         # 報酬を計算
         return self._calculate_reward(env, root_player_id)
@@ -309,36 +386,32 @@ class UCBMCTSAgent:
         g = env.game
         g_orig = original_env.game
         
-        # 既知のカードを収集（元の環境から、文字列IDとして）
-        root_hand_ids = {str(c) for c in g_orig.players[root_player_id].hand}
-        field_ids = {str(c) for c in getattr(g_orig, 'current_field', []) or []}
+        # 既知のカードを収集（Cardオブジェクトとして保持）
+        root_hand_cards = list(g_orig.players[root_player_id].hand)
+        field_cards = list(getattr(g_orig, 'current_field', []) or [])
         
-        # 全カードを収集（元の環境から、文字列IDとして）
-        all_cards_dict = {}  # 文字列ID -> カード文字列ID のマッピング
+        # 全カードを収集（Cardオブジェクトを直接使用）
+        all_cards = []
         for p in g_orig.players:
-            for c in p.hand:
-                cid = str(c)
-                if cid not in all_cards_dict:
-                    all_cards_dict[cid] = cid
-        for c in getattr(g_orig, 'current_field', []) or []:
-            cid = str(c)
-            if cid not in all_cards_dict:
-                all_cards_dict[cid] = cid
-        all_cards = list(all_cards_dict.values())
+            all_cards.extend(p.hand)
+        all_cards.extend(getattr(g_orig, 'current_field', []) or [])
         
-        # 既知カード（自分の手札、場のカード、既に上がったプレイヤーの手札）
-        known = set(root_hand_ids) | field_ids
+        # 既知カードのIDセット（文字列比較用）
+        known_ids = {str(c) for c in root_hand_cards}
+        known_ids.update(str(c) for c in field_cards)
+        
+        # 既に上がったプレイヤーのカードも既知
         for rid in getattr(g_orig, 'rankings', []):
             if rid != root_player_id:
-                known.update(str(c) for c in g_orig.players[rid].hand)
+                known_ids.update(str(c) for c in g_orig.players[rid].hand)
         
-        # 未知のカード（サンプリング対象）
-        unknown_seed = [cid for cid in all_cards if cid not in known]
+        # 未知のカード（Cardオブジェクト）を収集
+        unknown_cards = [c for c in all_cards if str(c) not in known_ids]
         
         # 相手プレイヤーIDのリスト
         opp_ids = [i for i in range(len(g.players)) if i != root_player_id and i not in getattr(g, 'rankings', [])]
         
-        if not opp_ids or not unknown_seed:
+        if not opp_ids or not unknown_cards:
             # 相手がいない、または未知カードがない場合は何もしない
             return
         
@@ -347,38 +420,32 @@ class UCBMCTSAgent:
         for pid in opp_ids:
             capacities[pid] = len(g_orig.players[pid].hand)
         
-        # 残りカードをランダムにシャッフル
-        random.shuffle(unknown_seed)
+        # 未知カードをシャッフル
+        random.shuffle(unknown_cards)
         
-        # 各相手プレイヤーに手札を配分
+        # 各相手プレイヤーに手札を配分（Cardオブジェクトを直接クローン）
         from game.card import Card
+        
+        def _clone_card(c):
+            """Cardオブジェクトをクローン"""
+            if getattr(c, 'is_joker', False):
+                return Card(is_joker=True)
+            else:
+                return Card(
+                    suit=getattr(c, 'suit', None),
+                    rank=getattr(c, 'rank', None),
+                    is_joker=False
+                )
+        
         card_idx = 0
         for pid in opp_ids:
             capacity = capacities[pid]
             new_hand = []
-            assigned = 0
-            while assigned < capacity and card_idx < len(unknown_seed):
-                cid = unknown_seed[card_idx]
-                card_idx += 1  # 常にインデックスを進める
-                try:
-                    # Card.from_stringがある場合
-                    if hasattr(Card, 'from_string'):
-                        card = Card.from_string(cid)
-                    else:
-                        # フォールバック: 文字列からCardオブジェクトを構築
-                        card = Card(cid)
-                    # カードが有効な場合のみ追加
-                    if card is not None:
-                        new_hand.append(card)
-                        assigned += 1
-                except Exception:
-                    # パースに失敗した場合は次のカードへ
-                    continue
-            
-            # 手札数が不足している場合は警告（通常は発生しないはず）
-            if len(new_hand) < capacity:
-                # 手札数が不足している場合は空のカードで埋める（通常は発生しない）
-                pass
+            while len(new_hand) < capacity and card_idx < len(unknown_cards):
+                # Cardオブジェクトをクローンして追加
+                card = _clone_card(unknown_cards[card_idx])
+                new_hand.append(card)
+                card_idx += 1
             
             g.players[pid].hand = new_hand
     

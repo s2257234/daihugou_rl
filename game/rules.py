@@ -168,8 +168,14 @@ class RuleChecker:
         try:
             key_elems = []
             for c in cards:
+                # If Joker is explicitly set as a substitute, treat it as that suit/rank
                 if getattr(c, 'is_joker', False):
-                    key_elems.append((1, None, None))
+                    jas = getattr(c, 'joker_as_suit', None)
+                    jar = getattr(c, 'joker_as_rank', None)
+                    if jas is not None and jar is not None:
+                        key_elems.append((0, jas, jar))
+                    else:
+                        key_elems.append((1, None, None))
                 else:
                     key_elems.append((0, getattr(c, 'suit', None), getattr(c, 'rank', None)))
             key_elems.sort()
@@ -326,7 +332,13 @@ class RuleChecker:
             return False
 
     def is_8cut(self, cards):
-        """8が含まれていて、かつジョーカーだけではないとき、8切り発動"""
+        """8切り判定。
+
+        方針:
+          - 8が1枚でも含まれていれば8切りを発動する。
+          - 階段など他のランクを含む組合せに8が混じる場合も8切りとみなす。
+        """
+        # ジョーカーは無視してランク判定
         has_8 = any(card.rank == 8 and not card.is_joker for card in cards)
         has_normal = any(not card.is_joker for card in cards)
         return has_8 and has_normal
@@ -566,3 +578,87 @@ class RuleChecker:
         players[fugo].hand.remove(fugo_give)
         players[hinmin].hand.append(fugo_give)
         #print(f"富豪(Player {fugo})→貧民(Player {hinmin}): {fugo_give}")
+
+    # ========== しばり (Suit Lock) ルール実装 ==========
+    def check_shibari(self, current_field, prev_field):
+        """しばり判定を行う
+        
+        Args:
+            current_field: 今回出されたカードのリスト
+            prev_field: 前回の場にあったカードのリスト
+        
+        Returns:
+            (is_shibari: bool, required_suits: List[str])
+            - しばりが成立する場合: (True, [必須スート])
+            - しばりが成立しない場合: (False, [])
+        """
+        # 前回の場が空（新しいトリックの開始）なら縛りは発生しない
+        if not prev_field:
+            return False, []
+        
+        # どちらかが空なら縛りなし
+        if not current_field:
+            return False, []
+        
+        # ジョーカー単体は縛り対象外。ただしジョーカーに代用スート/ランクが付与されている
+        # 場合は通常カードとして扱う（JOKER(as ♥4) など）
+        if len(prev_field) == 1 and getattr(prev_field[0], 'is_joker', False) and (
+            getattr(prev_field[0], 'joker_as_suit', None) is None or getattr(prev_field[0], 'joker_as_rank', None) is None
+        ):
+            return False, []
+        if len(current_field) == 1 and getattr(current_field[0], 'is_joker', False) and (
+            getattr(current_field[0], 'joker_as_suit', None) is None or getattr(current_field[0], 'joker_as_rank', None) is None
+        ):
+            return False, []
+        
+        # 前回と今回のスートパターンを取得
+        prev_suits = self.extract_suit_pattern(prev_field)
+        new_suits = self.extract_suit_pattern(current_field)
+        
+        # スートパターンが一致したら縛り発動
+        if prev_suits == new_suits and len(prev_suits) > 0:
+            return True, prev_suits
+        
+        return False, []
+
+    def extract_suit_pattern(self, cards):
+        """カードセットからスートパターンを抽出 (ソート済み・重複除外)
+        
+        Args:
+            cards: Cardオブジェクトのリスト
+        
+        Returns:
+            ソート済みのスートリスト（例: ['♥', '♠']）
+        """
+        suits = set()
+        for card in cards:
+            # 通常カードのスートを追加
+            if not getattr(card, 'is_joker', False) and hasattr(card, 'suit') and card.suit:
+                suits.add(card.suit)
+            # ジョーカーで代用スートが設定されている場合はそれを追加
+            elif getattr(card, 'is_joker', False):
+                jas = getattr(card, 'joker_as_suit', None)
+                if jas:
+                    suits.add(jas)
+        return sorted(list(suits))  # ソートで順序を一定に
+
+    def extract_suit_pattern_from_strings(self, card_strs):
+        """文字列リストからスートパターンを抽出
+        
+        Args:
+            card_strs: カード文字列のリスト（例: ['♠3', '♥K']）
+        
+        Returns:
+            ソート済みのスートリスト
+        """
+        suits = set()
+        # Accept suit character anywhere in the string (handles 'JOKER(♥4)' etc.)
+        valid_suits = {'\u2660', '\u2665', '\u2666', '\u2663', '♠', '♥', '♦', '♣'}
+        for s in card_strs:
+            if not s:
+                continue
+            for ch in s:
+                if ch in valid_suits:
+                    suits.add(ch)
+                    break
+        return sorted(list(suits))

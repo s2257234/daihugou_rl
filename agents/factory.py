@@ -3,10 +3,25 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import os
+import random
+import glob
 
 from agents.drl_agent import AlphaZeroAgent
+from agents.rule_based_agent import RuleBasedAgent
 from agents.models import PolicyValueNet
 from game.environment import DaifugoSimpleEnv
+
+# Suppress repeated informational prints: allow once-per-process messages
+_FACTORY_PRINTED: set = set()
+
+def _factory_print_once(key: str, msg: str) -> None:
+    try:
+        if key in _FACTORY_PRINTED:
+            return
+        _FACTORY_PRINTED.add(key)
+        print(msg)
+    except Exception:
+        pass
 
 
 @dataclass
@@ -49,14 +64,14 @@ def _load_or_build_model(config: Dict[str, Any], *, device: str, model_path: Opt
     if use_full:
         # 新仕様に合わせたデフォルト full_feature_dim を使う。
         # models.py のレイアウトに基づく期待式: full_feature_dim = 72*N + 73
-        try:
-            N = int(config.get("num_players", 4))
-            # New layout: full_feature_dim = 73*N + 74
-            default_full_dim = 73 * N + 74
-        except Exception:
-            default_full_dim = 366
+        N = int(config.get("num_players", 4))
+        # v9 layout: full_feature_dim = 73*N + 79 (matches agents.models expected v9)
+        default_full_dim = 73 * N + 79
+        # prepare policy size and full dim
+        max_policy_size_cfg = config.get("max_policy_size", 128)
+        default_full_dim = 371
         model = PolicyValueNet(
-            max_policy_size=config.get("max_policy_size", 128),
+            max_policy_size=max_policy_size_cfg,
             hidden_size=config.get("hidden_size", 128),
             num_players=config.get("num_players", 4),
             device=device,
@@ -66,10 +81,11 @@ def _load_or_build_model(config: Dict[str, Any], *, device: str, model_path: Opt
             context_out_dim=config.get("hidden_size", 128),  # hidden_sizeに合わせる（過学習防止）
             signal_noise_std=0.0,  # Signal Augmentationを無効化（勾配爆発対策）
         )
-    else:
+    if not bool(config.get('suppress_factory_info', False)):
         # use_full_features=False は廃止されているが、互換性のため残している
+        max_policy_size_cfg = config.get("max_policy_size", 128)
         model = PolicyValueNet(
-            max_policy_size=config.get("max_policy_size", 128),
+            max_policy_size=max_policy_size_cfg,
             hidden_size=config.get("hidden_size", 128),
             num_players=config.get("num_players", 4),
             device=device,
@@ -124,6 +140,19 @@ def _attach_agent_context(
                     ag._remote_req_counter = 0
                 except Exception:
                     pass
+        # Ensure agent-level flag exists for downstream code that inspects the attribute
+        try:
+            # Prefer explicit config flag if provided, fallback to False
+            if hasattr(ag, 'config') and isinstance(getattr(ag, 'config', None), dict):
+                ag.is_using_latest_model = bool(ag.config.get('is_using_latest_model', False))
+            else:
+                # For agents without a config dict (e.g., RuleBasedAgent), default to False
+                ag.is_using_latest_model = False
+        except Exception:
+            try:
+                setattr(ag, 'is_using_latest_model', False)
+            except Exception:
+                pass
 
 
 def _maybe_rebuild_full_model(config: Dict[str, Any], model: PolicyValueNet, agents: List[AlphaZeroAgent], env: DaifugoSimpleEnv) -> PolicyValueNet:
@@ -150,8 +179,11 @@ def _maybe_rebuild_full_model(config: Dict[str, Any], model: PolicyValueNet, age
         if need_rebuild:
             device = next(model.parameters()).device if hasattr(model, "parameters") else None
             device_str = str(device) if device is not None else resolve_device(config, context="main")
+            max_policy_size_cfg = config.get("max_policy_size", 128)
+            if not bool(config.get('suppress_factory_info', False)):
+                _factory_print_once('rebuild_model_full', f"[factory] Rebuilding model with max_policy_size={max_policy_size_cfg} full_feature_dim={full_dim_i}")
             new_model = PolicyValueNet(
-                max_policy_size=config.get("max_policy_size", 128),
+                max_policy_size=max_policy_size_cfg,
                 hidden_size=config.get("hidden_size", 128),
                 num_players=config.get("num_players", 4),
                 device=device_str,
@@ -257,6 +289,99 @@ def _maybe_rebuild_full_model(config: Dict[str, Any], model: PolicyValueNet, age
     return model
 
 
+def _load_past_model_pool(config: Dict[str, Any], device: str, pool_size: int) -> List[PolicyValueNet]:
+    """過去モデルプールをチェックポイントディレクトリから読み込む"""
+    checkpoint_dir = config.get("checkpoint_dir", "checkpoints")
+    if not os.path.isdir(checkpoint_dir):
+        return []
+    
+    # policy_value_ep*.pt 形式のチェックポイントを検索
+    pattern = os.path.join(checkpoint_dir, "policy_value_ep*.pt")
+    checkpoint_files = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+    
+    # 最新のN個を除外（これらは最新モデルと同等として扱う）
+    # pool_size個の過去モデルを選択
+    past_checkpoints = checkpoint_files[5:5+pool_size] if len(checkpoint_files) > 5 else []
+    
+    past_models = []
+    for cp in past_checkpoints:
+        try:
+            model = PolicyValueNet.load(cp, map_location=device)
+            past_models.append(model)
+        except Exception as e:
+            print(f"[WARN] Failed to load past model '{cp}': {e}")
+    
+    return past_models
+
+
+def _select_opponent_agent(
+    player_id: int,
+    config: Dict[str, Any],
+    latest_model: PolicyValueNet,
+    past_model_pool: List[PolicyValueNet],
+) -> Any:
+    """アリーナ方式で対戦相手を確率的に選択
+    
+    Args:
+        player_id: プレイヤーID
+        config: 設定
+        latest_model: 最新モデル
+        past_model_pool: 過去モデルプール
+    
+    Returns:
+        AlphaZeroAgent または RuleBasedAgent
+    """
+    learning_player_id = config.get("learning_player_id", 0)
+    
+    # 学習プレイヤーは常に最新モデル（学習モード）
+    if player_id == learning_player_id:
+        agent_config = dict(config)
+        agent_config["is_using_latest_model"] = True  # 最新モデル使用フラグ
+        return AlphaZeroAgent(player_id=player_id, model=latest_model, config=agent_config)
+    
+    # アリーナ方式が無効なら全員最新モデル（全員学習データ保存対象）
+    if not config.get("enable_arena_selection", False):
+        agent_config = dict(config)
+        agent_config["is_using_latest_model"] = True  # 最新モデル使用フラグ
+        # training フラグは元のconfigを継承（通常はTrue）
+        return AlphaZeroAgent(player_id=player_id, model=latest_model, config=agent_config)
+    
+    # 確率的に対戦相手を選択
+    best_prob = config.get("arena_best_model_prob", 0.50)
+    past_prob = config.get("arena_past_model_prob", 0.25)
+    rule_prob = config.get("arena_rule_based_prob", 0.25)
+    
+    rand = random.random()
+    
+    if rand < best_prob:
+        # 最新モデル（推論モード）→ データ保存対象
+        agent_config = dict(config)
+        # training=True にすることで select_action 内でデータが保存される
+        # （推論モードではなく学習モード扱い）
+        agent_config["training"] = True
+        agent_config["is_using_latest_model"] = True  # 最新モデル使用フラグ
+        return AlphaZeroAgent(player_id=player_id, model=latest_model, config=agent_config)
+    
+    elif rand < best_prob + past_prob:
+        # 過去モデル（プールからランダム選択）→ データ保存対象外
+        if past_model_pool:
+            past_model = random.choice(past_model_pool)
+            agent_config = dict(config)
+            agent_config["training"] = False
+            agent_config["is_using_latest_model"] = False  # 過去モデル
+            return AlphaZeroAgent(player_id=player_id, model=past_model, config=agent_config)
+        else:
+            # 過去モデルがない場合は最新モデルで代替（データ保存対象）
+            agent_config = dict(config)
+            agent_config["training"] = True  # データ保存のためTrue
+            agent_config["is_using_latest_model"] = True  # 代替なので最新扱い
+            return AlphaZeroAgent(player_id=player_id, model=latest_model, config=agent_config)
+    
+    else:
+        # ルールベースエージェント → データ保存対象外
+        return RuleBasedAgent(player_id=player_id)
+
+
 def create_env_and_agents(
     config: Dict[str, Any],
     *,
@@ -274,12 +399,23 @@ def create_env_and_agents(
     device = resolved_device or resolve_device(config, context=context)
     # モデル準備
     model, loaded = _load_or_build_model(config, device=device, model_path=model_path)
-    # エージェント作成
+    
+    # アリーナ方式用の過去モデルプール準備
+    past_model_pool = []
+    if config.get("enable_arena_selection", False):
+        pool_size = config.get("arena_past_model_pool_size", 10)
+        past_model_pool = _load_past_model_pool(config, device, pool_size)
+    else:
+        if not bool(config.get('suppress_factory_info', False)) and context == 'main':
+            _factory_print_once('arena_disabled', "[INFO] Arena selection is disabled: all players will use the latest model")
+    
+    # エージェント作成（アリーナ方式で対戦相手を選択）
     num_players = int(config.get("num_players", 4))
-    agents: List[AlphaZeroAgent] = []
+    agents: List[Any] = []
     for pid in range(num_players):
-        ag = AlphaZeroAgent(player_id=pid, model=model, config=dict(config))
-        agents.append(ag)
+        agent = _select_opponent_agent(pid, config, model, past_model_pool)
+        agents.append(agent)
+    
     # 環境作成
     env = DaifugoSimpleEnv(num_players=num_players, agent_classes=None)
     # デバッグオプション設定
@@ -297,8 +433,10 @@ def create_env_and_agents(
         response_q=response_q,
         worker_id=worker_id,
     )
-    # フル特徴量時、必要なら入力次元に合わせて再構築
-    model = _maybe_rebuild_full_model(config, model, agents, env)
+    # フル特徴量時、必要なら入力次元に合わせて再構築（AlphaZeroAgentのみ）
+    alphazero_agents = [ag for ag in agents if isinstance(ag, AlphaZeroAgent)]
+    if alphazero_agents:
+        model = _maybe_rebuild_full_model(config, model, alphazero_agents, env)
     # Optional: force model full feature dim override from config (useful when model expects legacy dim)
     try:
         forced = config.get('force_full_input_dim', None)
@@ -310,14 +448,15 @@ def create_env_and_agents(
                     model.full_feature_dim = fd
                 except Exception:
                     pass
-                # also update existing agents' model references if they hold the model
-                for ag in agents:
+                # also update existing AlphaZero agents' model references if they hold the model
+                for ag in alphazero_agents:
                     try:
                         if getattr(ag, 'model', None) is not None:
                             ag.model.full_feature_dim = fd
                     except Exception:
                         pass
-                print(f"[INFO] forced model.full_feature_dim to {fd} via config.force_full_input_dim")
+                if not bool(config.get('suppress_factory_info', False)) and context == 'main':
+                    _factory_print_once('forced_full_dim', f"[INFO] forced model.full_feature_dim to {fd} via config.force_full_input_dim")
             except Exception:
                 pass
     except Exception:
@@ -328,7 +467,7 @@ def create_env_and_agents(
     bundle = AgentEnvBundle(model=model, agents=agents, env=env, device=device, loaded_from_checkpoint=loaded)
     # 念のため、学習プレイヤーのモデルとbundle.modelが同じインスタンスであることを確認
     learning_player_id = config.get('learning_player_id', 0)
-    if learning_player_id < len(agents):
+    if learning_player_id < len(agents) and isinstance(agents[learning_player_id], AlphaZeroAgent):
         learner = agents[learning_player_id]
         if id(learner.model) != id(bundle.model):
             # 学習プレイヤーのモデルとbundle.modelが異なる場合は、bundle.modelを更新

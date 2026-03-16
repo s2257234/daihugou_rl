@@ -1,6 +1,22 @@
 import copy
 import math
 import random
+
+_MCTS_FALLBACK_LOGGED = set()
+
+def _log_mcts_fallback_once(key: str, msg: str, exc: Exception | None = None):
+    if key in _MCTS_FALLBACK_LOGGED:
+        return
+    _MCTS_FALLBACK_LOGGED.add(key)
+    try:
+        if exc is not None:
+            print(f"{msg} ({type(exc).__name__}: {exc})")
+        else:
+            print(msg)
+    except Exception:
+        pass
+
+_MCTS_FAST_IMPORT_ERROR = None
 try:
     # Optional fast helpers (Cython acceleration). Safe fallback if missing.
     from agents.mcts_fast import (
@@ -8,10 +24,14 @@ try:
         puct_backup_generic as _puct_backup_generic,
         puct_backup_scalar as _puct_backup_scalar,
     )
-except Exception:
+except Exception as e:
+    _MCTS_FAST_IMPORT_ERROR = e
     _puct_select_index_fast = None
     _puct_backup_generic = None
     _puct_backup_scalar = None
+
+if _MCTS_FAST_IMPORT_ERROR is not None:
+    _log_mcts_fallback_once("mcts_fast_import", "[mcts-fallback] mcts_fast import failed; using pure-Python MCTS helpers", _MCTS_FAST_IMPORT_ERROR)
 
 """MCTS 実装共通化モジュール
 
@@ -94,6 +114,14 @@ class environmentEnv:
 
 
 class MCTSNode:
+    """旧式ランダムロールアウト用ノード。
+
+    簡易版のみで使用されるため、環境コピー(state)を保持する設計は維持しつつ、
+    __slots__ で辞書を排しメモリを抑制する。
+    """
+
+    __slots__ = ("state", "parent", "action", "children", "visits", "value")
+
     def __init__(self, state, parent=None, action=None):
         self.state = state      # このノードが表す環境状態（environmentEnvのコピー）
         self.parent = parent    # 親ノード（Noneならルート）
@@ -108,6 +136,9 @@ class MCTSNode:
 # =============================================================
 class PUCTNode:
     """PUCT (AlphaZero) 用ノード。
+
+    推論ツリーで大量生成されるため __slots__ で軽量化し、ゲーム状態は保持しない。
+    持つのは統計値と分岐情報のみ。
 
     value_sum: 累積価値（各ノードの現在手番プレイヤー視点で加算）。平均値 = value_sum / visit_count。
     prior: policy_value_fn が返した事前確率。
@@ -158,8 +189,8 @@ class PUCTNode:
             if _puct_backup_generic is not None:
                 _puct_backup_generic(self, leaf_value)
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            _log_mcts_fallback_once("puct_backup_fast_exception", "[mcts-fallback] fast backup failed; using Python backup", e)
         # Fallback: pure Python backup
         def _value_for_pid(v, pid: int) -> float:
             try:
@@ -178,23 +209,40 @@ class PUCTNode:
             node = node.parent
 
 
-def _puct_select(node: PUCTNode, c_puct: float, virtual_counts=None) -> PUCTNode:
-    """子ノードの中から PUCT スコア最大のものを返す"""
+def _puct_select(node: PUCTNode, c_puct: float, virtual_counts=None, fpu_reduction: float = 0.0) -> PUCTNode:
+    """子ノードの中から PUCT スコア最大のものを返す
+    
+    Args:
+        node: 現在のノード
+        c_puct: PUCT探索定数
+        virtual_counts: 仮想訪問回数（バッチ評価用）
+        fpu_reduction: FPU (First Play Urgency) ペナルティ。未訪問ノードの評価値を親の価値 - fpu_reduction にする
+    """
     if virtual_counts is None:
         virtual_counts = {}
     ch_vals = node.children
     if not ch_vals:
         return None
+    
+    # FPU: 未訪問ノードの初期値を計算（親ノードの価値 - fpu_reduction）
+    parent_value = node.value if node.visit_count > 0 else 0.5
+    fpu_value = parent_value - fpu_reduction if fpu_reduction > 0.0 else 0.0
+    
     # Fast path: Cython implementation if available
     if _puct_select_index_fast is not None:
         children = list(ch_vals.values())
-        priors = [ch.prior for ch in children]
-        values = [(0.0 if ch.visit_count == 0 else ch.value_sum / ch.visit_count) for ch in children]
-        visits = [ch.visit_count for ch in children]
-        vcounts = [virtual_counts.get(id(ch), 0) for ch in children]
-        idx = _puct_select_index_fast(priors, values, visits, vcounts, float(c_puct), -1)
-        if 0 <= idx < len(children):
-            return children[idx]
+        # Cython expects pure Python lists of float/int, not memoryview/bytes
+        priors = [float(ch.prior) for ch in children]
+        values = [float(fpu_value if ch.visit_count == 0 else ch.value_sum / ch.visit_count) for ch in children]
+        visits = [int(ch.visit_count) for ch in children]
+        vcounts = [int(virtual_counts.get(id(ch), 0)) for ch in children]
+        try:
+            idx = _puct_select_index_fast(priors, values, visits, vcounts, float(c_puct), -1)
+            if 0 <= idx < len(children):
+                return children[idx]
+        except (TypeError, ValueError):
+            # Cython互換性エラーの場合はNumPyパスにフォールバック（ログ不要）
+            pass
     # NumPy vectorized path (when Cython is unavailable)
     try:
         import numpy as _np
@@ -205,18 +253,22 @@ def _puct_select(node: PUCTNode, c_puct: float, virtual_counts=None) -> PUCTNode
         vcounts = _np.fromiter((virtual_counts.get(id(ch), 0) for ch in children), dtype=_np.int64, count=n)
         visits = _np.fromiter((ch.visit_count for ch in children), dtype=_np.int64, count=n)
         priors = _np.fromiter((ch.prior for ch in children), dtype=_np.float64, count=n)
-        # value = value_sum / max(1, visit_count)
+        # value = value_sum / max(1, visit_count), but use FPU for unvisited nodes
         vsum = _np.fromiter((ch.value_sum for ch in children), dtype=_np.float64, count=n)
         denom = _np.maximum(1, visits)
         values = vsum / denom
+        # FPU: 未訪問ノード (visit_count == 0) には fpu_value を使用
+        if fpu_reduction > 0.0:
+            unvisited_mask = (visits == 0)
+            values[unvisited_mask] = fpu_value
         total_visits = int(_np.maximum(1, (visits + vcounts).sum()))
         sqrt_total = math.sqrt(total_visits)
         u = (float(c_puct) * priors * sqrt_total) / (1.0 + visits + vcounts)
         score = values + u
         idx = int(score.argmax())
         return children[idx]
-    except Exception:
-        pass
+    except Exception as e:
+        _log_mcts_fallback_once("puct_select_numpy_exception", "[mcts-fallback] NumPy PUCT failed; using Python fallback", e)
     # Fallback: pure-Python loop
     def vc(ch):
         return virtual_counts.get(id(ch), 0)
@@ -226,7 +278,12 @@ def _puct_select(node: PUCTNode, c_puct: float, virtual_counts=None) -> PUCTNode
     for child in ch_vals.values():
         visit_eff = child.visit_count + vc(child)
         u = c_puct * child.prior * sqrt_total / (1 + visit_eff)
-        score = child.value + u
+        # FPU: 未訪問ノードには fpu_value を使用
+        if child.visit_count == 0 and fpu_reduction > 0.0:
+            q_value = fpu_value
+        else:
+            q_value = child.value
+        score = q_value + u
         if score > best_score:
             best_score = score
             best = child
@@ -247,6 +304,7 @@ def run_puct_mcts(root_env_copy,
                   transposition_table: dict | None = None,
                   state_key_fn = None,
                   determinize_fn = None,
+                  fpu_reduction: float = 0.0,
                   early_stop_enable: bool = False,
                   early_stop_min_sims: int = 16,
                   early_stop_visit_ratio: float = 0.75,
@@ -446,11 +504,12 @@ def run_puct_mcts(root_env_copy,
                     base_env.already_won_players = set(_root_already_won)
                 else:
                     # best-effort fallback: treat current rankings as already-won
+                    _log_mcts_fallback_once("already_won_fallback", "[mcts-fallback] already_won_players missing; fallback to rankings")
                     base_env.already_won_players = set(getattr(g_new, 'rankings', []) or [])
                 # stage_history must be a fresh list per clone
                 base_env.stage_history = []
-            except Exception:
-                pass
+            except Exception as e:
+                _log_mcts_fallback_once("clone_stage_isolation_exception", "[mcts-fallback] stage isolation failed; proceeding best-effort", e)
             _clone_pool.append(base_env)
     except Exception:
         _clone_pool = []
@@ -463,8 +522,10 @@ def run_puct_mcts(root_env_copy,
                 if snapshot_root is not None and hasattr(env_new.game, 'set_state_data'):
                     env_new.game.set_state_data(snapshot_root, card_lookup)
                     return env_new
-            except Exception:
-                pass
+            except Exception as e:
+                _log_mcts_fallback_once("snapshot_restore_exception", "[mcts-fallback] snapshot restore failed; using manual restore", e)
+            if snapshot_root is None:
+                _log_mcts_fallback_once("snapshot_missing", "[mcts-fallback] snapshot_root missing; using manual restore")
             # Snapshot が使えない場合でも、プールの clone を使って手動で状態を復元する。
             # （浅い copy フォールバックは already_won_players 等を共有して汚染するため不可）
             try:
@@ -473,61 +534,63 @@ def run_puct_mcts(root_env_copy,
                 if g_src is not None and g_dst is not None:
                     try:
                         g_dst.turn = int(getattr(g_src, 'turn', 0) or 0)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _log_mcts_fallback_once("manual_restore_turn", "[mcts-fallback] manual restore: turn failed", e)
                     try:
                         g_dst.current_field = list(getattr(g_src, 'current_field', []) or [])
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _log_mcts_fallback_once("manual_restore_field", "[mcts-fallback] manual restore: current_field failed", e)
                     try:
                         g_dst.passed = list(getattr(g_src, 'passed', []) or [])
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _log_mcts_fallback_once("manual_restore_passed", "[mcts-fallback] manual restore: passed failed", e)
                     try:
                         g_dst.rankings = list(getattr(g_src, 'rankings', []) or [])
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _log_mcts_fallback_once("manual_restore_rankings", "[mcts-fallback] manual restore: rankings failed", e)
                     try:
                         g_dst.done = bool(getattr(g_src, 'done', False))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _log_mcts_fallback_once("manual_restore_done", "[mcts-fallback] manual restore: done failed", e)
                     # hands
                     try:
                         ps = getattr(g_src, 'players', []) or []
                         pd = getattr(g_dst, 'players', []) or []
                         for i in range(min(len(ps), len(pd))):
                             pd[i].hand = list(getattr(ps[i], 'hand', []) or [])
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _log_mcts_fallback_once("manual_restore_hands", "[mcts-fallback] manual restore: hands failed", e)
 
                 # stage/phase tracking isolation
                 try:
                     env_new.stage_id = int(getattr(root_env_copy, 'stage_id', getattr(env_new, 'stage_id', 0)) or 0)
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log_mcts_fallback_once("manual_restore_exception", "[mcts-fallback] manual restore encountered error; continuing best-effort", e)
                 try:
                     env_new.turn_idx = int(getattr(root_env_copy, 'turn_idx', getattr(env_new, 'turn_idx', 0)) or 0)
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log_mcts_fallback_once("manual_restore_turn_idx", "[mcts-fallback] manual restore: turn_idx failed", e)
                 try:
                     aw = getattr(root_env_copy, 'already_won_players', None)
                     env_new.already_won_players = set(aw) if aw is not None else set()
-                except Exception:
+                except Exception as e:
+                    _log_mcts_fallback_once("manual_restore_already_won", "[mcts-fallback] manual restore: already_won_players failed", e)
                     try:
                         env_new.already_won_players = set()
-                    except Exception:
-                        pass
+                    except Exception as e2:
+                        _log_mcts_fallback_once("manual_restore_already_won_fallback", "[mcts-fallback] manual restore: already_won fallback failed", e2)
                 try:
                     env_new.stage_history = []
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log_mcts_fallback_once("manual_restore_stage_history", "[mcts-fallback] manual restore: stage_history failed", e)
                 return env_new
-            except Exception:
+            except Exception as e:
                 # If even manual restore fails, fall through to slow path.
+                _log_mcts_fallback_once("manual_restore_total_failure", "[mcts-fallback] manual restore failed; using slow path", e)
                 try:
                     _clone_pool.append(env_new)
-                except Exception:
-                    pass
+                except Exception as e2:
+                    _log_mcts_fallback_once("manual_restore_return_pool_failed", "[mcts-fallback] failed to return clone to pool", e2)
         # ルートと同じ軽量コピー方針
         g = env.game
         g_new = copy.copy(g)
@@ -568,8 +631,8 @@ def run_puct_mcts(root_env_copy,
         try:
             aw = getattr(env, 'already_won_players', None)
             env_new.already_won_players = set(aw) if aw is not None else set()
-        except Exception:
-            pass
+        except Exception as e:
+            _log_mcts_fallback_once("slow_clone_already_won", "[mcts-fallback] slow clone: already_won_players failed", e)
         return env_new
 
     # トランスポジションテーブル（None の場合はキャッシュ無効）
@@ -588,9 +651,10 @@ def run_puct_mcts(root_env_copy,
                     # Zobrist ハッシュがあれば優先
                     if hasattr(g, 'get_zobrist_key'):
                         return g.get_zobrist_key(True)
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log_mcts_fallback_once("state_key_zobrist_exception", "[mcts-fallback] zobrist key failed; using legacy bitmask", e)
                 # フォールバック: 旧ビットマスク方式
+                _log_mcts_fallback_once("state_key_bitmask", "[mcts-fallback] state_key uses legacy bitmask")
                 try:
                     g = e.game
                     turn = getattr(g, 'turn', 0)
@@ -739,7 +803,7 @@ def run_puct_mcts(root_env_copy,
             terminal_value = None
             depth = 0
             while node.children:
-                node = _puct_select(node, c_puct, virtual_counts)
+                node = _puct_select(node, c_puct, virtual_counts, fpu_reduction)
                 # 同一バッチ中に同じ経路が過剰に選ばれないよう仮想訪問を加算
                 virtual_counts[id(node)] = virtual_counts.get(id(node), 0) + 1
                 # --- stage-terminal detection (phase ends when a new winner appears) ---
@@ -1002,15 +1066,17 @@ def run_puct_mcts(root_env_copy,
             if isinstance(leaf_value, dict):
                 try:
                     leaf_value = {int(k): float(v) for k, v in leaf_value.items()}
-                except Exception:
+                except Exception as e:
                     # fallback: map missing players to 0.0
+                    _log_mcts_fallback_once("leaf_value_dict_fallback", "[mcts-fallback] leaf_value dict sanitize fallback", e)
                     leaf_value = {pid: float(leaf_value.get(pid, 0.0)) for pid in range(n_players)}
             # Case: list/tuple -> treat as per-player vector
             elif isinstance(leaf_value, (list, tuple)):
                 try:
                     leaf_value = {pid: float(leaf_value[pid]) if 0 <= pid < len(leaf_value) else 0.0
                                   for pid in range(n_players)}
-                except Exception:
+                except Exception as e:
+                    _log_mcts_fallback_once("leaf_value_list_fallback", "[mcts-fallback] leaf_value list->dict fallback", e)
                     leaf_value = {pid: 0.0 for pid in range(n_players)}
             else:
                 # Scalar: assign to leaf_pid and distribute remainder evenly

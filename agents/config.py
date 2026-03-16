@@ -20,8 +20,8 @@ ALPHA_ZERO_CONFIG = {
     # ---------------------------
     "buffer_size": 750000,            # リプレイバッファ最大サイズ（メモリ効率優先で削減） 
     "batch_size": 256,               # 学習バッチサイズ (train_step 実装時に利用)
-    "lr": 7e-5,                      # 学習率　7e-5→1e-4（Val loss改善のため引き上げ）
-    "weight_decay": 3e-3,          # L2 正則化　初期値1e-4
+    "lr": 1e-4,                      # 学習率　7e-5→1e-4（Val loss改善のため引き上げ）
+    "weight_decay": 1e-4,          # L2 正則化　初期値1e-4
     # 勾配ノルムクリップ: 大きな勾配スパイクを防ぎ安定化するための上限 (float>0で有効)
     "grad_clip": 4.0,
     # Value Head専用の正則化（過学習対策）
@@ -43,9 +43,9 @@ ALPHA_ZERO_CONFIG = {
     # none | warmup_cosine
     "lr_scheduler": "warmup_cosine",
     "lr_warmup_steps": 1000,
-    "lr_min": 7e-6,
+    "lr_min": 1e-6,
     # ウォームアップ後、ここまでの更新ステップで lr_min へ到達
-    "lr_cosine_T_max_updates": 100000, #目標ステップ数に応じて変更する
+    "lr_cosine_T_max_updates": 200000, #目標ステップ数に応じて変更する
     
     # MCTS評価値（q）と勝敗結果（z）の混合設定
     "value_mix_z_q_enable": True,  # zとqを混ぜる機能を有効にするか
@@ -71,15 +71,31 @@ ALPHA_ZERO_CONFIG = {
     # リモート推論結果(hand_probs)のキャッシュ有効TTL(秒)。古い予測は無視してローカル再計算。
     # determinization 時の鮮度確保と過度なIPC依存を避けるために使用。
     "hand_pred_cache_ttl_sec": 0.5,
+    # --- 手札予測ヘッドのウォームアップ設定 ---
+    # hand_warmup_updates: 学習開始からこの更新回数まで一時的に hand_pred_loss_coef を増やす (0 で無効)
+    "hand_warmup_updates": 1000,
+    # hand_warmup_coef: ウォームアップ期間中に使用する一時的な hand_pred_loss_coef (None で無効)
+    "hand_warmup_coef": None,
 
     # ---------------------------
     # MCTS / 探索
     # ---------------------------
     # MCTS シミュレーション回数 (96で速度重視、tau=0.3の強力シャープ化でカバー) 
     "num_simulations": 200,       # 1手あたりのシミュレーション回数 (速度とバランス)　初期値96
-    "puct_c": 1.3,                  # PUCT 探索定数 (1.4→1.2で探索を抑制、訪問集中を促進) 初期値1.0
-    "dirichlet_alpha": 0.15,          # Dirichlet ノイズ α (ルート) 初期値0.3
-    "dirichlet_epsilon": 0.25,       # ノイズ混合率 ε (0.15→0.10でノイズを削減、評価に基づく集中) 
+    "puct_c": 1.5,                  # PUCT 探索定数 (1.4→1.2で探索を抑制、訪問集中を促進) 初期値1.0
+    # FPU (First Play Urgency): 未訪問ノードの初期評価値の調整
+    # 親ノードの価値 - fpu_reduction で未訪問ノードを評価（悲観的探索）
+    # 0.0で無効化（未訪問ノード=0.0）、正の値で悲観的に（例: 0.1なら親-0.1）
+    "fpu_reduction": 0.1,            # 未訪問ノードのペナルティ（0.0で無効化）
+    # 推論時の動的シミュレーション調整（One Choice は既に select_action でスキップ済み）
+    "inference_boost_enable": False,           # 重要局面でのシミュレーション増強を有効化
+    "inference_boost_multiplier": 3.0,       # 通常の何倍にするか（例: 400 → 1200）
+    "inference_boost_on_first_play": True,   # 最初の手出し時に増強
+    "inference_boost_on_revolution": True,   # 革命直後に増強
+    "inference_boost_on_high_branch": True,  # 合法手が多い時（例: 8手以上）に増強
+    "inference_boost_branch_threshold": 8,   # 合法手がこの数以上の時に増強
+    "dirichlet_alpha": 2.8,          # Dirichlet ノイズ α (ルート) 初期値0.3
+    "dirichlet_epsilon": 0.3,       # ノイズ混合率 ε (0.15→0.10でノイズを削減、評価に基づく集中) 
     "temperature": 1.0,              # 方策サンプリング温度 (序盤高く終盤低くする調整可) 初期値1.0
     "temperature_decay_moves": 20 ,   # この手数以降は温度を 0 (argmax) にする等のスケジューリング用目安
     # 温度スケジュール（序盤高温→後半低温、自己対戦エピソード進行で高温手数を短縮）
@@ -87,16 +103,35 @@ ALPHA_ZERO_CONFIG = {
     "temp_high_value": 1.5,            # 高温 τ (0.8→0.6に下げて過度なランダム性を抑制)
     "temp_low_value": 0.1,              # 低温 τ
     "temp_high_moves_initial": 14,      # 高温適用の初期手数
-    "temp_high_moves_min": 6,           # 高温適用の最低手数
+    "temp_high_moves_min": 10,           # 高温適用の最低手数
     "temp_high_moves_decay_every": 5000, # 何エピソードごとに高温手数を1手短縮するか
     # 序盤ランダム化: 指定手数までは完全ランダムに行動 (探索温度の代替オプション)
     "opening_random_enable": False,    # True で有効化
+    
     "opening_random_moves": 2,          # >0 で有効。例: 3 なら最初の3手をランダム行動
     "opening_random_include_pass": False,  # True なら pass もランダム候補に含める
+    
+    # 無駄な高ランク出し禁止フィルタ
+    # 最弱カード + max_rank_gap までのカードしか出せないように制限
+    # 例: max_rank_gap=3 なら、最弱が4の場合、4,5,6,7まで出せるが8以上は禁止
+    "filter_high_rank_enable": False,     # True で有効化（推論時のみ適用）
+    "filter_high_rank_training": False,  # True なら学習時にも適用（通常は False 推奨）
+    "filter_high_rank_max_gap": 3,       # 最弱カードからの最大ランク差（3〜4が推奨）
     # 学習ターゲットπの温度（行動サンプリングとは分離）
     # 行動選択は高温（多様性確保）でも、学習用πは強力にシャープ化してエントロピーを劇的に下げる
     # 0.3でv^(1/0.3)=v^3.33正規化 → 訪問数格差を大幅に強調、低エントロピー教師信号を生成
     "policy_target_tau": 0.4,           # 学習ターゲット用温度 (1.0→0.3で強力シャープ化、高entropy問題に対処)
+    
+    # --- アリーナ方式（Arena Selection）---
+    # 自己対戦時の対戦相手構成を多様化
+    "enable_arena_selection": True,     # アリーナ方式を有効化
+    "arena_best_model_prob": 0.75,      # 対戦相手が最新モデルになる確率
+    "arena_past_model_prob": 0.25,      # 対戦相手が過去モデルになる確率
+    "arena_rule_based_prob": 0.0,      # 対戦相手がルールベースになる確率
+    # 過去モデルのチェックポイントプール（最大保持数）
+    "arena_past_model_pool_size": 10,   # 最大10個の過去チェックポイントを保持
+    # 学習対象プレイヤーID（常に最新モデル・学習モード）
+    "learning_player_id": 0,             # Player 0 のみ学習データを保存
     # 追加: MCTS 高速化オプション（デフォルト有効化）
     "mcts_batch_eval_size": 32,      # 葉ノードのバッチ評価サイズ（1で無効同等）
     "enable_mcts_tt": True,          # トランスポジションテーブル有効化（品質不変で再計算を削減）
@@ -115,12 +150,17 @@ ALPHA_ZERO_CONFIG = {
     "determinization_mode_eval": "stochastic",
     # 推論時は Dirichlet ノイズを無効化（安定した選択のため）
     "inference_dirichlet": False,
+    # 推論時のQ値による足切り（Veto）戦略: Q値（平均勝率）がこの閾値以下の手を除外
+    "inference_q_value_veto_threshold": 0.1,  # 0.1 = 10%以下を除外（Noneで無効化）
+    # 推論時の複数回手札サンプリング（Multiple Determinization Averaging）
+    # 1手につきN回「手札生成 → MCTS」を実行し、訪問回数を平均化することで頑健性を向上
+    "inference_multi_determinization": 1,  # 1で無効化（通常動作）、3-5推奨、10以上は重い
     # 並列 determinization プールを有効化 (True でバックグラウンドスレッドが割当候補を生成)
     "enable_parallel_determinization": True,
-    # プール容量 (生成済み割当の最大保持数) メモリ削減: 128→64
-    "det_pool_capacity": 64,
-    # 再生成のための補充閾値 (容量 * ratio を下回ると生成ループが活発化)
-    "det_pool_refill_threshold": 0.30,
+    # プール容量 (生成済み割当の最大保持数) MCTS高速化のため増量: 256
+    "det_pool_capacity": 256,
+    # 再生成のための補充閾値 (容量 * ratio を下回ると生成ループが活発化) より積極的に: 0.50
+    "det_pool_refill_threshold": 0.50,
     # プールからのサンプリング方式: fifo | random
     "det_pool_sampling": "fifo",
     # インライン/プール生成時の最大リトライ回数 (パス制約矛盾解消目的)
@@ -130,6 +170,11 @@ ALPHA_ZERO_CONFIG = {
     # ゲーム終了毎に determinization プールを停止しメモリ/署名ミスマッチを抑制するか
     # True: 各ゲーム開始時に必要なら再起動 (安定性/メモリ優先) / False: ゲーム間で継続 (微小性能最適化)
     "reset_det_pool_each_game": True,
+    # プール起動直後のウォームアップ待機設定
+    # 指定数の割当が溜まるまで待機（プール空フォールバックの抑制）
+    "det_pool_warmup_count": 10,
+    # ウォームアップ待機の最大秒数（0で無制限）
+    "det_pool_warmup_timeout_sec": 3.0,
     # per-move パフォーマンスログを抑制したい場合 False に (デバッグ用途 True 推奨)
     "enable_perf_log": False,
     # Early Stop (MCTS 収束早期打ち切り)
@@ -169,12 +214,18 @@ ALPHA_ZERO_CONFIG = {
     "enable_root_parallelism": True,  # ルート並列処理の有効化
     "enable_central_batch_inference": False,  # 中央バッチ推論サーバの有効化
 
+    # Factory/agent creation verbosity: True -> suppress repetitive factory info logs
+    "suppress_factory_info": True,
+
     # ---------------------------
     # モデル
     # ---------------------------
-    "max_policy_size": 128,          # policy ログits の固定長 (合法手数 <= この値)
-    "hidden_size": 64,               # MLP 隠れ層次元
+    # policy ロジットの固定長: 全アクション語彙を網羅 (1059)
+    "max_policy_size": 1059,
+    "hidden_size": 128,               # MLP 隠れ層次元
     "num_players": 4,                # 大富豪 4人
+
+    'dataloader_num_workers': 0,        # DataLoader の並列ワーカー数 (Windows では0推奨)
 
     
 
@@ -188,7 +239,11 @@ ALPHA_ZERO_CONFIG = {
     # 学習更新に対して何回に1回、検証損失を計算するか (0/None で検証無効)
     "val_eval_every_updates": 50,
     # 検証時に使用する最大サンプル数 (過大計算防止)。0/None で全件。
-    "val_max_samples": 4096,        # 16384→32768（2倍、より正確な汎化性能評価）
+    # デフォルトを増やして一度に多めに取るが、`val_use_full_split` を False にして
+    # ミニバッチ検証に切り替えることで負荷を制御できます。
+    "val_max_samples": 20000,
+    # 検証で全分割を使用するかどうか (True=全件, False=ミニバッチ/サンプル限定)
+    "val_use_full_split": False,
     # 検証時のバッチサイズ (未指定で学習バッチと同一)
     "val_batch_size": None,
     "resume_skip_prevalidation": True,  # 7分削減
@@ -232,7 +287,7 @@ ALPHA_ZERO_CONFIG = {
     "checkpoint_interval_episodes": 10000,       # 0 / None なら無効
     "keep_previous_model_opponent": True,       # 直前世代モデルを一部プレイヤーに割当てて多様性確保
     "previous_model_mix_players": 2,            # 学習プレイヤー以外から2人を過去モデル化
-    "past_model_pool_size": 1,             # メモリ削減: 過去1世代のみ保持
+    "past_model_pool_size": 5,             # メモリ削減: 過去1世代のみ保持
     "opponent_mix_interval_episodes": 500, # 500エピソードごとに再割当
     "replay_path": "replay_buffer.joblib",     # リプレイバッファ保存先
     "strict_lossless": False,        # True なら 圧縮しない
@@ -240,10 +295,10 @@ ALPHA_ZERO_CONFIG = {
     # ingest_max_files: 1以上で最新Nファイルのみ学習対象に選択（None/0で全件）
     # ingest_pick_newest: Trueなら新しい順（推奨）、Falseなら古い順
     # ingest_max_samples_per_file: 各joblibから取り込む最大サンプル数（train/val それぞれに適用）。None/0で無制限
-    "ingest_max_files": 100,
+    "ingest_max_files": 50,
     "ingest_pick_newest": True,
     "ingest_max_samples_per_file": 0,
-    "active_file_pool_size": 100,  # メモリ削減: アクティブに監視するファイル数
+    "active_file_pool_size": 50,  # メモリ削減: アクティブに監視するファイル数
     "active_file_refresh_every_updates": 0,  # 何更新ごとにアクティブファイルリストを更新するか
     "active_file_pool_refresh_fraction": 0.25,  # プール内の何割を更新するか（メモリスパイク抑制のため削減）
     # newest_bias: 最新ファイルとランダム選択の割合 (0.0-1.0)
@@ -263,7 +318,7 @@ ALPHA_ZERO_CONFIG = {
     
     # 固定サンプル数制御（優先）: fixed_total_samples > 0 なら動的サイジングを無視してこの値を使用
     # buffer_window_sizeが有効な場合、全ファイルを読み込むため0に設定推奨
-    "fixed_total_samples": 550000,  # 0で無効化（buffer_sizeと整合、メモリ効率優先）
+    "fixed_total_samples": 750000,  # 0で無効化（buffer_sizeと整合、メモリ効率優先）
     # 動的サンプルサイジング: total_updates の累乗に基づいてサンプル数を調整
     # enable_dynamic_sample_sizing が True かつ fixed_total_samples が 0 の場合のみ有効
     # 注意: buffer_window_size > 0 の場合は無効にすること（全件読み込みのため）
@@ -301,7 +356,7 @@ ALPHA_ZERO_CONFIG = {
     # ログ / 可視化
     # ---------------------------
     "log_dir": "logs",              # ログ出力ディレクトリ (CSV / TensorBoard)
-    "enable_tensorboard": True,      # TensorBoard 出力を有効化
+    "enable_tensorboard": False,      # TensorBoard 出力を有効化
     "mcts_log_sample_rate": 0.15,    # MCTS ルート統計のサンプリング率
     "disable_mcts_log": True,        # True で mcts_samples.jsonl へ出力しない
     "clear_logs_on_start": True,     # 起動時に既存ログを消去 (Falseで残す)
@@ -335,7 +390,7 @@ ALPHA_ZERO_CONFIG = {
     # 自己対局 並列実行
     # ---------------------------
     # 並列ワーカー数 (0/1 で無効 = 単一プロセス)。Windows の spawn に対応。
-    "selfplay_workers": 16,            # CPU 28 論理スレッドに合わせ並列度を拡大（様子を見て 12 まで）
+    "selfplay_workers":16,            # CPU 28 論理スレッドに合わせ並列度を拡大（様子を見て 12 まで）
     # ワーカープロセスでの推論デバイス。通常は CPU を推奨 (GPU 共有は非推奨)
     "selfplay_worker_device": "cpu",
 
@@ -376,7 +431,7 @@ ALPHA_ZERO_CONFIG = {
     "tensorboard_flush_seconds": 300,        # 最低この秒数ごとに flush (0/None なら都度 flush)
     # CSV 出力間引き (1=毎回)。間引いた行は欠番になる
     "csv_train_log_every": 50,
-    "csv_episode_log_every": 50,
+    "csv_episode_log_every": 200,
     # MCTS ルート統計 JSONL を更に抑制したい場合 (disable_mcts_log と組み合わせ)
     "mcts_jsonl_max_bytes": 50_000_000,     # 上限超過で以降追記停止 (約50MB)。0/None で無効
 
@@ -404,6 +459,9 @@ ALPHA_ZERO_CONFIG = {
     "initial_checkpoint_on_setup": True,
     # True にするとチェックポイント保存を完全に無効化する (テスト/評価用途)
     "disable_checkpoint_saving": False,
+    # True にするとチェックポイント保存後の torch.load による検証をスキップする
+    # (高速化目的)。開発/短期実験で推奨。本番長期学習では False 推奨。
+    "skip_checkpoint_verify": True,
     # True にすると data/ 下への自己対局ファイルや replay 保存を無効化する
     "disable_data_writes": False,
     # 並行モード train_concurrent で一定秒ごとに events.log へ進捗とバッファ統計を出す間隔 (0/None で無効)

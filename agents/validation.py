@@ -65,17 +65,8 @@ def _hand_loss_like_train(agent, logits, target, mask_unknown=None):
     bce = _nn.BCEWithLogitsLoss(reduction='none')
     base = bce(logits, target)
 
-    # Focal term (same as training)
-    try:
-        gamma = float(getattr(agent, 'config', {}).get('hand_focal_gamma', 2.0) or 0.0)
-    except Exception:
-        gamma = 2.0
-    if gamma > 0.0:
-        p = _t.sigmoid(logits)
-        pt = target * p + (1.0 - target) * (1.0 - p)
-        focal = _t.clamp(1.0 - pt, min=1e-4).pow(gamma)
-    else:
-        focal = 1.0
+    # No focal term: use standard BCE behavior (focal removed)
+    focal = 1.0
 
     # If mask provided, apply unknown-mask averaging and dynamic class-weighting
     if mask_unknown is not None:
@@ -107,14 +98,11 @@ def _hand_loss_like_train(agent, logits, target, mask_unknown=None):
         pos_w = ((1.0 - p) / (p + eps)).clamp(1.0, 20.0)
         w_class = 1.0 + (pos_w - 1.0) * tgt
 
-        weighted = base * (focal if isinstance(focal, _t.Tensor) else focal) * w_class * m
+        weighted = base * w_class * m
         return weighted.sum() / (active + eps)
     else:
-        # No mask: fallback to simple mean but include focal if present
-        if isinstance(focal, _t.Tensor):
-            return (base * focal).mean()
-        else:
-            return base.mean()
+        # No mask: fallback to simple mean
+        return base.mean()
 
 
 def _build_unknown_mask_from_state(st: Dict[str, Any], hand_dim: int) -> List[float]:
@@ -763,3 +751,51 @@ def validate_on_agent(agent, batch_size: Optional[int] = None) -> Dict[str, Any]
     except Exception:
         out['hand_recall'] = None
     return out
+
+
+def apply_hand_prediction_constraint(hand_probs, num_opponents: int = 3):
+    """手札予測確率にカード枚数制約を適用して正規化する。
+    
+    各カードについて、全相手プレイヤーの予測確率の合計が4を超えないように
+    正規化します（各カードはデッキに最大4枚しか存在しないため）。
+    
+    Args:
+        hand_probs: 手札予測確率の配列 (shape: [num_opponents * 53])
+                   各相手プレイヤーについて53次元（53種類のカード）
+        num_opponents: 相手プレイヤー数（デフォルト: 3）
+    
+    Returns:
+        制約を適用した手札予測確率の配列（同じshape）
+    """
+    import numpy as np
+    
+    # numpy配列に変換
+    if not isinstance(hand_probs, np.ndarray):
+        hand_probs = np.asarray(hand_probs, dtype=np.float32)
+    
+    # コピーを作成（元の配列を変更しない）
+    hand_probs_constrained = hand_probs.copy()
+    
+    # 各カード（53種類）について処理
+    for card_idx in range(53):
+        # このカードについて全相手プレイヤーの確率を取得
+        card_probs = []
+        for opp_idx in range(num_opponents):
+            offset = opp_idx * 53 + card_idx
+            if offset < len(hand_probs_constrained):
+                card_probs.append(hand_probs_constrained[offset])
+            else:
+                card_probs.append(0.0)
+        
+        # 確率の合計を計算
+        total_prob = sum(card_probs)
+        
+        # 合計が4を超える場合は正規化
+        if total_prob > 4.0:
+            scale = 4.0 / total_prob
+            for opp_idx in range(num_opponents):
+                offset = opp_idx * 53 + card_idx
+                if offset < len(hand_probs_constrained):
+                    hand_probs_constrained[offset] *= scale
+    
+    return hand_probs_constrained

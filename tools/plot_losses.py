@@ -11,6 +11,10 @@ import argparse
 import os
 import sys
 import pandas as pd
+import matplotlib
+# Use non-interactive backend by default to avoid Tkinter-related errors
+# (e.g. "PyCapsule_New called with null pointer" when Tk isn't available)
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import joblib
 import glob
@@ -41,20 +45,20 @@ def plot_losses(df: pd.DataFrame, output_path: str, show: bool = False):
     # 有効なデータのみをフィルタ
     df = df.dropna(subset=['update_step'])
     
-    # 2x2のサブプロットを作成
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    # 1x3のサブプロットを作成（横一列）
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     fig.suptitle('Training and Validation Losses', fontsize=14, fontweight='bold')
     
     # 1. Policy Loss
-    ax1 = axes[0, 0]
+    ax1 = axes[0]
     if 'policy_loss' in df.columns:
         valid = df['policy_loss'].notna()
         ax1.plot(df.loc[valid, 'update_step'], df.loc[valid, 'policy_loss'], 
-                 label='Train Policy Loss', color='blue', alpha=0.8, linewidth=1, marker='o', markersize=4)
+             label='Train Policy Loss', color='blue', alpha=0.8, linewidth=1)
     if 'val_policy_loss' in df.columns:
         valid = df['val_policy_loss'].notna()
         ax1.plot(df.loc[valid, 'update_step'], df.loc[valid, 'val_policy_loss'], 
-                 label='Val Policy Loss', color='red', alpha=0.8, linewidth=1, marker='o', markersize=4)
+             label='Val Policy Loss', color='red', alpha=0.8, linewidth=1)
     ax1.set_xlabel('Update Step')
     ax1.set_ylabel('Loss')
     ax1.set_title('Policy Loss')
@@ -62,15 +66,15 @@ def plot_losses(df: pd.DataFrame, output_path: str, show: bool = False):
     ax1.grid(True, alpha=0.3)
     
     # 2. Value Loss
-    ax2 = axes[0, 1]
+    ax2 = axes[1]
     if 'value_loss' in df.columns:
         valid = df['value_loss'].notna()
         ax2.plot(df.loc[valid, 'update_step'], df.loc[valid, 'value_loss'], 
-                 label='Train Value Loss', color='blue', alpha=0.8, linewidth=1, marker='o', markersize=4)
+             label='Train Value Loss', color='blue', alpha=0.8, linewidth=1)
     if 'val_value_loss' in df.columns:
         valid = df['val_value_loss'].notna()
         ax2.plot(df.loc[valid, 'update_step'], df.loc[valid, 'val_value_loss'], 
-                 label='Val Value Loss', color='red', alpha=0.8, linewidth=1, marker='o', markersize=4)
+             label='Val Value Loss', color='red', alpha=0.8, linewidth=1)
     ax2.set_xlabel('Update Step')
     ax2.set_ylabel('Loss')
     ax2.set_title('Value Loss')
@@ -78,39 +82,20 @@ def plot_losses(df: pd.DataFrame, output_path: str, show: bool = False):
     ax2.grid(True, alpha=0.3)
     
     # 3. Hand Prediction Loss
-    ax3 = axes[1, 0]
+    ax3 = axes[2]
     if 'hand_pred_loss' in df.columns:
         valid = df['hand_pred_loss'].notna()
         ax3.plot(df.loc[valid, 'update_step'], df.loc[valid, 'hand_pred_loss'], 
-                 label='Train Hand Loss', color='blue', alpha=0.8, linewidth=1, marker='o', markersize=4)
+             label='Train Hand Loss', color='blue', alpha=0.8, linewidth=1)
     if 'val_hand_pred_loss' in df.columns:
         valid = df['val_hand_pred_loss'].notna()
         ax3.plot(df.loc[valid, 'update_step'], df.loc[valid, 'val_hand_pred_loss'], 
-                 label='Val Hand Loss', color='red', alpha=0.8, linewidth=1, marker='o', markersize=4)
+             label='Val Hand Loss', color='red', alpha=0.8, linewidth=1)
     ax3.set_xlabel('Update Step')
     ax3.set_ylabel('Loss')
     ax3.set_title('Hand Prediction Loss')
     ax3.legend(loc='upper right')
     ax3.grid(True, alpha=0.3)
-    
-    # 4. Train/Val Gap (過学習の指標)
-    ax4 = axes[1, 1]
-    if 'value_loss' in df.columns and 'val_value_loss' in df.columns:
-        valid = df['value_loss'].notna() & df['val_value_loss'].notna()
-        gap = df.loc[valid, 'val_value_loss'] - df.loc[valid, 'value_loss']
-        ax4.plot(df.loc[valid, 'update_step'], gap, 
-                 label='Value Loss Gap (Val - Train)', color='purple', alpha=0.8, linewidth=1, marker='o', markersize=4)
-    if 'policy_loss' in df.columns and 'val_policy_loss' in df.columns:
-        valid = df['policy_loss'].notna() & df['val_policy_loss'].notna()
-        gap = df.loc[valid, 'val_policy_loss'] - df.loc[valid, 'policy_loss']
-        ax4.plot(df.loc[valid, 'update_step'], gap, 
-                 label='Policy Loss Gap (Val - Train)', color='green', alpha=0.8, linewidth=1, marker='o', markersize=4)
-    ax4.axhline(y=0, color='black', linestyle='--', alpha=0.5, linewidth=0.5)
-    ax4.set_xlabel('Update Step')
-    ax4.set_ylabel('Gap (Val - Train)')
-    ax4.set_title('Overfitting Indicator (Gap > 0 = Overfitting)')
-    ax4.legend(loc='upper right')
-    ax4.grid(True, alpha=0.3)
     
     plt.tight_layout()
     
@@ -129,7 +114,7 @@ def plot_losses(df: pd.DataFrame, output_path: str, show: bool = False):
             valid = df['vt_mean'].notna()
             if valid.any():
                 fig2, ax = plt.subplots(1, 1, figsize=(10, 4))
-                ax.plot(df.loc[valid, 'update_step'], df.loc[valid, 'vt_mean'], label='ValueTarget Mean', color='tab:orange', marker='o')
+                ax.plot(df.loc[valid, 'update_step'], df.loc[valid, 'vt_mean'], label='ValueTarget Mean', color='tab:orange')
                 if 'vt_std' in df.columns:
                     std_valid = df['vt_std'].notna()
                     if std_valid.any():

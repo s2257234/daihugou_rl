@@ -241,7 +241,7 @@ class StateComposer:
         return base
 
       num_players = len(g.players)
-      expected_full_dim = 73 * num_players + 74
+      expected_full_dim = 73 * num_players + 79  # +5 for shibari (1 active + 4 suit bits)
 
       # Self block
       self_bits = self._ce.encode_bits_53(getattr(me, 'hand', []))
@@ -358,6 +358,20 @@ class StateComposer:
       field_bits = self._ce.encode_bits_53(field)
       feat.extend(field_bits)
 
+      # Shibari constraint (1 + 4)
+      shibari_active_bit = 1.0 if getattr(g, 'shibari_active', False) else 0.0
+      feat.append(shibari_active_bit)
+
+      # Shibari suits bit flags (4 dimensions: ♠, ♥, ♦, ♣)
+      lock_suits = getattr(g, 'lock_suits', None) or []
+      shibari_suit_bits = [0.0] * 4
+      suit_order = {'\u2660': 0, '\u2665': 1, '\u2666': 2, '\u2663': 3}  # ♠♥♦♣
+      for s in lock_suits:
+        idx = suit_order.get(s, -1)
+        if 0 <= idx < 4:
+          shibari_suit_bits[idx] = 1.0
+      feat.extend(shibari_suit_bits)
+
       # History blocks
       try:
         action_hist = list(getattr(g, '_action_history', []) or [])
@@ -451,25 +465,6 @@ class StateComposer:
           print(f"[INFO] override full_input length to {target_dim} (model.full_feature_dim; was {expected_full_dim})")
           agent._warned_full_dim_model_override = True
 
-      if not isinstance(base, dict):
-        try:
-          print(f"[WARN][_extract_state] base was {type(base).__name__}; reconstructing dict for pid={pid}")
-        except Exception:
-          pass
-        base = {"turn": pid}
-        try:
-          base.update({
-            "hand_size": len(getattr(me, 'hand', [])),
-            "field_size": len(getattr(g, 'current_field', [])),
-            "revolution": revo,
-          })
-          try:
-            base['is_leader'] = 1.0 if (len(getattr(g, 'current_field', []) or []) == 0) else 0.0
-          except Exception:
-            base['is_leader'] = 0.0
-        except Exception:
-          pass
-
       base['full_input'] = feat
       base['full_input_dim'] = expected_full_dim
       base['full_input_version'] = 8
@@ -500,6 +495,16 @@ class StateComposer:
         base['last_action_card_indices'] = hist['last_action_card_indices']
         base['num_players'] = num_players
         base['self_player_id'] = pid
+        
+        # mask_unknownを生成して設定
+        if 'hand_labels' in base and 'hand_labels_dim' in base:
+          try:
+            from agents.validation import _build_unknown_mask_from_state
+            hand_dim = base['hand_labels_dim']
+            mask_unknown = _build_unknown_mask_from_state(base, hand_dim)
+            base['mask_unknown'] = mask_unknown
+          except Exception:
+            pass
       except Exception:
         pass
 

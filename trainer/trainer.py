@@ -605,6 +605,48 @@ class Trainer:
                     pass
             self.past_models.append(snap)
             self._previous_model = snap  # 互換
+            # 追加: ディスク上のプールにも保存して、常駐ワーカーが読み込めるようにする
+            try:
+                pool_dir = os.path.join(self.config.get("checkpoint_dir", "checkpoints"), "_pool")
+                os.makedirs(pool_dir, exist_ok=True)
+                fname = f"policy_value_pool_v{self.model_version}_{int(time.time())}.pt"
+                fp = os.path.join(pool_dir, fname)
+                try:
+                    # PolicyValueNet.save を使って安全に保存
+                    if hasattr(snap, 'save'):
+                        snap.save(fp, force_sync=True, logger=self.logger)
+                    else:
+                        # 最低限 state_dict を torch.save する
+                        try:
+                            import torch
+                            torch.save(snap.state_dict(), fp)
+                        except Exception:
+                            # fallback: try to use model's own save if available
+                            pass
+                except Exception as _e:
+                    # 保存失敗はログに残すが処理は継続
+                    try:
+                        if self.logger:
+                            self.logger.log_text(f"[snapshot] failed to save pool file: {_e}")
+                        else:
+                            print(f"[snapshot] failed to save pool file: {_e}")
+                    except Exception:
+                        pass
+                # pool 上のファイル数を制限（古い順に削除）
+                try:
+                    files = [os.path.join(pool_dir, f) for f in os.listdir(pool_dir) if f.endswith('.pt') and '.tmp.' not in f]
+                    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                    if self.past_model_pool_size > 0 and len(files) > self.past_model_pool_size:
+                        overflow = len(files) - self.past_model_pool_size
+                        for old in files[-overflow:]:
+                            try:
+                                os.remove(old)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            except Exception:
+                pass
             # 上限超過なら古いものから削除
             if self.past_model_pool_size > 0 and len(self.past_models) > self.past_model_pool_size:
                 overflow = len(self.past_models) - self.past_model_pool_size

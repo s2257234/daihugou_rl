@@ -126,6 +126,17 @@ class AlphaZeroAgent(TrainStepMixin):
         self.config = config or ALPHA_ZERO_CONFIG
         self.model = model
         
+        # Device 設定（model から取得、なければ config、なければ cpu）
+        if model is not None and hasattr(model, 'device'):
+            self.device = model.device
+        else:
+            import torch
+            device_str = config.get('device', 'cpu') if isinstance(config, dict) else 'cpu'
+            # Allow 'auto' in config: prefer CUDA if available, otherwise CPU
+            if isinstance(device_str, str) and device_str.lower() == 'auto':
+                device_str = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.device = torch.device(device_str)
+        
         # --- 推論エンジンの初期化 (遅延初期化: 実際の使用時に確定) ---
         self._inference_client: Optional[InferenceClient] = None
 
@@ -179,6 +190,7 @@ class AlphaZeroAgent(TrainStepMixin):
         self.env_ref = None  # 直近参照環境
         self.logger = None   # 外部ロガー (TensorBoard 等)
         self._logged_inside = False  # 二重記録防止
+        self._mcts_params_logged = False  # MCTSパラメータログ出力フラグ（初回のみ）
         # インクリメンタル Belief 用キャッシュ
         # 形式: {
         #   'num_players': int,
@@ -197,6 +209,8 @@ class AlphaZeroAgent(TrainStepMixin):
         self.episode_phase_total = 0
         self.episode_phase_correct = 0
         self.lost_phase_samples = 0
+        # バッチ推論使用フラグ（学習フェーズで1回だけログ出力するため）
+        self._batch_inference_used = False
         self.tt_hits = 0
         self.tt_misses = 0
         self.pos_weight = float(self.config.get("value_pos_weight", 1.0))
@@ -265,6 +279,12 @@ class AlphaZeroAgent(TrainStepMixin):
             'retries_total': 0,
         }
 
+        # ---- 推論結果の再利用（評価用余分な forward 削減） ----
+        self._capture_eval_value = False
+        self._last_eval_value: Optional[float] = None
+        # フォールバックログの重複抑制
+        self._fallback_logged = set()
+
     # ---------------- Batch Preparation ----------------
     def _prepare_batch(self, batch: List[Dict[str, Any]], uid2weight: Optional[Dict[int, float]] = None, fast_full_input_np=None) -> Dict[str, Any]:
         """バッチ前処理は [agents/agent_utills/training.py](agents/agent_utills/training.py) に委譲。"""
@@ -273,6 +293,22 @@ class AlphaZeroAgent(TrainStepMixin):
     def _canonicalize_state(self, st: Optional[dict]) -> dict:
         """Canonicalize state; implementation lives in agents/replay_buffer.py."""
         return _canonicalize_state_impl(self, st)
+
+    def _log_fallback_once(self, key: str, msg: str, exc: Exception | None = None) -> None:
+        try:
+            if key in self._fallback_logged:
+                return
+            self._fallback_logged.add(key)
+        except Exception:
+            pass
+        try:
+            text = f"{msg} ({type(exc).__name__}: {exc})" if exc is not None else msg
+            if getattr(self, 'logger', None):
+                self.logger.log_text(text)
+            else:
+                print(text)
+        except Exception:
+            pass
 
     # ---------------- Public API ----------------
     def set_model(self, model):
@@ -308,6 +344,9 @@ class AlphaZeroAgent(TrainStepMixin):
         3) 方策サンプルを保存 (value は未確定 None)
         4) 選択行動を環境へ返す
         """
+        # 学習/推論モードをインスタンス変数に保存（_get_legal_actionsで参照）
+        self._current_training_mode = training
+        
         # Resolve env
         if hasattr(env_or_obs, "game"):
             env = env_or_obs
@@ -329,17 +368,71 @@ class AlphaZeroAgent(TrainStepMixin):
                 if _is_pass_only(legal0):
                     pass_only_detected = True
                     if training:
-                        # Store pass-only sample with legal_actions=[None], pi=[1.0], value=None
+                        # Store pass-only sample with legal_actions=[None], pi=fixed-length 1059 (PASS=1.0), value=None
                         state_repr = self._extract_state(env, prev_state=getattr(self, '_last_state', None))
-                        stored = self._store_sample(state_repr, [None], [1.0], None)
+                        # Create fixed-length pi with PASS action at index corresponding to 'PASS' key
+                        L = 1059
+                        pi_full_pass = [0.0] * L
+                        # Find PASS index in canonical keys
+                        if hasattr(self.model, 'canonical_action_keys'):
+                            try:
+                                canonical = self.model.canonical_action_keys()
+                                pass_idx = canonical.index('PASS') if 'PASS' in canonical else (L - 1)
+                                pi_full_pass[pass_idx] = 1.0
+                            except Exception:
+                                pi_full_pass[-1] = 1.0  # Fallback: assume PASS is last
+                        else:
+                            pi_full_pass[-1] = 1.0  # Fallback: assume PASS is last
+                        stored = self._store_sample(state_repr, [None], pi_full_pass, None)
                         self._phase_samples.append(stored)
                         # PASSのみの場合は MCTS/NN 推論を省略して即座にパスする。
                         # 予測値は作らない（教師データではなく統計用だが、混同・汚染を避ける）。
                         self._phase_value_preds.append(None)
                         self._last_state = state_repr
+                    # pass-only は正常な最適化動作なのでログ不要
                     return None
-        except Exception:
-            pass
+                # 合法手が1つだけ（パス以外）の場合も探索をスキップ
+                elif legal0 and len(legal0) == 1:
+                    single_action = legal0[0]
+                    if single_action is not None:
+                        if training:
+                            # Store single-action sample with fixed-length 1059
+                            try:
+                                serialized_legal = [[str(c) for c in single_action]]
+                            except Exception:
+                                serialized_legal = [single_action]
+                            state_repr = self._extract_state(env, prev_state=getattr(self, '_last_state', None))
+                            # Create fixed-length pi with single action at 1.0
+                            L = 1059
+                            pi_full_single = [0.0] * L
+                            if hasattr(self.model, 'canonical_action_keys'):
+                                try:
+                                    from agents.agent_utills.feature_extractor import CardEncoder
+                                    ce = CardEncoder()
+                                    parts = [int(ce.card_index(c)) for c in single_action]
+                                    parts.sort()
+                                    action_key = '|'.join(str(p) for p in parts)
+                                    canonical = self.model.canonical_action_keys()
+                                    action_idx = canonical.index(action_key) if action_key in canonical else 0
+                                    pi_full_single[action_idx] = 1.0
+                                except Exception:
+                                    pi_full_single[0] = 1.0  # Fallback
+                            else:
+                                pi_full_single[0] = 1.0  # Fallback
+                            stored = self._store_sample(state_repr, serialized_legal, pi_full_single, None)
+                            self._phase_samples.append(stored)
+                            # バリューは計算しない（学習時の正解ラベルはゲーム終了時の勝敗を使うため）
+                            self._phase_value_preds.append(None)
+                            self._last_state = state_repr
+                        # 合法手が1つだけの場合は正常な最適化動作なのでログ不要
+                        # 探索をスキップしてその合法手を返す
+                        return single_action
+        except Exception as e:
+            self._log_fallback_once(
+                "pre_mcts_legal_check_exception",
+                "[az-fallback] pre-MCTS legal check failed; continuing",
+                e
+            )
 
         # If env is unavailable, fall back to pass or a legal action (when provided).
         if env is None:
@@ -348,8 +441,28 @@ class AlphaZeroAgent(TrainStepMixin):
                 if training:
                     # Cannot extract state without env, skip sample storage
                     pass
+                self._log_fallback_once(
+                    "env_missing_pass_only",
+                    f"[az-fallback] env is None; pass-only legal actions -> return pass (training={training})"
+                )
                 return None
+            # 合法手が1つだけ（パス以外）の場合はその手を返す
+            if legal_actions_kw and len(legal_actions_kw) == 1:
+                single_action_kw = legal_actions_kw[0]
+                if single_action_kw is not None:
+                    self._log_fallback_once(
+                        "env_missing_single_action",
+                        f"[az-fallback] env is None; single legal action -> return it (training={training})"
+                    )
+                    try:
+                        return [str(c) for c in single_action_kw]
+                    except Exception:
+                        return single_action_kw
             if legal_actions_kw is not None:
+                self._log_fallback_once(
+                    "env_missing_choose_legal",
+                    f"[az-fallback] env is None; choosing from legal_actions without MCTS (training={training})"
+                )
                 for cand in legal_actions_kw:
                     if cand is None:
                         continue
@@ -360,17 +473,72 @@ class AlphaZeroAgent(TrainStepMixin):
             return None
 
         # If env.step provided legal_actions and it is pass-only, skip MCTS and pass.
-        if _is_pass_only(kwargs.get("legal_actions")):
+        legal_actions_kw = kwargs.get("legal_actions")
+        if _is_pass_only(legal_actions_kw):
             if training and not pass_only_detected:
-                # Store pass-only sample
+                # Store pass-only sample with fixed-length 1059 (PASS=1.0)
                 state_repr = self._extract_state(env, prev_state=getattr(self, '_last_state', None))
-                stored = self._store_sample(state_repr, [None], [1.0], None)
+                L = 1059
+                pi_full_pass = [0.0] * L
+                if hasattr(self.model, 'canonical_action_keys'):
+                    try:
+                        canonical = self.model.canonical_action_keys()
+                        pass_idx = canonical.index('PASS') if 'PASS' in canonical else (L - 1)
+                        pi_full_pass[pass_idx] = 1.0
+                    except Exception:
+                        pi_full_pass[-1] = 1.0
+                else:
+                    pi_full_pass[-1] = 1.0
+                stored = self._store_sample(state_repr, [None], pi_full_pass, None)
                 self._phase_samples.append(stored)
                 # PASSのみの場合は MCTS/NN 推論を省略して即座にパスする。
                 # 予測値は作らない（教師データではなく統計用だが、混同・汚染を避ける）。
                 self._phase_value_preds.append(None)
                 self._last_state = state_repr
+            self._log_fallback_once(
+                "pass_only_skip_mcts",
+                f"[az-fallback] pass-only legal_actions hint; skip MCTS (training={training})"
+            )
             return None
+        
+        # 合法手が1つだけ（パス以外）の場合も探索をスキップ
+        if legal_actions_kw and len(legal_actions_kw) == 1:
+            single_action_kw = legal_actions_kw[0]
+            if single_action_kw is not None:
+                if training and not pass_only_detected:
+                    # Store single-action sample with fixed-length 1059
+                    try:
+                        serialized_legal = [[str(c) for c in single_action_kw]]
+                    except Exception:
+                        serialized_legal = [single_action_kw]
+                    state_repr = self._extract_state(env, prev_state=getattr(self, '_last_state', None))
+                    L = 1059
+                    pi_full_single = [0.0] * L
+                    if hasattr(self.model, 'canonical_action_keys'):
+                        try:
+                            from agents.agent_utills.feature_extractor import CardEncoder
+                            ce = CardEncoder()
+                            parts = [int(ce.card_index(c)) for c in single_action_kw]
+                            parts.sort()
+                            action_key = '|'.join(str(p) for p in parts)
+                            canonical = self.model.canonical_action_keys()
+                            action_idx = canonical.index(action_key) if action_key in canonical else 0
+                            pi_full_single[action_idx] = 1.0
+                        except Exception:
+                            pi_full_single[0] = 1.0
+                    else:
+                        pi_full_single[0] = 1.0
+                    stored = self._store_sample(state_repr, serialized_legal, pi_full_single, None)
+                    self._phase_samples.append(stored)
+                    # バリューは計算しない（学習時の正解ラベルはゲーム終了時の勝敗を使うため）
+                    self._phase_value_preds.append(None)
+                    self._last_state = state_repr
+                self._log_fallback_once(
+                    "single_action_skip_mcts",
+                    f"[az-fallback] single legal action hint; skip MCTS (training={training})"
+                )
+                # 探索をスキップしてその合法手を返す
+                return single_action_kw
 
         # デバッグ: MCTS実行前の環境状態を記録
         _pre_mcts_revo = None
@@ -381,27 +549,125 @@ class AlphaZeroAgent(TrainStepMixin):
                 _pre_mcts_revo = bool(getattr(getattr(env.game, 'rule_checker', None), 'revolution', False))
                 _pre_mcts_field = [str(c) for c in (getattr(env.game, 'current_field', []) or [])]
                 _pre_mcts_turn = getattr(env.game, 'turn', -1)
-            except Exception:
-                pass
+            except Exception as e:
+                self._log_fallback_once(
+                    "debug_action_mismatch_pre_exception",
+                    "[az-fallback] debug_action_mismatch(pre) failed; continuing",
+                    e
+                )
 
         # ---- MCTS 実行 ----
-        root = self._run_mcts(env, training=training)
+        if not training:
+            # 評価時はルート状態のNN出力を次ステップで再利用できるようキャプチャ
+            self._capture_eval_value = True
+            self._last_eval_value = None
+        else:
+            # 学習時はキャプチャ不要
+            self._capture_eval_value = False
+            self._last_eval_value = None
+        import time
+        
+        # 推論時の複数回手札サンプリング（Multiple Determinization Averaging）
+        multi_det_count = 1
+        if not training:
+            multi_det_count = max(1, int(self.config.get("inference_multi_determinization", 1)))
+        
+        if multi_det_count > 1 and not training:
+            # 複数回MCTS実行して訪問回数を統合
+            mcts_start = time.time()
+            aggregated_visits = {}  # {action: total_visit_count}
+            aggregated_q_sum = {}   # {action: total_q_value_sum}
+            aggregated_q_count = {} # {action: count for averaging}
+            
+            for det_idx in range(multi_det_count):
+                # 各反復でMCTSを実行（determinizationが有効なら異なる手札サンプリング）
+                root_iter = self._run_mcts(env, training=False)
+                
+                # 訪問回数とQ値を集約
+                for action, child in root_iter.children.items():
+                    if action not in aggregated_visits:
+                        aggregated_visits[action] = 0
+                        aggregated_q_sum[action] = 0.0
+                        aggregated_q_count[action] = 0
+                    
+                    aggregated_visits[action] += child.visit_count
+                    # Q値を重み付き平均するため、訪問回数 × Q値の合計を保持
+                    aggregated_q_sum[action] += child.value * child.visit_count
+                    aggregated_q_count[action] += child.visit_count
+            
+            # 最初の実行のrootノードを使って統合結果を格納
+            root = self._run_mcts(env, training=False)  # 最後の1回を再利用してもよいが、新規作成
+            
+            # root.childrenを統合結果で上書き
+            for action in aggregated_visits.keys():
+                if action not in root.children:
+                    # 新しいノードを作成（既存のノードがない場合）
+                    prior = 1.0 / max(1, len(aggregated_visits))
+                    to_play = getattr(root, 'to_play', getattr(env.game, 'turn', self.player_id))
+                    root.children[action] = PUCTNode(prior=prior, parent=root, action=action, to_play=to_play)
+                
+                # 訪問回数を統合値に上書き
+                root.children[action].visit_count = aggregated_visits[action]
+                
+                # value_sumを設定（value = value_sum / visit_count で計算される）
+                if aggregated_q_count[action] > 0:
+                    avg_q_value = aggregated_q_sum[action] / aggregated_q_count[action]
+                    root.children[action].value_sum = avg_q_value * aggregated_visits[action]
+            
+            # 統合に使われなかったchildrenを削除
+            actions_to_remove = []
+            for action in root.children.keys():
+                if action not in aggregated_visits:
+                    actions_to_remove.append(action)
+            for action in actions_to_remove:
+                del root.children[action]
+            
+            mcts_time = time.time() - mcts_start
+            
+            # パフォーマンスログ（複数サンプリング時）
+            if mcts_time > 1.0:
+                if not hasattr(self, '_mcts_log_counter'):
+                    self._mcts_log_counter = 0
+                self._mcts_log_counter += 1
+                if self._mcts_log_counter % 10 == 0:
+                    print(f"[PERF] AlphaZero Multi-Det MCTS: {mcts_time:.2f}s (sims={self.num_simulations}, runs={multi_det_count})")
+        else:
+            # 通常の1回実行
+            
+            root = self._run_mcts(env, training=training)
+            
 
-        # デバッグ: MCTS実行後の環境状態を比較
+        # デバッグ: 環境コピー時のズレを検証
         if self.config.get('debug_action_mismatch', False):
             try:
+                # MCTS実行後の実環境の状態を取得
                 _post_mcts_revo = bool(getattr(getattr(env.game, 'rule_checker', None), 'revolution', False))
                 _post_mcts_field = [str(c) for c in (getattr(env.game, 'current_field', []) or [])]
                 _post_mcts_turn = getattr(env.game, 'turn', -1)
                 
+                # 実環境の変更を検出（MCTSは元環境を変更してはいけない）
                 if _pre_mcts_revo != _post_mcts_revo:
                     print(f"[ENV-MUTATED-REVO] pid={self.player_id} before={_pre_mcts_revo} after={_post_mcts_revo}")
                 if _pre_mcts_field != _post_mcts_field:
                     print(f"[ENV-MUTATED-FIELD] pid={self.player_id} before={_pre_mcts_field} after={_post_mcts_field}")
                 if _pre_mcts_turn != _post_mcts_turn:
                     print(f"[ENV-MUTATED-TURN] pid={self.player_id} before={_pre_mcts_turn} after={_post_mcts_turn}")
-            except Exception:
-                pass
+                
+                # MCTSで使用した環境コピーの状態と実環境を比較
+                if root is not None:
+                    _copy_revo = getattr(root, '_debug_env_copy_revolution', None)
+                    _copy_field = getattr(root, '_debug_env_copy_field', None)
+                    
+                    if _copy_revo is not None and _copy_revo != _pre_mcts_revo:
+                        print(f"[ENV-COPY-MISMATCH-REVO] pid={self.player_id} real={_pre_mcts_revo} copy={_copy_revo}")
+                    if _copy_field is not None and _copy_field != _pre_mcts_field:
+                        print(f"[ENV-COPY-MISMATCH-FIELD] pid={self.player_id} real={_pre_mcts_field} copy={_copy_field}")
+            except Exception as e:
+                self._log_fallback_once(
+                    "debug_action_mismatch_post_exception",
+                    "[az-fallback] debug_action_mismatch(post) failed; continuing",
+                    e
+                )
 
         # --- Root children hard alignment with real env legal actions ---
         try:
@@ -485,6 +751,25 @@ class AlphaZeroAgent(TrainStepMixin):
         actions = list(root.children.keys())
         visits = [child.visit_count for child in root.children.values()]
 
+        # 推論時のみ: Q値による足切り（Veto）戦略
+        if not training:
+            q_veto_threshold = self.config.get("inference_q_value_veto_threshold")
+            if q_veto_threshold is not None and q_veto_threshold > 0.0:
+                filtered_actions = []
+                filtered_visits = []
+                filtered_children = {}
+                for act, child in root.children.items():
+                    q_value = child.value  # Q値（平均勝率）= value_sum / visit_count
+                    if q_value > q_veto_threshold:
+                        filtered_actions.append(act)
+                        filtered_visits.append(child.visit_count)
+                        filtered_children[act] = child
+                # 除外後の手が1つ以上ある場合のみ適用
+                if filtered_actions:
+                    actions = filtered_actions
+                    visits = filtered_visits
+                    root.children = filtered_children
+
         # 温度決定 (手数/進行に応じたスケジュール)
         tau_action = self._select_temperature(training=training)
         pi_action = self._apply_temperature_to_visits(visits, tau_action)
@@ -503,7 +788,13 @@ class AlphaZeroAgent(TrainStepMixin):
         state_repr = self._extract_state(env, prev_state=getattr(self, '_last_state', None))
 
         # リプレイサンプル保存 (value=None : 未確定)
-        if training:
+        # サンプル保存の判定:
+        # 既存実装は learning_player_id 固定で保存していたため、
+        # Arena (最新モデルを複数プレイヤーに割当て) の場合に保存数が変動しない問題があった。
+        # factory で割当時に `is_using_latest_model` を設定しているため、
+        # こちらのフラグを優先して保存する（最新モデルを使用するプレイヤーを保存対象にする）。
+        is_latest_model_user = bool(self.config.get('is_using_latest_model', False)) or (self.player_id == self.config.get('learning_player_id', 0))
+        if training and is_latest_model_user:
             try:
                 import random as _r
                 val_ratio = float(self.config.get('val_split_ratio', 0.0) or 0.0)
@@ -541,14 +832,89 @@ class AlphaZeroAgent(TrainStepMixin):
                     tau_target = float(self.config.get("policy_target_tau", 1.0))
                     pi_target_val = self._apply_temperature_to_visits(visits_val, tau_target)
                     serialized_legal_val = [None if a == "pass" else (list(a) if isinstance(a, tuple) else a) for a in actions_val]
-                    stored = self._store_sample(state_repr, serialized_legal_val, pi_target_val, None)
+                    # Attempt to map variable-length pi into canonical fixed-head ordering
+                    try:
+                        if hasattr(self, 'model') and getattr(self.model, 'canonical_action_keys', None) is not None:
+                            canonical = self.model.canonical_action_keys()
+                            key_to_idx = {k: i for i, k in enumerate(canonical)}
+                            L = len(canonical)
+                            pi_full = [0.0] * L
+                            # helper: convert action -> canonical key string
+                            def _act_to_key(a):
+                                try:
+                                    if a is None or a == 'pass':
+                                        return 'PASS'
+                                    cards = a if isinstance(a, (list, tuple)) else [a]
+                                    from agents.agent_utills.feature_extractor import CardEncoder
+                                    ce = CardEncoder()
+                                    parts = []
+                                    for c in cards:
+                                        try:
+                                            parts.append(int(ce.card_index(c)))
+                                        except Exception:
+                                            pass
+                                    parts.sort()  # Integer sort to match action_vocab.py
+                                    return '|'.join(str(x) for x in parts)
+                                except Exception:
+                                    try:
+                                        return '|'.join(sorted(repr(x) for x in (a if isinstance(a, (list, tuple)) else [a])))
+                                    except Exception:
+                                        return str(a)
+                            for i, act in enumerate(actions_val):
+                                k = _act_to_key(act)
+                                idx = key_to_idx.get(k, None)
+                                try:
+                                    v = float(pi_target_val[i]) if i < len(pi_target_val) else 0.0
+                                except Exception:
+                                    v = 0.0
+                                if idx is not None and 0 <= idx < L:
+                                    pi_full[idx] += v
+                                else:
+                                    # log unmapped actions for diagnosis (skip PASS)
+                                    try:
+                                        if act not in (None, 'pass'):
+                                            self._log_fallback_once(
+                                                "canonical_map_miss",
+                                                f"[WARN] canonical map miss: action={act} key={k}",
+                                            )
+                                    except Exception:
+                                        pass
+                            # normalize if possible
+                            s = sum(pi_full)
+                            if s > 0:
+                                pi_full = [p / s for p in pi_full]
+                            else:
+                                # fallback: uniform distribution over all canonical keys
+                                L = len(pi_full)
+                                pi_full = [1.0 / L if L > 0 else 0.0] * L
+                            stored = self._store_sample(state_repr, serialized_legal_val, pi_full, None)
+                        else:
+                            # No canonical_action_keys available: create uniform distribution
+                            L = 1059  # Known vocab size
+                            pi_full_fallback = [1.0 / L] * L
+                            stored = self._store_sample(state_repr, serialized_legal_val, pi_full_fallback, None)
+                    except Exception as _map_e:
+                        try:
+                            if getattr(self, 'logger', None) and hasattr(self.logger, 'log_text'):
+                                self.logger.log_text(f"[WARN] canonical mapping failed: {_map_e}")
+                            else:
+                                print(f"[WARN] canonical mapping failed: {_map_e}")
+                        except Exception:
+                            pass
+                        # Fallback: uniform distribution over canonical keys
+                        L = 1059
+                        pi_full_fallback = [1.0 / L] * L
+                        stored = self._store_sample(state_repr, serialized_legal_val, pi_full_fallback, None)
                     try:
                         stored['split'] = 'val'
                     except Exception:
                         pass
                 except Exception:
                     serialized_legal = [None if a == "pass" else (list(a) if isinstance(a, tuple) else a) for a in actions]
-                    stored = self._store_sample(state_repr, serialized_legal, pi_target, None)
+                    # Fallback: uniform distribution
+                    L = 1059
+                    pi_full_fallback = [1.0 / L] * L
+                    stored = self._store_sample(state_repr, serialized_legal, pi_full_fallback, None)
                 finally:
                     try:
                         cfg['inference_dirichlet'] = _old_inf_dir
@@ -566,7 +932,75 @@ class AlphaZeroAgent(TrainStepMixin):
                 self._phase_value_preds.append(value_scalar_for_store)
             else:
                 serialized_legal = [None if a == "pass" else (list(a) if isinstance(a, tuple) else a) for a in actions]
-                stored = self._store_sample(state_repr, serialized_legal, pi_target, None)
+                try:
+                    if hasattr(self, 'model') and getattr(self.model, 'canonical_action_keys', None) is not None:
+                        canonical = self.model.canonical_action_keys()
+                        key_to_idx = {k: i for i, k in enumerate(canonical)}
+                        L = len(canonical)
+                        pi_full = [0.0] * L
+                        def _act_to_key(a):
+                            try:
+                                if a is None or a == 'pass':
+                                    return 'PASS'
+                                cards = a if isinstance(a, (list, tuple)) else [a]
+                                from agents.agent_utills.feature_extractor import CardEncoder
+                                ce = CardEncoder()
+                                parts = []
+                                for c in cards:
+                                    try:
+                                        parts.append(int(ce.card_index(c)))
+                                    except Exception:
+                                        pass
+                                parts.sort()  # Integer sort to match action_vocab.py
+                                return '|'.join(str(x) for x in parts)
+                            except Exception:
+                                try:
+                                    return '|'.join(sorted(repr(x) for x in (a if isinstance(a, (list, tuple)) else [a])))
+                                except Exception:
+                                    return str(a)
+                        for i, act in enumerate(actions):
+                            k = _act_to_key(act)
+                            idx = key_to_idx.get(k, None)
+                            try:
+                                v = float(pi_target[i]) if i < len(pi_target) else 0.0
+                            except Exception:
+                                v = 0.0
+                                if idx is not None and 0 <= idx < L:
+                                    pi_full[idx] += v
+                                else:
+                                    try:
+                                        if act not in (None, 'pass'):
+                                            self._log_fallback_once(
+                                                "canonical_map_miss",
+                                                f"[WARN] canonical map miss: action={act} key={k}",
+                                            )
+                                    except Exception:
+                                        pass
+                        s = sum(pi_full)
+                        if s > 0:
+                            pi_full = [p / s for p in pi_full]
+                        else:
+                            # fallback: uniform distribution over canonical keys
+                            L = len(pi_full)
+                            pi_full = [1.0 / L if L > 0 else 0.0] * L
+                        stored = self._store_sample(state_repr, serialized_legal, pi_full, None)
+                    else:
+                        # No canonical_action_keys available: uniform distribution
+                        L = 1059
+                        pi_full_fallback = [1.0 / L] * L
+                        stored = self._store_sample(state_repr, serialized_legal, pi_full_fallback, None)
+                except Exception as _map_e:
+                    try:
+                        if getattr(self, 'logger', None) and hasattr(self.logger, 'log_text'):
+                            self.logger.log_text(f"[WARN] canonical mapping failed: {_map_e}")
+                        else:
+                            print(f"[WARN] canonical mapping failed: {_map_e}")
+                    except Exception:
+                        pass
+                    # Fallback: uniform distribution
+                    L = 1059
+                    pi_full_fallback = [1.0 / L] * L
+                    stored = self._store_sample(state_repr, serialized_legal, pi_full_fallback, None)
                 self._phase_samples.append(stored)
                 self._phase_value_preds.append(value_scalar_for_store)
 
@@ -675,10 +1109,108 @@ class AlphaZeroAgent(TrainStepMixin):
         return policy_value_batch_fn
 
     def _policy_value_batch_impl(self, env_list, legal_list=None, training: bool = True):
-        # 既存実装を保持（phase-2 で remote_infer へ移設）
-        # NOTE: 元の _run_mcts 内の policy_value_batch_fn をこの関数へ集約するのが最終形。
-        # 現段階では互換維持のため、従来のコードパスを使用。
-        return [self._policy_value(e) for e in env_list]
+        """バッチ推論: 複数環境をまとめて GPU forward し、結果を各環境へ分配する。
+        
+        Args:
+            env_list: 環境のリスト
+            legal_list: 各環境の legal_actions リスト (Optional)
+            training: 学習モードかどうか
+            
+        Returns:
+            List of (policy_dict, value_dict) tuples for each environment
+        """
+        if not env_list:
+            return []
+        
+        # 単一環境の場合は従来通り（オーバーヘッド回避）
+        if len(env_list) == 1:
+            return [self._policy_value(env_list[0])]
+        
+        try:
+            import torch
+            
+            # 1. 全環境の状態を抽出
+            states = []
+            legals = []
+            for i, env in enumerate(env_list):
+                state = self._extract_state(env)
+                states.append(state)
+                
+                # legal_actions を取得（legal_list または env から）
+                if legal_list is not None and i < len(legal_list):
+                    legal = legal_list[i]
+                else:
+                    try:
+                        legal = env.get_legal_actions() if hasattr(env, 'get_legal_actions') else None
+                    except Exception:
+                        legal = None
+                legals.append(legal if legal else [])
+            
+            # 2. モデルでバッチ推論（GPU上で一括処理）
+            with torch.no_grad():
+                # device の type 属性を安全に取得（model.device へフォールバック）
+                device = getattr(self, 'device', None) or getattr(self.model, 'device', None)
+                use_amp = bool(getattr(device, 'type', None) == 'cuda')
+                with torch.amp.autocast('cuda', enabled=use_amp):
+                    policy_logits_batch, value_logits_batch = self.model.forward_batch(states)
+            
+
+            self._batch_inference_used = True
+            results = []
+            for i, (state, legal) in enumerate(zip(states, legals)):
+                try:
+                    # policy ロジットを legal 数に合わせて切り出し
+                    logits_full = policy_logits_batch[i]
+                    n_legal = len(legal)
+                    
+                    if n_legal > 0:
+                        # legal の長さに合わせて切り出し（GPU上で）
+                        if logits_full.shape[0] < n_legal:
+                            pad = torch.zeros(n_legal - logits_full.shape[0], 
+                                            device=logits_full.device, 
+                                            dtype=logits_full.dtype)
+                            logits_sel = torch.cat([logits_full, pad], dim=0)
+                        else:
+                            logits_sel = logits_full[:n_legal]
+                        
+                        # softmax は GPU 上で実行
+                        policy_probs = torch.softmax(logits_sel, dim=0)
+                        # CPU 転送は最小限（1回のみ）
+                        policy_probs_list = policy_probs.cpu().tolist()
+                        # リスト型のアクションを tuple に変換してキーとして使用可能にする
+                        policy_dict = {(tuple(action) if isinstance(action, list) else action): prob 
+                                      for action, prob in zip(legal, policy_probs_list)}
+                    else:
+                        policy_dict = {}
+                    
+                    # value: スカラー出力（学習対象プレイヤーの勝率）
+                    # BCEWithLogitsLoss 使用のため、推論時は sigmoid で確率化
+                    value_logits = value_logits_batch[i]
+                    value_prob = torch.sigmoid(value_logits)
+                    # スカラー値を取得（shape [] or [1] → float）
+                    value_scalar = float(value_prob.item())
+                    
+                    results.append((policy_dict, value_scalar))
+                    
+                except Exception as e:
+                    # 個別環境の処理エラー時はフォールバック
+                    self._log_fallback_once(
+                        f"batch_impl_env_{i}",
+                        f"[batch-fallback] env {i} failed in batch processing; fallback to single",
+                        e
+                    )
+                    results.append(self._policy_value(env_list[i]))
+            
+            return results
+            
+        except Exception as e:
+            # バッチ推論全体が失敗した場合は従来の逐次処理にフォールバック
+            self._log_fallback_once(
+                "batch_impl_all",
+                "[batch-fallback] Batch inference failed; fallback to sequential processing",
+                e
+            )
+            return [self._policy_value(e) for e in env_list]
 
     def _ensure_inference_client(self) -> InferenceClient:
         """InferenceClient の遅延初期化。リモートキューの有無に応じて適切なクライアントを返す。"""
@@ -752,6 +1284,10 @@ class AlphaZeroAgent(TrainStepMixin):
         # 3. 合法手取得
         legal = self._get_legal_actions(env)
         if not legal:
+            self._log_fallback_once(
+                "policy_value_no_legal",
+                "[az-fallback] no legal actions; returning empty policy/value"
+            )
             return {}, 0.0
         
         # 4. InferenceClient 経由で推論実行（パフォーマンス計測付き）
@@ -759,9 +1295,14 @@ class AlphaZeroAgent(TrainStepMixin):
         try:
             client = self._ensure_inference_client()
             policy_dict, value_scalar = client.infer_policy_value(state, legal)
-        except Exception:
+        except Exception as e:
             # フォールバック: 均等分布
             # リスト型のアクションを tuple に変換してキーとして使用可能にする
+            self._log_fallback_once(
+                "policy_value_infer_exception",
+                f"[az-fallback] infer_policy_value failed; using uniform policy (training={getattr(self, '_current_training_mode', False)})",
+                e
+            )
             n = len(legal)
             policy_dict = {(tuple(a) if isinstance(a, list) else a): 1.0 / n for a in legal}
             value_scalar = 0.5
@@ -784,7 +1325,43 @@ class AlphaZeroAgent(TrainStepMixin):
                 except Exception:
                     pass
         
+        self._record_eval_value(value_scalar)
         return policy_dict, value_scalar
+
+    def _value_scalar_for_self(self, value_scalar: Any) -> Optional[float]:
+        pid = int(getattr(self, 'player_id', 0) or 0)
+        try:
+            if isinstance(value_scalar, dict):
+                if pid in value_scalar:
+                    return float(value_scalar[pid])
+                return None
+            if isinstance(value_scalar, (list, tuple)):
+                if 0 <= pid < len(value_scalar):
+                    return float(value_scalar[pid])
+                return None
+            return float(value_scalar)
+        except Exception as e:
+            self._log_fallback_once(
+                "validate_action_exception",
+                "[az-fallback] validate_action failed; returning pass",
+                e
+            )
+            return None
+
+    def _record_eval_value(self, value_scalar: Any) -> None:
+        if not getattr(self, '_capture_eval_value', False):
+            return
+        if getattr(self, '_last_eval_value', None) is not None:
+            return
+        val = self._value_scalar_for_self(value_scalar)
+        if val is None:
+            return
+        self._last_eval_value = val
+        self._capture_eval_value = False
+
+    def get_last_eval_value(self) -> Optional[float]:
+        """直近 select_action 呼び出しでキャプチャした value（推論結果）を返す。"""
+        return getattr(self, '_last_eval_value', None)
 
     # ---------------- Env helpers ----------------
     def _copy_env(self, env):
@@ -927,6 +1504,135 @@ class AlphaZeroAgent(TrainStepMixin):
     def _build_single_determinization(self, e_clone, original_env, root_pid, apply_direct=False):
         return _build_single_determinization_impl(self, e_clone, original_env, root_pid, apply_direct=apply_direct)
 
+    def _filter_high_rank_waste(self, env, legal_actions: List[Any]) -> List[Any]:
+        """無駄な高ランク出し禁止フィルタ。
+        
+        最も弱いカード + max_rank_gap までのカードしか出せないように制限。
+        例: max_rank_gap=3, 最弱が4(rank=2) なら rank 2+3=5 まで許可。
+        
+        Args:
+            env: 環境オブジェクト
+            legal_actions: フィルタリング前の合法手リスト
+        
+        Returns:
+            フィルタリング後の合法手リスト（最低1手は残す）
+        """
+        if not legal_actions:
+            return legal_actions
+        
+        try:
+            from game.card import Card
+            
+            # 場のカードと革命状態を取得
+            field = (env.game.current_field or [])[:]  
+            if not field:
+                # 場が空ならフィルタ無効（最初の手出し）
+                return legal_actions
+            
+            rc = getattr(env.game, 'rule_checker', None)
+            if rc is None:
+                return legal_actions
+            
+            # 場の役を分類
+            field_combo = rc.classify_combo(field)
+            if not field_combo:
+                return legal_actions
+            
+            field_type = field_combo.get('type')
+            field_strength = field_combo.get('strength', 0)
+            field_size = field_combo.get('size', 0)
+            
+            # パス以外の合法手を収集
+            non_pass_actions = [a for a in legal_actions if a != "pass"]
+            if len(non_pass_actions) <= 1:
+                # 手が1つ以下ならフィルタ不要
+                return legal_actions
+            
+            # 各合法手を解析
+            action_info = []
+            for action in non_pass_actions:
+                try:
+                    cards = [Card.from_string(s) for s in action] if isinstance(action, list) else []
+                    if not cards:
+                        continue
+                    
+                    combo = rc.classify_combo(cards)
+                    if not combo:
+                        continue
+                    
+                    action_type = combo.get('type')
+                    action_strength = combo.get('strength', 0)
+                    action_size = combo.get('size', 0)
+                    
+                    # 場の役と同じ種類でサイズも一致する手のみ比較対象
+                    if action_type != field_type or action_size != field_size:
+                        continue
+                    
+                    # 場より強い手のみが合法手のはず
+                    if action_strength <= field_strength:
+                        continue
+                    
+                    action_info.append({
+                        'action': action,
+                        'strength': action_strength,
+                        'cards': cards,
+                    })
+                except Exception:
+                    continue
+            
+            if len(action_info) <= 1:
+                # 比較可能な手が1つ以下ならフィルタ不要
+                return legal_actions
+            
+            # 強さでソート（昇順: 弱い手から強い手へ）
+            action_info.sort(key=lambda x: x['strength'])
+            
+            # 最弱手の強さを取得
+            min_strength = action_info[0]['strength']
+            
+            # 許可される最大強さを計算
+            max_rank_gap = int(self.config.get('filter_high_rank_max_gap', 3))
+            max_allowed_strength = min_strength + max_rank_gap
+            
+            # フィルタリング後の合法手を構築
+            filtered = []
+            for action in legal_actions:
+                if action == "pass":
+                    # パスは常に残す
+                    filtered.append(action)
+                    continue
+                
+                # このアクションの強さを検索
+                action_strength = None
+                for info in action_info:
+                    if info['action'] == action:
+                        action_strength = info['strength']
+                        break
+                
+                # action_infoにない場合（別の役種類など）はそのまま残す
+                if action_strength is None:
+                    filtered.append(action)
+                    continue
+                
+                # 強さが許可範囲内なら残す
+                if action_strength <= max_allowed_strength:
+                    filtered.append(action)
+            
+            # 安全装置: 全ての手を除外してしまった場合は元のリストを返す
+            if not filtered or (len(filtered) == 1 and filtered[0] == "pass"):
+                return legal_actions
+            
+            return filtered
+        
+        except Exception as e:
+            # エラー時は元のリストをそのまま返す（フィルタリング失敗）
+            self._log_fallback_once(
+                "filter_high_rank_exception",
+                "[az-fallback] filter_high_rank_waste failed; returning unfiltered legal actions",
+                e
+            )
+            return legal_actions
+
     def _get_legal_actions(self, env) -> List[Any]:
         """現在手番プレイヤーの合法手集合を可変長リストで返す。
 
@@ -945,7 +1651,12 @@ class AlphaZeroAgent(TrainStepMixin):
                 raw = env._generate_legal_actions(hand, field)
             else:
                 raw = []
-        except Exception:
+        except Exception as e:
+            self._log_fallback_once(
+                "get_legal_actions_exception",
+                "[az-fallback] get_legal_actions failed; returning empty",
+                e
+            )
             raw = []
         
         acts: List[Any] = []
@@ -1007,6 +1718,15 @@ class AlphaZeroAgent(TrainStepMixin):
         # パスは「場が空でない場合」にのみ合法手として許可する（最後に付加）
         if not field_is_empty and ("pass" not in acts_sorted):
             acts_sorted.append("pass")
+        
+        # 無駄な高ランク出し禁止フィルタ（推論時のみ適用）
+        filter_enable = self.config.get('filter_high_rank_enable', False)
+        filter_training = self.config.get('filter_high_rank_training', False)
+        is_training = getattr(self, '_current_training_mode', False)
+        
+        if filter_enable and (not is_training or filter_training):
+            acts_sorted = self._filter_high_rank_waste(env, acts_sorted)
+        
         return acts_sorted
 
     def _validate_action(self, env, action):

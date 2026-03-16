@@ -438,6 +438,11 @@ def run_self_play(cfg: Dict[str, Any], episodes: int, workers: int, model_path: 
 
 	target_eps = int(episodes)
 	ep_done = 0
+	# しばり統計（累積）
+	cum_shibari_triggered = 0
+	cum_shibari_passes = 0
+	cum_shibari_turns = 0
+	cum_total_turns = 0
 	# 累積表示用: この実行開始前までの累積エピソードを保持
 	start_cumulative_eps = cumulative_eps
 	drained_samples: List[Dict[str, Any]] = []
@@ -480,6 +485,31 @@ def run_self_play(cfg: Dict[str, Any], episodes: int, workers: int, model_path: 
 					last_progress_len = len(line)
 			elif evt == 'perf_ep':  # forward/game time 計測行は logger 内で処理されるためここでは何もしない
 				pass
+			elif evt == 'ep_metrics':
+				# Worker から送られたエピソード指標を中央で記録
+				try:
+					if logger:
+						logger.log_episode(val)
+				except Exception:
+					pass
+				# 集約用にしばり統計を加算
+				try:
+					cum_shibari_triggered += int(val.get('shibari_triggered', 0) or 0)
+				except Exception:
+					pass
+				try:
+					cum_shibari_passes += int(val.get('shibari_passes', 0) or 0)
+				except Exception:
+					pass
+				try:
+					cum_shibari_turns += int(val.get('shibari_turns', 0) or 0)
+				except Exception:
+					pass
+				# 合計ターン数も集約
+				try:
+					cum_total_turns += int(val.get('episode_len', 0) or 0)
+				except Exception:
+					pass
 			elif evt == 'hb':
 				pass
 			elif evt == 'worker_exit':
@@ -622,6 +652,21 @@ def run_self_play(cfg: Dict[str, Any], episodes: int, workers: int, model_path: 
 
 	# Emit a concise one-line summary per self-play run.
 	try:
+		# Emit shibari aggregate summary (one line)
+		try:
+			if ep_done > 0:
+				avg_pass = float(cum_shibari_passes) / max(1, float(cum_shibari_triggered)) if cum_shibari_triggered > 0 else 0.0
+				shibari_rate = float(cum_shibari_triggered) / max(1, float(cum_total_turns)) if cum_total_turns > 0 else 0.0
+				msg = f"[shibari-summary] triggered={cum_shibari_triggered} rate={shibari_rate:.3%} avg_pass={avg_pass:.2f} episodes={ep_done}"
+				if logger:
+					logger.log_text(msg)
+				try:
+					with open(os.path.join(log_dir, 'shibari_summary.log'), 'a', encoding='utf-8') as sf:
+						sf.write(msg + '\n')
+				except Exception:
+					pass
+		except Exception:
+			pass
 		if bool(cfg.get('enable_duplicate_filter', False)) and raw_sample_count > 0 and dup_state is not None:
 			forced_raw = int(dup_state.get('pass_only_raw', 0) or 0)
 			forced_kept = int(dup_state.get('pass_only_kept', 0) or 0)
@@ -642,16 +687,15 @@ def run_self_play(cfg: Dict[str, Any], episodes: int, workers: int, model_path: 
 	# 圧縮レベル:
 	# 直列モード (non-parallel) は memmap 利用とI/O高速化を優先し compress=0 を強制。
 	# 並列モードと区別するための設定キー selfplay_joblib_compress があってもここでは無視。
-	# 必要なら config-json で selfplay_joblib_compress>=0 を指定して上書き可能。
-	# デフォルトは0（無圧縮）でロード時のCPU展開コストを削減し、高速化を優先。
-	force_c = cfg.get('selfplay_joblib_compress', None)
+	# 必要なら config-json で selfplay_force_compress>=0 を指定して上書き可能。
+	force_c = cfg.get('selfplay_force_compress', None)
 	if force_c is not None:
 		try:
 			compress_lv = int(force_c)
 		except Exception:
 			compress_lv = 0
 	else:
-		compress_lv = 0  # non-parallel 強制無圧縮（高速化優先）
+		compress_lv = 0  # non-parallel 強制無圧縮
 	try:
 		if not cfg.get('disable_data_writes', False):
 			tmp = out_path + '.tmp'

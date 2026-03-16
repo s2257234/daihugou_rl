@@ -36,6 +36,28 @@ class Game:
         self._zobrist = None  # lazy init
         self._zobrist_init_tables()
         self._zobrist_reset_full()
+        # フォールバックログの重複抑制
+        self._fallback_logged = set()
+        # しばり状態管理
+        self.shibari_active = False  # 縛り状態フラグ
+        self.lock_suits = None  # 縛られているスートのリスト (None = 縛りなし)
+        # しばり統計（ログ用）
+        self.shibari_triggered_count = 0
+        self.shibari_pass_count = 0
+        self.turn_count_in_shibari = 0
+
+    def _log_fallback_once(self, key: str, msg: str, exc: Exception | None = None) -> None:
+        try:
+            if key in self._fallback_logged:
+                return
+            self._fallback_logged.add(key)
+        except Exception:
+            pass
+        try:
+            text = f"{msg} ({type(exc).__name__}: {exc})" if exc is not None else msg
+            print(text)
+        except Exception:
+            pass
 
     def _all_others_passed(self):
         """
@@ -64,6 +86,12 @@ class Game:
             self._action_history.clear()
         except Exception:
             self._action_history = []
+        # しばり状態もリセット
+        self.shibari_active = False
+        self.lock_suits = None
+        self.shibari_triggered_count = 0
+        self.shibari_pass_count = 0
+        self.turn_count_in_shibari = 0
         # 前回の順位情報を一時保存
         prev_rankings = self.rankings[:] if hasattr(self, 'rankings') else []
         self.rankings = []
@@ -162,6 +190,10 @@ class Game:
             return data
         except Exception:
             # 最低限のフォールバック
+            self._log_fallback_once(
+                "get_state_data_fallback",
+                "[game-fallback] get_state_data failed; using minimal snapshot"
+            )
             return {
                 'num_players': int(getattr(self, 'num_players', len(getattr(self, 'players', [])))) or 0,
                 'turn': int(getattr(self, 'turn', 0)),
@@ -196,6 +228,10 @@ class Game:
             self.players = [Player(player_id=i) for i in range(np_)]
         # カード辞書のフォールバック構築
         if card_lookup is None:
+            self._log_fallback_once(
+                "set_state_data_card_lookup",
+                "[game-fallback] card_lookup missing; rebuilding from current hands/field"
+            )
             card_lookup = {}
             try:
                 for p in getattr(self, 'players', []):
@@ -368,6 +404,8 @@ class Game:
             played_str = ', '.join(str(c) for c in card_objs) if card_objs else ''
             # 1) 場に反映
             self._play_cards(player, card_objs)
+            # しばり状態更新（カード出し直後）
+            self._update_shibari_state()
             self.last_player = self.turn
             # 2) 革命判定のみ先に実行 (出力順制御のため分離)
             prev_rev = self.rule_checker.revolution
@@ -422,7 +460,10 @@ class Game:
                 done_now = self._check_agari(player, player_id)
                 return self.get_state(self.turn), done_now, True, "eight_cut"
             # ジョーカー流し
-            if len(card_objs) == 1 and card_objs[0].is_joker:
+            # ジョーカー単出し（代用指定がある場合は通常カード扱い）
+            if len(card_objs) == 1 and card_objs[0].is_joker and (
+                getattr(card_objs[0], 'joker_as_suit', None) is None or getattr(card_objs[0], 'joker_as_rank', None) is None
+            ):
                 self.last_player = self.turn
                 self._reset_field()
                 # ジョーカー単出しで上がった場合も正しく順位付けする
@@ -445,15 +486,23 @@ class Game:
                 self._action_history.append(hist_entry)
             except Exception:
                 pass
+            # しばり中のパスをカウント
+            if getattr(self, 'shibari_active', False):
+                self.shibari_pass_count += 1
             if not self.passed[self.turn]:
                 # Zobrist: pass フラグを立てる
                 self._zkey ^= self._zobrist['PASSED'][self.turn]
                 self.passed[self.turn] = True
             # 最後に出したプレイヤー以外が全員パス → 場リセット
             if self._all_others_passed():
-                self._reset_field()
-                reset_happened = True
-                return self.get_state(self.turn), False, reset_happened, "all_pass"
+                # If all players have empty hands (game finishing), skip clearing the field
+                # so transient states (e.g. shibari set by the last play) remain visible to the caller.
+                all_empty = all(len(p.hand) == 0 for p in self.players)
+                if not all_empty:
+                    self._reset_field()
+                    reset_happened = True
+                    return self.get_state(self.turn), False, reset_happened, "all_pass"
+                # else: fall through without resetting (end-of-game finalization will follow)
         if valid:
             self.last_player = self.turn
         # 上がり判定
@@ -462,9 +511,12 @@ class Game:
 
         # 全員パス or 全員上がりで場リセット
         if not empty_field and self._all_others_passed():
-            self._reset_field()
-            reset_happened = True
-            return self.get_state(self.turn), False, reset_happened, "all_pass"
+            all_empty = all(len(p.hand) == 0 for p in self.players)
+            if not all_empty:
+                self._reset_field()
+                reset_happened = True
+                return self.get_state(self.turn), False, reset_happened, "all_pass"
+            # else: do not reset the field to preserve transient state
 
         # リセット直後は再度 same player に戻る
         if reset_happened:
@@ -473,6 +525,54 @@ class Game:
         # どの分岐にも入らなかった場合、通常ターン進行
         self._advance_turn()
         return self.get_state(self.turn), False, False, None
+
+    def _update_shibari_state(self):
+        """しばり状態を更新する（カード出し直後に呼ぶ）"""
+        if not self._action_history:
+            self.shibari_active = False
+            self.lock_suits = None
+            return
+        
+        last_action = self._action_history[-1]
+        
+        # 1. 前回の場が空（新しいトリックの開始）なら縛りは発生しない
+        prev_field_strs = last_action.get('field_before', [])
+        if not prev_field_strs:
+            self.shibari_active = False
+            self.lock_suits = None
+            return
+        
+        # 2. 今回の場を取得
+        current = getattr(self, 'current_field', [])
+        if not current:
+            # パスの場合は状態維持（何もしない）
+            return
+        
+        # 3. 縛り判定
+        try:
+            prev_suits = self.rule_checker.extract_suit_pattern_from_strings(prev_field_strs)
+            current_suits = self.rule_checker.extract_suit_pattern(current)
+
+            # Jokerが含まれていて current_suits が空になっている場合は
+            # prev_suits を推定スートとして使用する（Jokerが前のスートを継承する挙動）
+            if (not current_suits) and any(getattr(c, 'is_joker', False) for c in current):
+                if prev_suits:
+                    current_suits = prev_suits[:]
+
+            # 4. 縛り判定
+            if prev_suits == current_suits and len(prev_suits) > 0:
+                if not self.shibari_active:
+                    # 縛り発生！
+                    self.shibari_triggered_count += 1
+                self.shibari_active = True
+                self.lock_suits = current_suits
+            else:
+                # 縛り解除（スートが異なった）
+                self.shibari_active = False
+                self.lock_suits = None
+        except Exception:
+            # フォールバック: 縛り判定失敗時は維持
+            pass
 
     def _advance_turn(self):
         """次のプレイヤーにターンを進める（手札がない場合はスキップ）"""
@@ -506,8 +606,10 @@ class Game:
             self.last_player = self.turn
             self._reset_field()
             return True, (self.get_state(self.turn), False, True, "eight_cut")
-        # ジョーカー流し（ジョーカー1枚出しのみ）
-        if len(card_objs) == 1 and card_objs[0].is_joker:
+        # ジョーカー流し（ジョーカー1枚出しのみ、ただし代用指定がある場合は通常カード扱い）
+        if len(card_objs) == 1 and card_objs[0].is_joker and (
+            getattr(card_objs[0], 'joker_as_suit', None) is None or getattr(card_objs[0], 'joker_as_rank', None) is None
+        ):
             self.last_player = self.turn
             self._reset_field()
             return True, (self.get_state(self.turn), False, True, "joker_cut")
@@ -549,10 +651,11 @@ class Game:
             #self.log("[REV_EVENTS] turn player reason old->new size cards meta")
             self._rev_events_header_printed = True
         for ev in events:
-            self.log(
-                #f"[REV_EVENTS] {ev['turn']} P{ev['player']} {ev['reason']} "
-                #f"{ev['old_state']}->{ev['new_state']} {ev['size']} {ev['cards']} {ev['meta']}"
-            )
+            # self.log(
+            #     f"[REV_EVENTS] {ev['turn']} P{ev['player']} {ev['reason']} "
+            #     f"{ev['old_state']}->{ev['new_state']} {ev['size']} {ev['cards']} {ev['meta']}"
+            # )
+            pass
 
     def print_revolution_events(self):
         """エイリアスメソッド (dump_revolution_events と同じ)。"""
@@ -678,6 +781,9 @@ class Game:
             except Exception:
                 pass
         self.current_field = []
+        # 場が流れたら縛り解除
+        self.shibari_active = False
+        self.lock_suits = None
         # Zobrist: pass を全解除
         for i, f in enumerate(self.passed):
             if f:

@@ -17,7 +17,7 @@ IF NOT DEFINED WORKERS SET WORKERS=16
 IF NOT DEFINED TRAIN_UPDATES SET TRAIN_UPDATES=200
 IF NOT DEFINED MAX_FILES_PER_TRAIN SET MAX_FILES_PER_TRAIN=100
 REM data/ の保存上限（FIFO）。100を既定に設定
-IF NOT DEFINED DATA_MAX_FILES SET DATA_MAX_FILES=70
+IF NOT DEFINED DATA_MAX_FILES SET DATA_MAX_FILES=50
 IF NOT DEFINED DATA_DIR SET DATA_DIR=data
 IF NOT DEFINED LOG_DIR SET LOG_DIR=logs
 IF NOT DEFINED CKPT_DIR SET CKPT_DIR=checkpoints
@@ -74,11 +74,11 @@ SET ITER=0
 
 :MAIN_LOOP
 IF NOT "%LOOP_COUNT%"=="-1" (
-  IF %ITER% GEQ %LOOP_COUNT% GOTO END
+  IF !ITER! GEQ %LOOP_COUNT% GOTO END
 )
-SET /A ITER=%ITER%+1
+SET /A ITER=!ITER!+1
 ECHO.
-ECHO ===================== Iteration %ITER% =====================
+ECHO ===================== Iteration !ITER! =====================
 
 REM ---- Adjust episodes/updates based on file count and episode count ----
 REM Phase 1: Until 30 files accumulated -> self-play only (no training)
@@ -102,18 +102,22 @@ IF "!CUMULATIVE_EPISODES!"=="" SET CUMULATIVE_EPISODES=0
 REM Determine training updates based on conditions
 SET "CURRENT_EPISODES=!EPISODES_PER_GEN!"
 
-IF !FILE_COUNT! LSS 30 (
+IF !FILE_COUNT! LSS 10 (
   REM Phase 1: Accumulating files - no training
   SET "CURRENT_UPDATES=0"
-  ECHO [PHASE] Warm-up: files=!FILE_COUNT!/30 episodes=!CUMULATIVE_EPISODES! training=SKIP
+  ECHO [PHASE] Warm-up: files=!FILE_COUNT!/10 episodes=!CUMULATIVE_EPISODES! training=SKIP
+) ELSE IF !FILE_COUNT! GEQ 50 (
+  REM New Phase: Large pool accumulated - reduce per-loop updates to keep iterations frequent
+  SET "CURRENT_UPDATES=300"
+  ECHO [PHASE] Large-pool training: files=!FILE_COUNT! episodes=!CUMULATIVE_EPISODES! updates=150
 ) ELSE IF !CUMULATIVE_EPISODES! LSS 100000 (
-  REM Phase 2: 30+ files but less than 100k episodes - updates=50
+  REM Phase 2: 10+ files but less than 100k episodes - updates=50
   SET "CURRENT_UPDATES=100"
   ECHO [PHASE] Early training: files=!FILE_COUNT! episodes=!CUMULATIVE_EPISODES! updates=100
 ) ELSE (
-  REM Phase 3: 30+ files and 100k+ episodes - updates=90
-  SET "CURRENT_UPDATES=100"
-  ECHO [PHASE] Full training: files=!FILE_COUNT! episodes=!CUMULATIVE_EPISODES! updates=100
+  REM Phase 3: 10+ files and 100k+ episodes - updates=90
+  SET "CURRENT_UPDATES=300"
+  ECHO [PHASE] Full training: files=!FILE_COUNT! episodes=!CUMULATIVE_EPISODES! updates=150
 )
 
 REM ---- Phase 1: Self-play data generation ----
@@ -157,7 +161,7 @@ GOTO MAIN_LOOP
 
 :END
 ECHO.
-ECHO [RUN-LOOP] Completed %ITER% iteration(s). Exiting.
+ECHO [RUN-LOOP] Completed !ITER! iteration(s). Exiting.
 POPD
 ENDLOCAL
 EXIT /B 0

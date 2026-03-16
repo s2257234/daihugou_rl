@@ -65,7 +65,22 @@ python -m evaluation.run_eval --episodes 20 --checkpoint checkpoints/policy_valu
 --no-tb                    # TensorBoard 無効
 --no-auto-plot             # 評価終了後の自動PNG生成を無効化
 --num-sim 32               # 評価時 MCTS シミュレーション数上書き
+--filter-dominated         # 圧倒的無駄遣いの禁止フィルタを有効化（推論時のみ）
 ```
+
+### 圧倒的無駄遣いの禁止フィルタ
+
+`--filter-dominated` オプションを有効にすると、より弱いカードで勝てる場面で、より強いカードを使う手を候補から除外します。
+
+**例**: 場に「3」が出ている時、手札に「4」と「2」がある場合
+- **フィルタなし**: 「4」を出す、「2」を出す、パス
+- **フィルタあり**: 「4」を出す、パス （「2」を出す手が除外される）
+
+**理由**: 「4」で勝てる場面で「2」を使うメリットはほぼありません。
+
+**効果**: MCTS探索木のサイズが削減され、より有望な手に探索リソースを集中できます。
+
+詳細は [docs/DOMINATED_FILTER.md](docs/DOMINATED_FILTER.md) を参照してください。
 
 ## 手動でプロット再生成のみ行いたい場合
 

@@ -5,6 +5,7 @@ from typing import Dict, Any, Optional
 import glob
 import joblib
 import numpy as np
+from collections import deque
 
 class TrainingLogger:
     """Collects and writes training / episode / MCTS root statistics.
@@ -92,6 +93,27 @@ class TrainingLogger:
         self._train_buf = []  # list[list]
         self._episode_buf = []
         self._text_buf = []  # list[str]
+        # recent episode wins buffer for windowed win-rate (length == csv_episode_every)
+        try:
+            self._episode_win_buf = deque(maxlen=self.csv_episode_every)
+        except Exception:
+            self._episode_win_buf = deque()
+        # windowed arena counts buffers
+        try:
+            self._arena_latest_buf = deque(maxlen=self.csv_episode_every)
+            self._arena_past_buf = deque(maxlen=self.csv_episode_every)
+            self._arena_rule_buf = deque(maxlen=self.csv_episode_every)
+        except Exception:
+            self._arena_latest_buf = deque()
+            self._arena_past_buf = deque()
+            self._arena_rule_buf = deque()
+        # windowed avg_rank and phase win-rate buffers
+        try:
+            self._avg_rank_buf = deque(maxlen=self.csv_episode_every)
+            self._phase_win_buf = deque(maxlen=self.csv_episode_every)
+        except Exception:
+            self._avg_rank_buf = deque()
+            self._phase_win_buf = deque()
         # 検証ロス一時保持（train_updates.csvへ同梱/即時書込の両方で使用）
         # 最終フラッシュ時刻
         now_ts = time.time()
@@ -262,6 +284,52 @@ class TrainingLogger:
         except Exception:
             pass
         # 必要に応じてヘッダ再生成 (頻度のみの変更では不要)
+        # adjust episode win buffer size when csv_episode_every changes
+        try:
+            # preserve existing entries up to new size
+            old_buf = getattr(self, '_episode_win_buf', None)
+            if old_buf is None:
+                self._episode_win_buf = deque(maxlen=self.csv_episode_every)
+            else:
+                new_buf = deque(list(old_buf), maxlen=self.csv_episode_every)
+                self._episode_win_buf = new_buf
+        except Exception:
+            try:
+                self._episode_win_buf = deque(maxlen=self.csv_episode_every)
+            except Exception:
+                self._episode_win_buf = deque()
+        # adjust arena buffers as well
+        try:
+            for attr in ('_arena_latest_buf','_arena_past_buf','_arena_rule_buf'):
+                old = getattr(self, attr, None)
+                if old is None:
+                    setattr(self, attr, deque(maxlen=self.csv_episode_every))
+                else:
+                    setattr(self, attr, deque(list(old), maxlen=self.csv_episode_every))
+        except Exception:
+            try:
+                self._arena_latest_buf = deque(maxlen=self.csv_episode_every)
+                self._arena_past_buf = deque(maxlen=self.csv_episode_every)
+                self._arena_rule_buf = deque(maxlen=self.csv_episode_every)
+            except Exception:
+                self._arena_latest_buf = deque()
+                self._arena_past_buf = deque()
+                self._arena_rule_buf = deque()
+        # adjust avg_rank and phase buffers
+        try:
+            for attr in ('_avg_rank_buf','_phase_win_buf'):
+                old = getattr(self, attr, None)
+                if old is None:
+                    setattr(self, attr, deque(maxlen=self.csv_episode_every))
+                else:
+                    setattr(self, attr, deque(list(old), maxlen=self.csv_episode_every))
+        except Exception:
+            try:
+                self._avg_rank_buf = deque(maxlen=self.csv_episode_every)
+                self._phase_win_buf = deque(maxlen=self.csv_episode_every)
+            except Exception:
+                self._avg_rank_buf = deque()
+                self._phase_win_buf = deque()
         if not self.disable_csv and not self.csv_summary_only:
             try:
                 if not os.path.exists(self.train_csv):
@@ -540,12 +608,69 @@ class TrainingLogger:
         if self._disk_full:
             return
         self.episode_idx += 1
+        # record individual learning-player win into rolling buffer
+        try:
+            lw = metrics.get('learning_player_win')
+            if isinstance(lw, (int, float)):
+                try:
+                    self._episode_win_buf.append(int(lw))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # record arena counts into rolling buffers
+        try:
+            al = metrics.get('arena_latest_count')
+            ap = metrics.get('arena_past_count')
+            ar = metrics.get('arena_rule_count')
+            try:
+                if isinstance(al, (int, float)):
+                    self._arena_latest_buf.append(int(al))
+            except Exception:
+                pass
+            try:
+                if isinstance(ap, (int, float)):
+                    self._arena_past_buf.append(int(ap))
+            except Exception:
+                pass
+            try:
+                if isinstance(ar, (int, float)):
+                    self._arena_rule_buf.append(int(ar))
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # record avg_rank and phase_win_rate into window buffers
+        try:
+            arank = metrics.get('avg_rank')
+            if isinstance(arank, (int, float)):
+                try:
+                    self._avg_rank_buf.append(float(arank))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            pwr = metrics.get('phase_win_rate')
+            if isinstance(pwr, (int, float)):
+                try:
+                    self._phase_win_buf.append(float(pwr))
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # 旧ヘッダ互換処理 (一度だけ再生成)
         try:
             if os.path.exists(self.episode_csv):
                 with open(self.episode_csv, 'r', encoding='utf-8') as rf:
                     header_line = rf.readline().strip()
+                # ヘッダが古い場合や新規列が無い場合は再生成
+                needs_rebuild = False
                 if 'phase_win_rate' not in header_line:
+                    needs_rebuild = True
+                if 'arena_latest_count' not in header_line:
+                    needs_rebuild = True
+                if needs_rebuild:
                     bak = self.episode_csv + '.bak'
                     if not os.path.exists(bak):
                         os.replace(self.episode_csv, bak)
@@ -553,24 +678,60 @@ class TrainingLogger:
                             writer = csv.writer(wf)
                             writer.writerow([
                                 "episode","avg_rank","first_rate","episode_len","phase_acc",
-                                "phase_win_rate","phase_wins","phase_attempts","cum_phase_win_rate"
+                                "phase_win_rate","phase_wins","phase_attempts","cum_phase_win_rate",
+                                "arena_latest_count","arena_past_count","arena_rule_count","learning_player_win","cum_learning_win_rate"
                             ])
         except Exception:
             pass
         if self.csv_summary_only:
             self._last_episode_metrics = dict(metrics)
         if (not self.disable_csv) and (not self.csv_summary_only) and (self.episode_idx % self.csv_episode_every) == 0:
+            # compute windowed averages for avg_rank and cum_phase_win_rate
+            try:
+                if hasattr(self, '_avg_rank_buf') and len(self._avg_rank_buf) > 0:
+                    win_avg_rank = float(sum(self._avg_rank_buf)) / float(len(self._avg_rank_buf))
+                else:
+                    win_avg_rank = metrics.get("avg_rank")
+            except Exception:
+                win_avg_rank = metrics.get("avg_rank")
+            try:
+                if hasattr(self, '_phase_win_buf') and len(self._phase_win_buf) > 0:
+                    win_phase = float(sum(self._phase_win_buf)) / float(len(self._phase_win_buf))
+                else:
+                    win_phase = metrics.get("cum_phase_win_rate")
+            except Exception:
+                win_phase = metrics.get("cum_phase_win_rate")
+
             row = [
                 self.episode_idx,
-                metrics.get("avg_rank"),
+                win_avg_rank,
                 metrics.get("first_rate"),
                 metrics.get("episode_len"),
                 metrics.get("phase_acc"),
                 metrics.get("phase_win_rate"),
                 metrics.get("phase_wins"),
                 metrics.get("phase_attempts"),
-                metrics.get("cum_phase_win_rate"),
+                win_phase,
             ]
+            # optionally append arena / learning stats if provided
+            extra_keys = [
+                'arena_latest_count', 'arena_past_count', 'arena_rule_count',
+                'learning_player_win', 'cum_learning_win_rate'
+            ]
+            for k in extra_keys:
+                if k == 'cum_learning_win_rate':
+                    # compute windowed average over recent episode wins
+                    try:
+                        buf = getattr(self, '_episode_win_buf', None)
+                        if buf and len(buf) > 0:
+                            win_rate = float(sum(buf)) / float(len(buf))
+                        else:
+                            win_rate = metrics.get(k)
+                    except Exception:
+                        win_rate = metrics.get(k)
+                    row.append(win_rate)
+                else:
+                    row.append(metrics.get(k))
             if self._buffer_enabled:
                 self._episode_buf.append(row)
                 self._maybe_flush_episode()
@@ -581,6 +742,44 @@ class TrainingLogger:
                 except OSError as e:
                     self._mark_disk_full(e, 'episode_csv')
                     return
+            # Emit windowed arena summary to events.log for visibility
+            try:
+                # compute aggregates over window
+                window_n = max(1, len(getattr(self, '_arena_latest_buf', [])))
+                latest_sum = sum(self._arena_latest_buf) if hasattr(self, '_arena_latest_buf') else 0
+                past_sum = sum(self._arena_past_buf) if hasattr(self, '_arena_past_buf') else 0
+                rule_sum = sum(self._arena_rule_buf) if hasattr(self, '_arena_rule_buf') else 0
+                # proportions (per-player average in window)
+                latest_avg = float(latest_sum) / float(window_n) if window_n else 0.0
+                past_avg = float(past_sum) / float(window_n) if window_n else 0.0
+                rule_avg = float(rule_sum) / float(window_n) if window_n else 0.0
+                # histograms for latest/past/rule counts (0..num_players)
+                try:
+                    num_players = int(self.cfg.get('num_players', 4) or 4)
+                except Exception:
+                    num_players = 4
+                hist_latest = {i: 0 for i in range(0, num_players+1)}
+                hist_past = {i: 0 for i in range(0, num_players+1)}
+                hist_rule = {i: 0 for i in range(0, num_players+1)}
+                for v in getattr(self, '_arena_latest_buf', []):
+                    if v is None:
+                        continue
+                    hist_latest.get(v, 0)
+                    if v in hist_latest:
+                        hist_latest[v] += 1
+                for v in getattr(self, '_arena_past_buf', []):
+                    if v is None:
+                        continue
+                    if v in hist_past:
+                        hist_past[v] += 1
+                for v in getattr(self, '_arena_rule_buf', []):
+                    if v is None:
+                        continue
+                    if v in hist_rule:
+                        hist_rule[v] += 1
+                # window-stats logging removed (verbose/unnecessary)
+            except Exception:
+                pass
         if self.tb and not self._disk_full and (self.episode_idx % self.tb_ep_every) == 0:
             try:
                 for k,v in metrics.items():
@@ -762,16 +961,29 @@ class TrainingLogger:
                         writer = csv.writer(f)
                         writer.writerow([
                             "episode","avg_rank","first_rate","episode_len","phase_acc",
-                            "phase_win_rate","phase_wins","phase_attempts","cum_phase_win_rate"
+                            "phase_win_rate","phase_wins","phase_attempts","cum_phase_win_rate",
+                            "arena_latest_count","arena_past_count","arena_rule_count","learning_player_win","cum_learning_win_rate"
                         ])
                 with open(self.episode_csv, 'a', newline='', encoding='utf-8') as f:
                     m = self._last_episode_metrics
                     writer = csv.writer(f)
+                    # compute windowed learning win rate if available
+                    try:
+                        buf = getattr(self, '_episode_win_buf', None)
+                        if buf and len(buf) > 0:
+                            win_rate = float(sum(buf)) / float(len(buf))
+                        else:
+                            win_rate = m.get('cum_learning_win_rate')
+                    except Exception:
+                        win_rate = m.get('cum_learning_win_rate')
                     writer.writerow([
                         self.episode_idx,
                         m.get("avg_rank"), m.get("first_rate"), m.get("episode_len"), m.get("phase_acc"),
                         m.get("phase_win_rate"), m.get("phase_wins"), m.get("phase_attempts"), m.get("cum_phase_win_rate")
-                    ])
+                        ] + [
+                            m.get('arena_latest_count'), m.get('arena_past_count'), m.get('arena_rule_count'),
+                            m.get('learning_player_win'), win_rate
+                        ])
         except Exception as e:
             print(f"[TrainingLogger] write_csv_summaries failed: {e}")
 

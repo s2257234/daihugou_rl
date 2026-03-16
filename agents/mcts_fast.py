@@ -5,6 +5,22 @@ Otherwise, provide a pure-Python fallback with identical API.
 """
 from __future__ import annotations
 
+_FALLBACK_LOGGED = set()
+
+def _log_fallback_once(key: str, msg: str, exc: Exception | None = None):
+    if key in _FALLBACK_LOGGED:
+        return
+    _FALLBACK_LOGGED.add(key)
+    try:
+        if exc is not None:
+            print(f"{msg} ({type(exc).__name__}: {exc})")
+        else:
+            print(msg)
+    except Exception:
+        # 最低限の安全策
+        pass
+
+_FAST_IMPORT_ERROR = None
 try:
     # Compiled module produced from _mcts_fast.pyx
     from agents._mcts_fast import (
@@ -12,10 +28,14 @@ try:
         puct_backup_generic as _backup_generic,
         puct_backup_scalar as _backup_scalar,
     )
-except Exception:  # pragma: no cover
+except Exception as e:  # pragma: no cover
+    _FAST_IMPORT_ERROR = e
     _fast = None
     _backup_generic = None
     _backup_scalar = None
+
+if _FAST_IMPORT_ERROR is not None:
+    _log_fallback_once("cython_import", "[mcts-fallback] Cython MCTS extension unavailable; using pure-Python paths", _FAST_IMPORT_ERROR)
 
 def puct_select_index_fast(priors, values, visits, virtual_counts, c_puct: float, total_visits: int):
     """Return index of best child by PUCT. Fallback to Python if Cython not present.
@@ -33,6 +53,7 @@ def puct_select_index_fast(priors, values, visits, virtual_counts, c_puct: float
         try:
             return int(_fast(priors, values, visits, virtual_counts, float(c_puct), int(total_visits)))
         except Exception:
+            # エラー時は自動的にPythonフォールバックへ（agents/mcts.py側でハンドリング済み）
             pass
     # Pure-Python fallback
     n = len(priors)
@@ -61,8 +82,10 @@ def puct_backup_scalar(node, leaf_value):
     if _backup_scalar is not None:
         try:
             return _backup_scalar(node, float(leaf_value))
-        except Exception:
-            pass
+        except Exception as e:
+            _log_fallback_once("backup_scalar_exception", "[mcts-fallback] puct_backup_scalar failed; using Python fallback", e)
+    else:
+        _log_fallback_once("backup_scalar_missing", "[mcts-fallback] puct_backup_scalar not available; using Python fallback")
     # Fallback
     try:
         v = float(leaf_value)
@@ -92,8 +115,10 @@ def puct_backup_generic(node, leaf_value):
     if _backup_generic is not None:
         try:
             return _backup_generic(node, leaf_value)
-        except Exception:
-            pass
+        except Exception as e:
+            _log_fallback_once("backup_generic_exception", "[mcts-fallback] puct_backup_generic failed; using Python fallback", e)
+    else:
+        _log_fallback_once("backup_generic_missing", "[mcts-fallback] puct_backup_generic not available; using Python fallback")
     # Python fallback
     cur = node
     while cur is not None:

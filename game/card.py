@@ -105,8 +105,14 @@ class Card:
         suit = s[0]
         rank_part = s[1:]
         map_face = {'A':1,'J':11,'Q':12,'K':13}
+        rank = None
         try:
-            rank = map_face.get(rank_part.upper(), int(rank_part))
+            # まずmap_faceをチェック（int()の前に）
+            rank_upper = rank_part.upper()
+            if rank_upper in map_face:
+                rank = map_face[rank_upper]
+            else:
+                rank = int(rank_part)
         except Exception:
             rank = None
         return Card(suit=suit, rank=rank, is_joker=False if rank is not None else True)

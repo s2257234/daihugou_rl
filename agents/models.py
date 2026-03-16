@@ -8,7 +8,21 @@
 ====================================
 1. 入力特徴 (full_input のみ / 簡易入力廃止)
     - 形式: 1 次元ベクトル (float32) 長さ full_feature_dim
-    - 最新レイアウト v5 (Belief/PlayHistory を除去 + OpponentDiscards + PassMatrix 拡張): 72N + 59
+    - 最新レイアウト v9 (しばり特徴追加): 73N + 79
+        * Self 55
+        * OppSummary 5(N-1)
+        * Field 27 (revolution 1 + combo 7 + rank_base 13 + field_size_norm 1 + shibari 5)
+        * FieldCards 53
+        * Turn N
+        * OpponentDiscards 53(N-1)
+        * PassMatrix 13(N-1)
+        * RankRemain 13
+        * JokerRemain 1
+        * is_leader 1
+        * last_actor_onehot N
+        合計: 55 + 27 + 53 + 13 + 1 + 1 + [5(N-1) + N + 53(N-1) + 13(N-1) + N] = 73N + 79
+    - 旧レイアウト v8 (is_leader + last_actor_onehot 追加): 73N + 74
+    - 旧レイアウト v5 (Belief/PlayHistory を除去 + OpponentDiscards + PassMatrix 拡張): 72N + 59
         * Self 55
         * OppSummary 5(N-1)
         * Field 22
@@ -80,6 +94,8 @@ import torch.nn as nn
 import torch.nn.init as init
 from torch import autograd
 
+from game.action_vocab import canonical_action_keys as _canonical_action_keys
+
 
 class SignalAugmentFunction(autograd.Function):
     @staticmethod
@@ -120,6 +136,22 @@ class SignalAugmentation(nn.Module):
 
 
 
+_MODEL_FALLBACK_LOGGED = set()
+
+
+def _log_model_fallback_once(key: str, msg: str, exc: Exception | None = None) -> None:
+    if key in _MODEL_FALLBACK_LOGGED:
+        return
+    _MODEL_FALLBACK_LOGGED.add(key)
+    try:
+        if exc is not None:
+            print(f"{msg} ({type(exc).__name__}: {exc})")
+        else:
+            print(msg)
+    except Exception:
+        pass
+
+
 class PolicyValueNet(nn.Module):
     def __init__(self,
                  max_policy_size: int = 128,
@@ -130,7 +162,7 @@ class PolicyValueNet(nn.Module):
                  full_feature_dim: Optional[int] = None,
                  enable_hand_prediction_head: bool = True,
                  context_out_dim: int = 128,
-                 signal_noise_std: float = 0.2):
+                 signal_noise_std: float = 0.0):
         """Policy-Value Net (フル特徴専用)
 
         簡易入力 (hand_size/field_size/turn_onehot) のフォールバックを廃止し、常に
@@ -147,11 +179,12 @@ class PolicyValueNet(nn.Module):
         self.device = torch.device(device) if device else torch.device("cpu")
         self.use_full_features = True
 
-        # ---- Feature partition (v8 layout: added is_leader + last_actor_onehot) ----
+        # ---- Feature partition (v9 layout: added shibari features) ----
         # Self: 55
         self.self_dim = 55
-        # Context (v6 base): OppSummary 5*(N-1) + Field 22 + FieldCards 53 + Turn N
-        base_context_dim = 5 * (num_players - 1) + 22 + 53 + num_players
+        # Context (v6 base): OppSummary 5*(N-1) + Field 27 + FieldCards 53 + Turn N
+        # Note: Field expanded from 22 to 27 (added shibari: 1 active bit + 4 suit bits)
+        base_context_dim = 5 * (num_players - 1) + 27 + 53 + num_players
         # Extensions:
         #   OpponentDiscards: 53*(N-1)
         #   PassMatrix: 13*(N-1)
@@ -168,8 +201,8 @@ class PolicyValueNet(nn.Module):
         self.context_dim = (base_context_dim + self.opponent_discards_dim + self.pass_matrix_dim
                             + self.rank_remain_dim + self.joker_remain_dim
                             + self.is_leader_dim + self.last_actor_dim)
-        # Expected full feature dimension (v8):
-        # 55 + [5*(N-1) + 22 + 53 + N + 53*(N-1) + 13*(N-1) + 13 + 1 + 1 + N] = 73N + 74
+        # Expected full feature dimension (v9):
+        # 55 + [5*(N-1) + 27 + 53 + N + 53*(N-1) + 13*(N-1) + 13 + 1 + 1 + N] = 73N + 79
         self.full_feature_dim = int(self.self_dim + self.context_dim)
         # 先に context_out_dim を確定させておく（旧 ckpt 分岐で利用するため）
         self.context_out_dim = int(context_out_dim)
@@ -253,6 +286,7 @@ class PolicyValueNet(nn.Module):
             # 1層目: 特徴抽出 & 圧縮
             nn.Linear(h, h),
             nn.ReLU(),
+            
             # 2層目: スカラー出力 (BCEWithLogitsLoss用ロジット)
             nn.Linear(h, 1)
         )
@@ -269,28 +303,7 @@ class PolicyValueNet(nn.Module):
             )
         else:
             self.hand_head = None  # type: ignore[assignment]
-        
-        # 重みの明示的な初期化（ゼロ初期化問題の回避）
-        self._initialize_weights()
-        
         self.to(self.device)
-    
-    def _initialize_weights(self):
-        """ネットワークの重みを明示的に初期化する。
-        
-        Xavier/Kaiming初期化を使用してゼロ初期化問題を回避する。
-        """
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                # Kaiming He初期化（ReLU用）
-                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0.0)
-            elif isinstance(module, nn.LayerNorm):
-                if module.weight is not None:
-                    nn.init.constant_(module.weight, 1.0)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0.0)
 
     def _encode_state(self, state: Dict[str, Any]):
         # フル特徴必須: full_input か full_compact が無ければ例外
@@ -320,6 +333,11 @@ class PolicyValueNet(nn.Module):
                     # 無意味に例外を握り潰さず、適切に処理する
                     import warnings
                     warnings.warn(f"Failed to convert full_compact to full_input: {e}", RuntimeWarning)
+                    _log_model_fallback_once(
+                        "full_compact_convert_failed",
+                        "[model-fallback] full_compact conversion failed; will rely on full_input or raise",
+                        e,
+                    )
                     # full_inputが設定されなかった場合、後続の処理で適切にエラーが発生する
             arr = state.get('full_input')
             if arr is None:
@@ -419,14 +437,7 @@ class PolicyValueNet(nn.Module):
             h = self.backbone(x.new_zeros(x.size(0), self.backbone_in_dim))
             return self.policy_head(h), self.value_head(h)
         self_feat, context_feat = parts
-        # Defensive: ensure each part is on model device
-        # ensure parts are on model device
-        try:
-            self_feat = self_feat.to(dev)
-            context_feat = context_feat.to(dev)
-        except Exception:
-            # best-effort move; if it fails, let subsequent ops raise
-            pass
+        # parts are already on the same device as `x` (moved above), no-op
         self_emb = self.self_encoder(self_feat)
         context_emb = self.context_encoder(context_feat)
         combined = torch.cat([self_emb, context_emb], dim=1)
@@ -549,12 +560,17 @@ class PolicyValueNet(nn.Module):
             with _t.no_grad():
                 with _t.amp.autocast('cuda', enabled=_use_amp):
                     logits_full, value_vec_logits = self.forward(state)
-        except Exception:
+        except Exception as e:
             # フォールバック（AMP なし / 例外吸収）
+            _log_model_fallback_once(
+                "evaluate_amp_fallback",
+                "[model-fallback] evaluate AMP failed; fallback to non-AMP forward",
+                e,
+            )
             logits_full, value_vec_logits = self.forward(state)
 
         n = len(legal_actions) if legal_actions is not None else 0
-        # policy ロジットを legal 数に合わせて切り出し（不足は 0-padding）
+        # GPU 上で policy を softmax 処理し、確率値のみを CPU 転送（最適化）
         if hasattr(logits_full, 'shape'):
             import torch as _t
             if logits_full.shape[0] < n:
@@ -562,51 +578,60 @@ class PolicyValueNet(nn.Module):
                 logits_sel = _t.cat([logits_full, pad], dim=0)
             else:
                 logits_sel = logits_full[:n]
-            policy_logits = logits_sel.detach().cpu().tolist()
+            # GPU 上で softmax を実行してから CPU へ転送（1回のみ）
+            policy_probs = _t.softmax(logits_sel, dim=0)
+            policy_logits = policy_probs.cpu().tolist()
         else:
             policy_logits = list(logits_full)[:n]
             if len(policy_logits) < n:
                 policy_logits += [0.0] * (n - len(policy_logits))
 
-        # value を Sigmoid で確率化して単一スカラーを返却
+        # GPU 上で value を sigmoid 処理してから CPU 転送（最適化）
         try:
             import torch as _t
             if isinstance(value_vec_logits, _t.Tensor):
                 v = value_vec_logits
+                # GPU 上で sigmoid を実行
+                v_prob_tensor = _t.sigmoid(v)
+                # スカラー値を取得（1回の CPU 転送）
                 if v.dim() == 0:
-                    v_prob = float(_t.sigmoid(v).detach().cpu().item())
+                    v_prob = float(v_prob_tensor.item())
                 elif v.dim() == 1:
-                    # 1D の場合は先頭要素を採用（バッチでの単一サンプル想定）
-                    v_prob = float(_t.sigmoid(v[0]).detach().cpu().item()) if v.numel() > 0 else float(_t.sigmoid(v).detach().cpu().item())
+                    v_prob = float(v_prob_tensor[0].item()) if v.numel() > 0 else float(v_prob_tensor.item())
                 else:
-                    # 予期せぬ高次元は平均化して安全側に処理
-                    v_prob = float(_t.sigmoid(v.mean()).detach().cpu().item())
+                    v_prob = float(v_prob_tensor.mean().item())
             else:
                 raw = value_vec_logits.tolist() if hasattr(value_vec_logits, 'tolist') else list(value_vec_logits)
                 import math as _m
                 first = raw[0] if isinstance(raw, (list, tuple)) and raw else raw
                 v_prob = float(1.0 / (1.0 + _m.exp(-float(first))))
-        except Exception:
+        except Exception as e:
             # フォールバック: 中立値 0.5
+            _log_model_fallback_once(
+                "evaluate_value_fallback",
+                "[model-fallback] evaluate value decode failed; using 0.5",
+                e,
+            )
             v_prob = 0.5
 
         return policy_logits, v_prob
 
+    def canonical_action_keys(self) -> List[str]:
+        """Return the full canonical action vocabulary in deterministic order."""
+        keys = list(_canonical_action_keys(include_pass=True))
+        max_k = int(getattr(self, 'max_policy_size', len(keys)) or len(keys))
+        if max_k < len(keys):
+            _log_model_fallback_once(
+                "canonical_action_keys_truncated",
+                f"[model-fallback] canonical_action_keys truncated: max_policy_size={max_k} < vocab={len(keys)}",
+            )
+            return keys[:max_k]
+        if max_k > len(keys):
+            # pad with PASS if larger than vocab
+            keys.extend(['PASS'] * (max_k - len(keys)))
+        return keys
+
     def save(self, path: str, *, force_sync: bool = False, logger=None):
-        # 保存前に親ディレクトリを作成（torch.save()が親ディレクトリを自動作成しない場合があるため）
-        try:
-            import os
-            parent_dir = os.path.dirname(path)
-            if parent_dir and not os.path.exists(parent_dir):
-                os.makedirs(parent_dir, exist_ok=True)
-        except Exception as e:
-            # ディレクトリ作成失敗時もログを記録
-            try:
-                if logger:
-                    logger.log_text(f"[save] WARNING: Failed to create parent directory for {path}: {e}")
-            except Exception:
-                pass
-        
         # state_dict()を取得
         state_dict = self.state_dict()
         
@@ -742,6 +767,26 @@ class PolicyValueNet(nn.Module):
                 return
         except Exception:
             pass
+        # 防御的措置: 学習中に複数回上書きされがちな 'policy_value_best.pt' への
+        # 中間保存を抑止する。最終保存（force_sync=True）や明示的に許可された場合は実行。
+        try:
+            best_defer = bool(_CFG.get('defer_best_mid_save', True)) if isinstance(_CFG, dict) else True
+        except Exception:
+            best_defer = True
+        try:
+            if best_defer and (not force_sync) and str(path).endswith('policy_value_best.pt'):
+                try:
+                    # ログは残すが保存はスキップ
+                    if logger:
+                        try:
+                            logger.log_text(f"[save] INFO: Best-model save deferred by config: {path}")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
         enable_async = bool(_CFG.get("enable_async_io", False))
         # 原子的保存 (tmp -> replace) の際は同期保存が必要。
         # path が .tmp で終わる場合や force_sync=True の場合は async を無効化。
@@ -754,58 +799,100 @@ class PolicyValueNet(nn.Module):
                     return
             except Exception:
                 pass
-        
         # torch.save()実行
         try:
             torch.save(ckpt, path)
             
-            # 保存後の検証: 保存されたチェックポイントが正しく読み込めるか確認
+            # 保存後の検証: 設定でスキップ指定されていれば検証を行わない
             try:
-                verify_ckpt = torch.load(path, map_location='cpu', weights_only=False)
-                verify_state_dict = verify_ckpt.get('state_dict', verify_ckpt) if 'state_dict' in verify_ckpt else verify_ckpt
+                skip_verify = bool(_CFG.get("skip_checkpoint_verify", False)) if isinstance(_CFG, dict) else False
+            except Exception:
+                skip_verify = False
+
+            if skip_verify:
+                # 検証をスキップする代わりに簡易ログを残す（重複抑止あり）
+                try:
+                    _now_ts = __import__('time').time()
+                    last = globals().get('_LAST_SAVE_LOG', None)
+                    if last is None or not isinstance(last, dict):
+                        last = {'path': None, 'ts': 0.0}
+                    if last.get('path') != path or (_now_ts - float(last.get('ts', 0.0))) > 10.0:
+                        if logger:
+                            try:
+                                logger.log_text(f"[save] INFO: Checkpoint saved (verification skipped by config): {path}")
+                            except Exception:
+                                pass
+                        globals()['_LAST_SAVE_LOG'] = {'path': path, 'ts': _now_ts}
+                except Exception:
+                    try:
+                        if logger:
+                            logger.log_text(f"[save] INFO: Checkpoint saved (verification skipped by config): {path}")
+                    except Exception:
+                        pass
                 
-                # 重要なパラメータが保存されているか確認
-                missing_critical = []
-                for key in critical_params:
-                    if key not in verify_state_dict:
-                        missing_critical.append(key)
-                
-                if missing_critical:
-                    warning_msg = f"[save] WARNING: Critical parameters missing in saved checkpoint: {missing_critical[:5]}{'...' if len(missing_critical) > 5 else ''}"
+            else:
+                # デフォルト: 保存後に再ロードして簡易検証を行う（元の挙動）
+                try:
+                    verify_ckpt = torch.load(path, map_location='cpu', weights_only=False)
+                    verify_state_dict = verify_ckpt.get('state_dict', verify_ckpt) if 'state_dict' in verify_ckpt else verify_ckpt
+                    
+                    # 重要なパラメータが保存されているか確認
+                    missing_critical = []
+                    for key in critical_params:
+                        if key not in verify_state_dict:
+                            missing_critical.append(key)
+                    
+                    if missing_critical:
+                        warning_msg = f"[save] WARNING: Critical parameters missing in saved checkpoint: {missing_critical[:5]}{'...' if len(missing_critical) > 5 else ''}"
+                        if logger:
+                            try:
+                                logger.log_text(warning_msg)
+                            except Exception:
+                                pass
+                        print(warning_msg)
+                    else:
+                        # 値が正しく保存されているか確認（最初の数個のパラメータのみ）
+                        verify_ok = True
+                        for key in critical_params[:3]:  # 最初の3つだけ確認
+                            if key in state_dict and key in verify_state_dict:
+                                orig = state_dict[key]
+                                saved = verify_state_dict[key]
+                                if hasattr(orig, 'abs') and hasattr(saved, 'abs'):
+                                    orig_max = orig.abs().max().item()
+                                    saved_max = saved.abs().max().item()
+                                    if abs(orig_max - saved_max) > 1e-6:
+                                        verify_ok = False
+                                        break
+                        
+                        # Throttle duplicate save-log entries: avoid repeating identical messages
+                        try:
+                            _now_ts = __import__('time').time()
+                            last = globals().get('_LAST_SAVE_LOG', None)
+                            if last is None or not isinstance(last, dict):
+                                last = {'path': None, 'ts': 0.0}
+                            # log if path changed or more than 10s passed since last identical message
+                            if last.get('path') != path or (_now_ts - float(last.get('ts', 0.0))) > 10.0:
+                                if logger:
+                                    try:
+                                        logger.log_text(f"[save] Checkpoint saved and verified successfully: {path}")
+                                    except Exception:
+                                        pass
+                                globals()['_LAST_SAVE_LOG'] = {'path': path, 'ts': _now_ts}
+                        except Exception:
+                            try:
+                                if logger:
+                                    logger.log_text(f"[save] Checkpoint saved and verified successfully: {path}")
+                            except Exception:
+                                pass
+                except Exception as verify_e:
+                    # 検証エラーは保存を失敗としない（警告のみ）
+                    warning_msg = f"[save] WARNING: Checkpoint verification failed: {verify_e}"
                     if logger:
                         try:
                             logger.log_text(warning_msg)
                         except Exception:
                             pass
                     print(warning_msg)
-                else:
-                    # 値が正しく保存されているか確認（最初の数個のパラメータのみ）
-                    verify_ok = True
-                    for key in critical_params[:3]:  # 最初の3つだけ確認
-                        if key in state_dict and key in verify_state_dict:
-                            orig = state_dict[key]
-                            saved = verify_state_dict[key]
-                            if hasattr(orig, 'abs') and hasattr(saved, 'abs'):
-                                orig_max = orig.abs().max().item()
-                                saved_max = saved.abs().max().item()
-                                if abs(orig_max - saved_max) > 1e-6:
-                                    verify_ok = False
-                                    break
-                    
-                    if verify_ok and logger:
-                        try:
-                            logger.log_text(f"[save] Checkpoint saved and verified successfully: {path}")
-                        except Exception:
-                            pass
-            except Exception as verify_e:
-                # 検証エラーは保存を失敗としない（警告のみ）
-                warning_msg = f"[save] WARNING: Checkpoint verification failed: {verify_e}"
-                if logger:
-                    try:
-                        logger.log_text(warning_msg)
-                    except Exception:
-                        pass
-                print(warning_msg)
                 
         except Exception as e:
             error_msg = f"[save] ERROR: Exception during torch.save(): {e}"
@@ -824,12 +911,22 @@ class PolicyValueNet(nn.Module):
         """チェックポイントをロード（古いフォーマット対応、strict=False）"""
         try:
             ckpt = torch.load(path, map_location=map_location or "cpu", weights_only=True)
-        except TypeError:
+        except TypeError as e:
             # 古い PyTorch では weights_only 引数が存在しないため、従来ロードにフォールバック
+            _log_model_fallback_once(
+                "load_weights_only_unsupported",
+                "[model-fallback] torch.load weights_only unsupported; fallback to legacy load",
+                e,
+            )
             ckpt = torch.load(path, map_location=map_location or "cpu")
-        except Exception:
+        except Exception as e:
             # weights_only=True で失敗するレガシー ckpt 用フォールバック。
             # weights_only=False による FutureWarning を一時的に抑制する。
+            _log_model_fallback_once(
+                "load_weights_only_failed",
+                "[model-fallback] torch.load weights_only failed; fallback to weights_only=False",
+                e,
+            )
             with warnings.catch_warnings():
                 warnings.filterwarnings(
                     "ignore",
@@ -1026,7 +1123,11 @@ class PolicyValueNet(nn.Module):
         try:
             ms = model.state_dict()
             # value_head構造の互換性処理（旧LayerNorm付き ckpt → 現行2層MLP）
-            _convert_legacy_value_head(state_dict, ms)
+            if _convert_legacy_value_head(state_dict, ms):
+                _log_model_fallback_once(
+                    "convert_legacy_value_head",
+                    "[model-fallback] converted legacy value_head to current layout",
+                )
 
             # strict=False で互換性のあるパラメータのみロード（古いチェックポイント対応）
             missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
@@ -1067,8 +1168,13 @@ class PolicyValueNet(nn.Module):
             except Exception as verify_e:
                 # 検証エラーはロードを失敗としない（警告のみ）
                 print(f"[load] WARNING: Load verification failed: {verify_e}")
-        except TypeError:
+        except TypeError as e:
             # 古いPyTorchでstrict引数がない場合
+            _log_model_fallback_once(
+                "load_strict_unsupported",
+                "[model-fallback] load_state_dict strict unsupported; retry without strict",
+                e,
+            )
             model.load_state_dict(state_dict)
         except RuntimeError as e:
             # Handle potential shape mismatch for value_head when migrating from
@@ -1113,7 +1219,12 @@ class PolicyValueNet(nn.Module):
                 # try load again permissively
                 try:
                     model.load_state_dict(sd, strict=False)
-                except Exception:
+                except Exception as e2:
+                    _log_model_fallback_once(
+                        "load_state_dict_retry",
+                        "[model-fallback] load_state_dict strict=False failed; retrying strict",
+                        e2,
+                    )
                     model.load_state_dict(sd)
             except Exception:
                 # fallback: re-raise original

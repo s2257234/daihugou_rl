@@ -103,10 +103,8 @@ def run_mcts(agent: Any, env: Any, *, training: bool) -> Any:
             used = agent._apply_from_det_pool(e_clone, original_env, root_pid_)
             if used:
                 return
-        try:
-            agent._det_stats['pool_fallback_inline'] = agent._det_stats.get('pool_fallback_inline', 0) + 1
-        except Exception:
-            pass
+        # プールが空の場合はインラインで割当生成（正常動作なのでログ不要）
+        agent._det_stats['pool_fallback_inline'] = agent._det_stats.get('pool_fallback_inline', 0) + 1
         agent._inline_determinize(e_clone, original_env, root_pid_)
 
     add_dirichlet_flag = True if training else bool(agent.config.get('inference_dirichlet', False))
@@ -123,6 +121,48 @@ def run_mcts(agent: Any, env: Any, *, training: bool) -> Any:
                     scale = float(agent.config.get('opponent_sim_scale', 0.125) or 0.125)
                     min_sim = int(agent.config.get('opponent_sim_min', 1) or 1)
                     sims_to_run = max(min_sim, int(round(sims_to_run * max(0.0, scale))))
+        else:
+            # 推論時の動的シミュレーション増強（重要局面判定）
+            # 過去モデル（checkpoint_name属性を持つ）には適用せず、学習済み最新モデルのみに適用
+            is_past_model = hasattr(agent, 'checkpoint_name') and agent.checkpoint_name is not None
+            if not is_past_model and agent.config.get('inference_boost_enable', False):
+                boost_applied = False
+                try:
+                    # 合法手を取得して局面の重要度を判定
+                    legal_actions = legal_fn(env_copy)
+                    num_legal = len(legal_actions) if legal_actions else 0
+                    
+                    # 条件1: 最初の手出し（場が空）
+                    if agent.config.get('inference_boost_on_first_play', True):
+                        try:
+                            field = getattr(env_copy.game, 'current_field', [])
+                            if not field or len(field) == 0:
+                                boost_applied = True
+                        except Exception:
+                            pass
+                    
+                    # 条件2: 革命直後
+                    if not boost_applied and agent.config.get('inference_boost_on_revolution', True):
+                        try:
+                            is_revolution = bool(getattr(getattr(env_copy.game, 'rule_checker', None), 'revolution', False))
+                            # 革命フラグが立っている場合に増強
+                            if is_revolution:
+                                boost_applied = True
+                        except Exception:
+                            pass
+                    
+                    # 条件3: 合法手が多い（高分岐）
+                    if not boost_applied and agent.config.get('inference_boost_on_high_branch', True):
+                        branch_threshold = int(agent.config.get('inference_boost_branch_threshold', 8))
+                        if num_legal >= branch_threshold:
+                            boost_applied = True
+                    
+                    # 増強適用
+                    if boost_applied:
+                        multiplier = float(agent.config.get('inference_boost_multiplier', 3.0))
+                        sims_to_run = int(sims_to_run * multiplier)
+                except Exception:
+                    pass
     except Exception:
         sims_to_run = int(sims_to_run)
 
@@ -140,6 +180,7 @@ def run_mcts(agent: Any, env: Any, *, training: bool) -> Any:
         batch_eval_size=getattr(agent, 'mcts_batch_eval_size', 1),
         transposition_table=TT,
         determinize_fn=_determinize if det_enable else None,
+        fpu_reduction=float(agent.config.get('fpu_reduction', 0.0)),
         early_stop_enable=bool(agent.config.get('mcts_early_stop_enable', False)),
         early_stop_min_sims=int(agent.config.get('mcts_early_stop_min_sims', 16)),
         early_stop_visit_ratio=float(agent.config.get('mcts_early_stop_visit_ratio', 0.75)),

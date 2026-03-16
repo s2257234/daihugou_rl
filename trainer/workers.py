@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from agents.factory import create_env_and_agents
 from agents.drl_agent import AlphaZeroAgent
+from agents.rule_based_agent import RuleBasedAgent
 
 
 VALUE_U8_NONE = 0xFF  # Legacy constant for backwards compatibility
@@ -71,6 +72,9 @@ class SelfplayDaemonWorker:
         self.logger = None
         # ローカル通番 (metrics interval 判定用)
         self._local_episode_counter = 0
+        # 累積統計
+        self._cum_learning_wins = 0
+        self._cum_episodes = 0
 
     # ---------- setup utilities ----------
     def _setup_threads_env(self):
@@ -338,6 +342,13 @@ class SelfplayDaemonWorker:
             if hasattr(ag, 'reset_episode'):
                 ag.reset_episode()
         t_game_start = time.time()
+        # エピソード開始時点でのアリーナ割当カウント
+        try:
+            arena_latest_count = int(sum(1 for ag in self.agents if bool(getattr(ag, 'is_using_latest_model', False))))
+            arena_rule_count = int(sum(1 for ag in self.agents if isinstance(ag, RuleBasedAgent)))
+            arena_past_count = max(0, len(self.agents) - arena_latest_count - arena_rule_count)
+        except Exception:
+            arena_latest_count = arena_rule_count = arena_past_count = 0
         step_count = 0
         prev_rankings: List[int] = list(getattr(self.env.game, "rankings", []))
         while not getattr(self.env.game, "done", False):
@@ -416,6 +427,40 @@ class SelfplayDaemonWorker:
                 'cum_phase_win_rate': cum_phase_rate,
                 'avg_moves_per_game': step_count,
             }
+            # --- しばり（shibari）統計をエピソード指標に追加 ---
+            try:
+                ep_metrics['shibari_triggered'] = int(getattr(self.env.game, 'shibari_triggered_count', 0) or 0)
+                ep_metrics['shibari_passes'] = int(getattr(self.env.game, 'shibari_pass_count', 0) or 0)
+                ep_metrics['shibari_turns'] = int(getattr(self.env.game, 'turn_count_in_shibari', 0) or 0)
+            except Exception:
+                ep_metrics['shibari_triggered'] = 0
+                ep_metrics['shibari_passes'] = 0
+                ep_metrics['shibari_turns'] = 0
+            # エピソード単位のアリーナ割当カウントと学習プレイヤー勝敗
+            try:
+                learning_win = 1 if (rankings and rankings[0] == self.learning_pid) else 0
+            except Exception:
+                learning_win = 0
+            try:
+                # 累積更新
+                self._cum_episodes = int(getattr(self, '_cum_episodes', 0)) + 1
+                self._cum_learning_wins = int(getattr(self, '_cum_learning_wins', 0)) + int(learning_win)
+                cum_learning_win_rate = float(self._cum_learning_wins) / max(1, int(self._cum_episodes))
+            except Exception:
+                cum_learning_win_rate = None
+            ep_metrics.update({
+                'arena_latest_count': arena_latest_count,
+                'arena_past_count': arena_past_count,
+                'arena_rule_count': arena_rule_count,
+                'learning_player_win': learning_win,
+                'cum_learning_win_rate': cum_learning_win_rate,
+            })
+            # 簡易テキストログにも出力
+            try:
+                if self.logger:
+                    self.logger.log_text(f"[arena] ep={ep_index+1} latest={arena_latest_count} past={arena_past_count} rule={arena_rule_count} learning_win={learning_win} cum_win_rate={cum_learning_win_rate}")
+            except Exception:
+                pass
             # 追加計測: forward / game time
             if bool(self.config.get('measure_forward_time', False)):
                 try:
@@ -442,11 +487,20 @@ class SelfplayDaemonWorker:
                         self.logger.log_text(f"[perf-ep] ep={ep_index+1} t_forward_ms={ep_metrics.get('t_forward_avg_ms')} t_game_sec={ep_metrics.get('t_game_sec')} moves={step_count}")
                     except Exception:
                         pass
-            if self.logger:
-                try:
-                    self.logger.log_episode(ep_metrics)
-                except Exception:
-                    pass
+            try:
+                if self.logger:
+                    try:
+                        self.logger.log_episode(ep_metrics)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        # Send episode metrics to parent process for central logging
+                        self.event_queue.put(("ep_metrics", ep_metrics), block=False)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except Exception:
             pass
         # 送信（通常は flush するが、呼び出し側で制御できるようにフラグ化）

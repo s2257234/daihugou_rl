@@ -91,6 +91,13 @@ def maybe_start_det_pool(agent: Any, env: Any) -> None:
         agent._det_pool_lock = threading.Lock()
         agent._det_stop_event = threading.Event()
 
+        # ワーカが参照するベース環境を確実にセット
+        try:
+            if env is not None:
+                agent.env_ref = env
+        except Exception:
+            pass
+
         g = env.game
         agent._det_root_signature = {
             'num_players': len(getattr(g, 'players', [])),
@@ -99,6 +106,25 @@ def maybe_start_det_pool(agent: Any, env: Any) -> None:
         }
         agent._det_pool_thread = threading.Thread(target=agent._determinization_worker, daemon=True)
         agent._det_pool_thread.start()
+        # プールが必要数貯まるまで明示的に待機（安全策）
+        try:
+            import time as _time
+            warmup_count = int(agent.config.get('det_pool_warmup_count', 1) or 1)
+            warmup_timeout = float(agent.config.get('det_pool_warmup_timeout_sec', 0.5) or 0.5)
+            if warmup_count > 0:
+                _start = _time.time()
+                while True:
+                    if getattr(agent, '_det_stop_event', None) is None or agent._det_stop_event.is_set():
+                        break
+                    with agent._det_pool_lock:
+                        cur = len(agent._det_pool) if agent._det_pool is not None else 0
+                    if cur >= warmup_count:
+                        break
+                    if warmup_timeout > 0 and (_time.time() - _start) >= warmup_timeout:
+                        break
+                    _time.sleep(0.001)
+        except Exception:
+            pass
         try:
             if getattr(agent, 'logger', None):
                 agent.logger.log_text(
@@ -164,6 +190,37 @@ def determinization_worker(agent: Any) -> None:
                     time.sleep(0.001)
                     continue
 
+                # assignmentの検証: 文字列が正しくパース可能かチェック
+                if assignment and 'hands' in assignment:
+                    from game.card import Card
+                    is_valid = True
+                    try:
+                        for pid, cards_str in assignment['hands'].items():
+                            for s in cards_str:
+                                # 文字列が空でないことを確認
+                                if not isinstance(s, str) or len(s) == 0:
+                                    is_valid = False
+                                    break
+                                # Card.from_stringでパースして検証
+                                parsed = Card.from_string(s)
+                                # パース失敗を検出（JOKERでないのにis_joker=True）
+                                if parsed.is_joker and not s.upper().startswith('JOKER'):
+                                    is_valid = False
+                                    try:
+                                        agent._det_stats['pool_invalid_gen'] = agent._det_stats.get('pool_invalid_gen', 0) + 1
+                                    except Exception:
+                                        pass
+                                    break
+                            if not is_valid:
+                                break
+                    except Exception:
+                        is_valid = False
+                    
+                    if not is_valid:
+                        # 不正なassignmentは破棄
+                        time.sleep(0.001)
+                        continue
+
                 with agent._det_pool_lock:
                     if len(agent._det_pool) < agent._det_cfg['capacity']:
                         agent._det_pool.append(assignment)
@@ -186,17 +243,40 @@ def apply_from_det_pool(agent: Any, e_clone: Any, original_env: Any, root_pid: i
         return False
     try:
         import random as _r
+        import time
 
-        with agent._det_pool_lock:
-            if not agent._det_pool:
-                return False
-            if agent._det_cfg['sampling'] == 'random':
-                idx = _r.randrange(len(agent._det_pool))
-                for _ in range(idx):
-                    agent._det_pool.append(agent._det_pool.popleft())
-                assignment = agent._det_pool.popleft()
-            else:
-                assignment = agent._det_pool.popleft()
+        # プールが空の場合、短時間待機してから再試行（最大3回）
+        max_retries = 3
+        for retry in range(max_retries):
+            with agent._det_pool_lock:
+                if agent._det_pool:
+                    # プールに割当がある - 取得
+                    if agent._det_cfg['sampling'] == 'random':
+                        idx = _r.randrange(len(agent._det_pool))
+                        for _ in range(idx):
+                            agent._det_pool.append(agent._det_pool.popleft())
+                        assignment = agent._det_pool.popleft()
+                    else:
+                        assignment = agent._det_pool.popleft()
+                    break
+                elif retry < max_retries - 1:
+                    # プールが空 - ロックを解放して少し待機
+                    pass
+                else:
+                    # 最終試行でも空 - inline_determinizeにフォールバック
+                    try:
+                        agent._det_stats['pool_fallback_empty'] = agent._det_stats.get('pool_fallback_empty', 0) + 1
+                        agent._det_stats['pool_fallback_reason'] = 'empty'
+                    except Exception:
+                        pass
+                    return False
+            
+            # ロック外で待機（生成ワーカーがプールを補充できるように）
+            if retry < max_retries - 1:
+                time.sleep(0.001)  # 1ms待機
+        else:
+            # ループが正常終了しなかった（通常ここには到達しない）
+            return False
 
         g_new = e_clone.game
         from game.card import Card
@@ -205,7 +285,29 @@ def apply_from_det_pool(agent: Any, e_clone: Any, original_env: Any, root_pid: i
             if pid == root_pid:
                 continue
             try:
-                g_new.players[pid].hand = [Card.from_string(s) if hasattr(Card, 'from_string') else Card(s) for s in cards_str]
+                # Card.from_stringがパース失敗時にJOKERを返すため、検証を追加
+                parsed_cards = []
+                for s in cards_str:
+                    card = Card.from_string(s) if hasattr(Card, 'from_string') else Card(s)
+                    # パース失敗の検出：元の文字列が'JOKER'でないのにis_joker=Trueになっている
+                    if card.is_joker and not s.upper().startswith('JOKER'):
+                        # パース失敗 - assignmentを破棄してFalseを返す（inline_determinizeにフォールバック）
+                        try:
+                            agent._det_stats['pool_parse_failures'] = agent._det_stats.get('pool_parse_failures', 0) + 1
+                            # 最初の10回だけログ出力
+                            if agent._det_stats['pool_parse_failures'] <= 10:
+                                print(f"[DetPool][WARN] Parse failure: '{s}' -> JOKER (expected non-JOKER)")
+                        except Exception:
+                            pass
+                        # プールに戻さない（不正なassignment）
+                        try:
+                            agent._det_stats['pool_fallback_parse'] = agent._det_stats.get('pool_fallback_parse', 0) + 1
+                            agent._det_stats['pool_fallback_reason'] = 'parse'
+                        except Exception:
+                            pass
+                        return False
+                    parsed_cards.append(card)
+                g_new.players[pid].hand = parsed_cards
             except Exception:
                 g_new.players[pid].hand = list(cards_str)
         try:
@@ -216,6 +318,11 @@ def apply_from_det_pool(agent: Any, e_clone: Any, original_env: Any, root_pid: i
     except Exception as e:
         try:
             print(f"[DetPool][ERROR] apply 失敗: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        try:
+            agent._det_stats['pool_fallback_exception'] = agent._det_stats.get('pool_fallback_exception', 0) + 1
+            agent._det_stats['pool_fallback_reason'] = 'exception'
         except Exception:
             pass
         return False
@@ -230,20 +337,62 @@ def build_single_determinization(agent: Any, e_clone: Any, original_env: Any, ro
         g_orig = original_env.game
         g_new = e_clone.game
         history = getattr(g_orig, '_action_history', []) or []
-        root_hand_ids = {str(c) for c in g_orig.players[root_pid].hand}
-        field_ids = {str(c) for c in getattr(g_orig, 'current_field', []) or []}
+        # Cardオブジェクトを直接扱う（文字列変換を避ける）
+        from game.card import Card
+        
+        root_hand_cards = list(g_orig.players[root_pid].hand)
+        field_cards = list(getattr(g_orig, 'current_field', []) or [])
+        root_hand_ids = {str(c) for c in root_hand_cards}
+        field_ids = {str(c) for c in field_cards}
 
-        all_cards: list[str] = []
+        # 全カードをCardオブジェクトとして収集
+        all_cards_objs = []
         try:
             if hasattr(g_orig, 'deck') and g_orig.deck:
-                all_cards = [str(c) for c in g_orig.deck]
+                deck_obj = g_orig.deck
+                # CardDeck は .cards に全カードを保持する
+                if hasattr(deck_obj, 'cards') and getattr(deck_obj, 'cards', None):
+                    all_cards_objs = list(deck_obj.cards)
+                else:
+                    all_cards_objs = list(deck_obj)
         except Exception:
             pass
-        if not all_cards:
+        if not all_cards_objs:
             for p in g_orig.players:
-                all_cards.extend(str(c) for c in p.hand)
-            all_cards.extend(field_ids)
-            all_cards = list(dict.fromkeys(all_cards))
+                all_cards_objs.extend(p.hand)
+            all_cards_objs.extend(field_cards)
+            # 重複除去（文字列IDで判定）
+            seen_ids = set()
+            unique_cards = []
+            skipped_cards = []
+            from game.card import SUITS
+            
+            for card in all_cards_objs:
+                card_id = str(card)
+                if card_id not in seen_ids:
+                    seen_ids.add(card_id)
+                    # Cardオブジェクトを正規化（suitが数値インデックスの場合、SUITS文字列に変換）
+                    if not getattr(card, 'is_joker', False):
+                        suit_val = getattr(card, 'suit', None)
+                        rank_val = getattr(card, 'rank', None)
+                        
+                        # suitが数値インデックス（0-3）の場合、SUITS文字列に変換
+                        if isinstance(suit_val, int) and 0 <= suit_val < len(SUITS):
+                            normalized_card = Card(suit=SUITS[suit_val], rank=rank_val, is_joker=False)
+                            unique_cards.append(normalized_card)
+                        elif suit_val in SUITS:
+                            # suitがすでに正しい文字列形式
+                            unique_cards.append(card)
+                        else:
+                            # 不正なsuit値でも、カードを保持（元のままで追加）
+                            # これはカード数を維持するため
+                            skipped_cards.append((str(card), suit_val, rank_val))
+                            unique_cards.append(card)
+                    else:
+                        # Jokerはそのまま追加
+                        unique_cards.append(card)
+            
+            all_cards_objs = unique_cards
 
         known = set(root_hand_ids) | field_ids
         for rid in getattr(g_orig, 'rankings', []):
@@ -253,7 +402,8 @@ def build_single_determinization(agent: Any, e_clone: Any, original_env: Any, ro
             act = h.get('action')
             if isinstance(act, (list, tuple)):
                 known.update(str(c) for c in act)
-        unknown_seed = [cid for cid in all_cards if cid not in known]
+        # 未知カードをCardオブジェクトのリストとして保持
+        unknown_seed = [card for card in all_cards_objs if str(card) not in known]
 
         # ===== パス制約の抽出（観測可能な情報に基づく） =====
         # 各プレイヤーがパスした場面で、場に出ていたカードを記録し、
@@ -359,9 +509,9 @@ def build_single_determinization(agent: Any, e_clone: Any, original_env: Any, ro
                     assignment_hands = {i: [] for i in opp_ids}
                     from game.card import Card
 
-                    def _card_index_from_str(cid: str) -> int:
+                    def _card_index_from_obj(c_obj) -> int:
+                        """CardオブジェクトからインデックスIDを取得"""
                         try:
-                            c_obj = Card.from_string(cid) if hasattr(Card, 'from_string') else Card(cid)
                             if getattr(c_obj, 'is_joker', False):
                                 return 52
                             suit_order = {'♠': 0, '♥': 1, '♦': 2, '♣': 3, 'S': 0, 'H': 1, 'D': 2, 'C': 3}
@@ -376,10 +526,10 @@ def build_single_determinization(agent: Any, e_clone: Any, original_env: Any, ro
 
                     # Step A (確定枠): 高確率カードを確率順にソートして割り当て
                     threshold = float(agent.config.get('hand_pred_deterministic_threshold', 0.95))
-                    candidate_list = []  # [(card_id, player_id, probability), ...]
+                    candidate_list = []  # [(card_obj, player_id, probability), ...]
                     
-                    for cid in unknown:
-                        idx = _card_index_from_str(cid)
+                    for card_obj in unknown:
+                        idx = _card_index_from_obj(card_obj)
                         for pid_ in opp_ids:
                             p_val = 0.0
                             try:
@@ -389,29 +539,31 @@ def build_single_determinization(agent: Any, e_clone: Any, original_env: Any, ro
                             except (KeyError, IndexError, TypeError, ValueError):
                                 p_val = 0.0
                             if p_val > 0.0:
-                                candidate_list.append((cid, pid_, p_val))
+                                candidate_list.append((card_obj, pid_, p_val))
                     
                     # 確率の降順でソート（高い確率から順に割り当て）
                     candidate_list.sort(key=lambda x: x[2], reverse=True)
                     
                     # Step A: 高確率カードを確定割り当て
-                    deterministic_cards = set()
-                    for cid, pid_, prob in candidate_list:
-                        if prob >= threshold and cid not in deterministic_cards:
+                    deterministic_cards = set()  # Cardオブジェクトのセット（IDで管理）
+                    for card_obj, pid_, prob in candidate_list:
+                        card_id = str(card_obj)
+                        if prob >= threshold and card_id not in {str(c) for c in deterministic_cards}:
                             if capacities.get(pid_, 0) > 0:
-                                assignment_hands[pid_].append(cid)
+                                assignment_hands[pid_].append(card_obj)  # Cardオブジェクトを格納
                                 capacities[pid_] -= 1
-                                deterministic_cards.add(cid)
+                                deterministic_cards.add(card_obj)
                     
                     # Step B (抽選枠): 残りのカードを確率分布に従って抽選
-                    remaining_unknown = [cid for cid in unknown if cid not in deterministic_cards]
+                    deterministic_ids = {str(c) for c in deterministic_cards}
+                    remaining_unknown = [card for card in unknown if str(card) not in deterministic_ids]
                     _r.shuffle(remaining_unknown)
                     
-                    for cid in remaining_unknown:
+                    for card_obj in remaining_unknown:
                         remaining_opps = [i for i in opp_ids if capacities[i] > 0]
                         if not remaining_opps:
                             break
-                        idx = _card_index_from_str(cid)
+                        idx = _card_index_from_obj(card_obj)
                         probs_raw = []
                         total = 0.0
                         for pid_ in remaining_opps:
@@ -438,25 +590,31 @@ def build_single_determinization(agent: Any, e_clone: Any, original_env: Any, ro
                             if r <= cum:
                                 chosen = pid_
                                 break
-                        assignment_hands[chosen].append(cid)
+                        assignment_hands[chosen].append(card_obj)  # Cardオブジェクトを保持
                         capacities[chosen] -= 1
 
                     # 未割り当てカードがあれば均等に配分
-                    leftover_unknown = [cid for cid in unknown if all(cid not in v for v in assignment_hands.values())]
+                    assigned_ids = set()
+                    for hand_list in assignment_hands.values():
+                        assigned_ids.update(str(c) for c in hand_list)
+                    leftover_unknown = [card for card in unknown if str(card) not in assigned_ids]
                     if leftover_unknown:
-                        for cid in leftover_unknown:
+                        for card_obj in leftover_unknown:
                             targets = [i for i in opp_ids if capacities[i] > 0]
                             if not targets:
                                 break
                             choice = _r.choice(targets)
-                            assignment_hands[choice].append(cid)
+                            assignment_hands[choice].append(card_obj)  # Cardオブジェクトを保持
                             capacities[choice] -= 1
 
                     # 割り当て結果の検証（枚数一致チェック）
                     mismatch = False
                     for i in opp_ids:
-                        if len(assignment_hands[i]) != len(g_new.players[i].hand):
+                        expected_count = len(g_new.players[i].hand)
+                        actual_count = len(assignment_hands[i])
+                        if actual_count != expected_count:
                             mismatch = True
+                            break
                             break
                     
                     if not mismatch:
@@ -482,6 +640,7 @@ def build_single_determinization(agent: Any, e_clone: Any, original_env: Any, ro
                     sz = len(p_new.hand)
                     pick = unknown[cursor:cursor + sz]
                     cursor += sz
+                    # Cardオブジェクトをそのまま保持
                     assignment_hands[i] = list(pick)
 
             # ===== パス制約の検証（観測と矛盾しない手札割当か） =====
@@ -492,16 +651,18 @@ def build_single_determinization(agent: Any, e_clone: Any, original_env: Any, ro
                 pidc = req['pid']
                 if pidc == root_pid or pidc is None:
                     continue
-                hand_ids = set(assignment_hands.get(pidc, []))
+                # assignment_handsはCardオブジェクトのリスト
+                hand_cards = assignment_hands.get(pidc, [])
+                hand_ids = {str(c) for c in hand_cards}
                 
                 # 手札のランクごとの枚数をカウント
                 counts = {}
                 has_joker = False
-                for cid in hand_ids:
-                    if 'JOKER' in cid.upper():
+                for card_obj in hand_cards:
+                    if getattr(card_obj, 'is_joker', False):
                         has_joker = True
                     else:
-                        rnk = rank_of(cid)
+                        rnk = int(getattr(card_obj, 'rank', 0))
                         counts[rnk] = counts.get(rnk, 0) + 1
                 
                 combo_type = req.get('combo_type')
@@ -562,30 +723,112 @@ def build_single_determinization(agent: Any, e_clone: Any, original_env: Any, ro
             if consistent:
                 if apply_direct:
                     from game.card import Card
-                    for pid, cards_str in assignment_hands.items():
+                    
+                    def _clone_card(c):
+                        """Cardオブジェクトをクローン"""
+                        if getattr(c, 'is_joker', False):
+                            return Card(is_joker=True)
+                        else:
+                            return Card(
+                                suit=getattr(c, 'suit', None),
+                                rank=getattr(c, 'rank', None),
+                                is_joker=False
+                            )
+                    
+                    for pid, cards_list in assignment_hands.items():
                         if pid == root_pid:
                             continue
-                        try:
-                            g_new.players[pid].hand = [Card.from_string(s) if hasattr(Card, 'from_string') else Card(s) for s in cards_str]
-                        except Exception:
-                            g_new.players[pid].hand = list(cards_str)
+                        g_new.players[pid].hand = [_clone_card(c) for c in cards_list]
                     return True, None
                 else:
+                    # apply_direct=Falseの場合、文字列IDに変換して返す
+                    # 検証: Cardオブジェクトが正しい形式であることを確認してから文字列化
+                    assignment_str = {}
+                    from game.card import Card, SUITS
+                    
+                    for pid, cards in assignment_hands.items():
+                        str_cards = []
+                        for c in cards:
+                            try:
+                                # Cardオブジェクトを正規化（suitが数値の場合、SUITS文字列に変換）
+                                normalized_card = c
+                                if not getattr(c, 'is_joker', False):
+                                    suit_val = getattr(c, 'suit', None)
+                                    rank_val = getattr(c, 'rank', None)
+                                    
+                                    # suitが数値インデックス（0-3）の場合、SUITS文字列に変換
+                                    if isinstance(suit_val, int) and 0 <= suit_val < len(SUITS):
+                                        # 新しいCardオブジェクトを作成（正しいsuit文字列で）
+                                        normalized_card = Card(suit=SUITS[suit_val], rank=rank_val, is_joker=False)
+                                    elif suit_val not in SUITS:
+                                        # 不正なsuit値 - スキップ
+                                        raise ValueError(f"Invalid suit: {suit_val}")
+                                    
+                                    # rankの検証
+                                    if rank_val is None or not isinstance(rank_val, int) or rank_val < 1 or rank_val > 13:
+                                        raise ValueError(f"Invalid rank: {rank_val}")
+                                
+                                # 文字列化
+                                card_str = str(normalized_card)
+                                
+                                # 空文字列でないことを確認
+                                if not card_str:
+                                    raise ValueError("Empty card string")
+                                
+                                # パースして検証（ラウンドトリップテスト）
+                                parsed = Card.from_string(card_str)
+                                # パース失敗を検出
+                                if parsed.is_joker and not card_str.upper().startswith('JOKER'):
+                                    # 元のカードがJOKERかどうか確認
+                                    if not getattr(c, 'is_joker', False):
+                                        # 不正な文字列化 - スキップ
+                                        try:
+                                            agent._det_stats['str_roundtrip_fail'] = agent._det_stats.get('str_roundtrip_fail', 0) + 1
+                                            # デバッグ: 最初の5回だけログ出力
+                                            fail_count = agent._det_stats['str_roundtrip_fail']
+                                            if fail_count <= 5:
+                                                print(f"[DEBUG] Roundtrip fail #{fail_count}: orig_card(suit={getattr(c, 'suit', None)}, rank={getattr(c, 'rank', None)}, is_joker={getattr(c, 'is_joker', False)}) -> '{card_str}' -> parsed(suit={parsed.suit}, rank={parsed.rank}, is_joker={parsed.is_joker})")
+                                        except Exception:
+                                            pass
+                                        raise ValueError(f"Parse failure: '{card_str}' -> JOKER")
+                                str_cards.append(card_str)
+                            except Exception as e:
+                                # 文字列化に失敗したカードはスキップ（assignmentを無効化）
+                                try:
+                                    agent._det_stats['str_conversion_fail'] = agent._det_stats.get('str_conversion_fail', 0) + 1
+                                    # デバッグ: 最初の3回だけログ出力
+                                    fail_count = agent._det_stats['str_conversion_fail']
+                                    if fail_count <= 3:
+                                        print(f"[DEBUG] Conversion fail #{fail_count}: card(suit={getattr(c, 'suit', None)}, rank={getattr(c, 'rank', None)}, is_joker={getattr(c, 'is_joker', False)}) Error: {type(e).__name__}: {e}")
+                                except Exception:
+                                    pass
+                                return False, None  # assignment生成失敗
+                        assignment_str[pid] = str_cards
                     try:
                         agent._det_stats['retries_total'] += attempt
                     except Exception:
                         pass
-                    return True, {'hands': assignment_hands}
+                    return True, {'hands': assignment_str}
 
+        # 再試行が尽きた場合、最後のassignment_handsを使用
         if apply_direct:
             from game.card import Card
-            for pid, cards_str in assignment_hands.items():
+            
+            def _clone_card(c):
+                """Cardオブジェクトをクローン"""
+                if getattr(c, 'is_joker', False):
+                    return Card(is_joker=True)
+                else:
+                    return Card(
+                        suit=getattr(c, 'suit', None),
+                        rank=getattr(c, 'rank', None),
+                        is_joker=False
+                    )
+            
+            for pid, cards_list in assignment_hands.items():
                 if pid == root_pid:
                     continue
-                try:
-                    g_new.players[pid].hand = [Card.from_string(s) if hasattr(Card, 'from_string') else Card(s) for s in cards_str]
-                except Exception:
-                    g_new.players[pid].hand = list(cards_str)
+                g_new.players[pid].hand = [_clone_card(c) for c in cards_list]
             return True, None
         else:
             return False, None

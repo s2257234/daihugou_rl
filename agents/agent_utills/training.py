@@ -13,6 +13,12 @@ import random
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+try:
+    from agents.agent_utills.feature_extractor import CardEncoder
+except Exception:
+    # best-effort import; helper below will fallback to str()
+    CardEncoder = None
+
 
 def _is_player_finished_in_state(state: Any, player_id: int) -> bool:
     """Best-effort check whether a player has already finished ("agari") in this state.
@@ -105,22 +111,155 @@ class LocalInferenceClient(InferenceClient):
     def infer_policy_value(self, state: Dict[str, Any], legal_actions: List[Any]) -> Tuple[Dict[Any, float], float]:
         """Execute forward pass on local model."""
         model = self.agent.model
+        # helper: canonicalize an action into a hashable string key
+        def _action_key(a: Any) -> str:
+            try:
+                if a is None or a == 'pass':
+                    return 'PASS'
+                cards = a if isinstance(a, (list, tuple)) else [a]
+                if CardEncoder is not None:
+                    ce = CardEncoder()
+                    parts = []
+                    for c in cards:
+                        try:
+                            parts.append(int(ce.card_index(c)))
+                        except Exception:
+                            parts.append(str(repr(c)))
+                    # Sort to match canonical_action_keys() behavior
+                    parts.sort(key=lambda x: (isinstance(x, str), x))
+                    return '|'.join(str(p) for p in parts)
+                # fallback: use repr of each card
+                return '|'.join(repr(c) for c in cards)
+            except Exception:
+                try:
+                    return repr(a)
+                except Exception:
+                    return str(a)
         if model is None:
             # Fallback: uniform policy, neutral value
             n = len(legal_actions) if legal_actions else 1
-            # リスト型のアクションを tuple に変換してキーとして使用可能にする
-            policy = {(tuple(a) if isinstance(a, list) else a): 1.0 / n for a in legal_actions} if legal_actions else {}
+            policy = {}
+            for a in legal_actions:
+                act_key = (tuple(a) if isinstance(a, list) else a)
+                policy[act_key] = 1.0 / n
             return policy, 0.5
         
-        # Variable-length model
+        # Variable-length model: be tolerant to different `evaluate` return formats.
+        # `evaluate` may return either:
+        #  - (policy_dict, value_scalar) where policy_dict maps actions->probs
+        #  - (policy_logits_tensor, value_logits_tensor) where policy_logits is 1D over legal_actions
+        #  - a policy_dict alone (in which case return neutral value 0.5)
         if getattr(model, 'supports_variable_actions', False) and hasattr(model, 'evaluate'):
             try:
                 import torch
                 model.eval()
                 with torch.no_grad():
-                    policy_dict, value_scalar = model.evaluate(state, legal_actions)
-                    return policy_dict, value_scalar
-            except (RuntimeError, AttributeError) as e:
+                    res = model.evaluate(state, legal_actions)
+
+                    # Helper to canonicalize an action key for dicts
+                    def _mk_key(a):
+                        return (tuple(a) if isinstance(a, list) else a)
+
+                    # Case: evaluate returned only a dict -> assume probabilities
+                    if isinstance(res, dict):
+                        out_pd = {}
+                        for a, pv in res.items():
+                            k = _mk_key(a)
+                            try:
+                                if hasattr(pv, 'detach'):
+                                    # scalar tensor
+                                    if getattr(pv, 'dim', lambda: 0)() == 0:
+                                        out_pd[k] = float(pv.detach().cpu().item())
+                                    else:
+                                        # vector-ish -> take first element (best-effort)
+                                        lst = pv.detach().cpu().tolist()
+                                        out_pd[k] = float(lst[0]) if isinstance(lst, (list, tuple)) and lst else float(lst)
+                                else:
+                                    out_pd[k] = float(pv)
+                            except Exception:
+                                try:
+                                    out_pd[k] = float(pv)
+                                except Exception:
+                                    out_pd[k] = 0.0
+                        return out_pd, 0.5
+
+                    # Case: tuple/list of length 2
+                    if isinstance(res, (tuple, list)) and len(res) == 2:
+                        policy_part, value_part = res
+
+                        # Process value_part: prefer sigmoid on tensor, single CPU transfer
+                        value_scalar = None
+                        try:
+                            if hasattr(value_part, 'sigmoid'):
+                                vp = value_part.sigmoid()
+                                if getattr(vp, 'dim', lambda: 0)() == 0:
+                                    value_scalar = float(vp.item())
+                                else:
+                                    value_scalar = vp.cpu().tolist()
+                            elif isinstance(value_part, dict):
+                                value_scalar = {int(k): float(v) for k, v in value_part.items()}
+                            elif isinstance(value_part, (list, tuple)):
+                                value_scalar = [float(x) for x in value_part]
+                            else:
+                                value_scalar = float(value_part)
+                        except Exception:
+                            try:
+                                value_scalar = float(value_part)
+                            except Exception:
+                                value_scalar = value_part
+
+                        # Process policy_part
+                        policy_dict = {}
+                        # If it's already a dict-like mapping
+                        if isinstance(policy_part, dict):
+                            for a, pv in policy_part.items():
+                                k = _mk_key(a)
+                                try:
+                                    if hasattr(pv, 'detach'):
+                                        if getattr(pv, 'dim', lambda: 0)() == 0:
+                                            policy_dict[k] = float(pv.detach().cpu().item())
+                                        else:
+                                            lst = pv.detach().cpu().tolist()
+                                            policy_dict[k] = float(lst[0]) if isinstance(lst, (list, tuple)) and lst else float(lst)
+                                    else:
+                                        policy_dict[k] = float(pv)
+                                except Exception:
+                                    try:
+                                        policy_dict[k] = float(pv)
+                                    except Exception:
+                                        policy_dict[k] = 0.0
+                            return policy_dict, value_scalar
+
+                        # If it's a tensor-like sequence (logits or probs for legal_actions)
+                        try:
+                            if hasattr(policy_part, 'shape') or hasattr(policy_part, 'dim'):
+                                pt = policy_part
+                                # Compute softmax on GPU (if logits) then transfer once
+                                try:
+                                    probs_tensor = torch.softmax(pt, dim=0)
+                                except Exception:
+                                    # If softmax fails, assume policy_part already contains probs
+                                    probs_tensor = pt
+                                probs = probs_tensor.cpu().tolist()
+                                for i, a in enumerate(legal_actions):
+                                    k = _mk_key(a)
+                                    p = float(probs[i]) if i < len(probs) else 0.0
+                                    policy_dict[k] = p
+                                return policy_dict, value_scalar
+                        except Exception:
+                            pass
+
+                        # Fallback: try to iterate over policy_part
+                        try:
+                            for i, a in enumerate(legal_actions):
+                                k = _mk_key(a)
+                                pv = policy_part[i] if i < len(policy_part) else 0.0
+                                policy_dict[k] = float(pv)
+                            return policy_dict, value_scalar
+                        except Exception:
+                            # Give up and let outer logic fallback
+                            pass
+            except (RuntimeError, AttributeError, ImportError):
                 # Model evaluation failed, fall through to fixed-head or fallback
                 pass
         
@@ -131,13 +270,17 @@ class LocalInferenceClient(InferenceClient):
             with torch.no_grad():
                 logits_raw, value_raw = model.forward(state)
                 
-                # Handle value output format (keep as list/dict if multi-player)
+                # Handle value output format (GPU 上で sigmoid 処理してから CPU 転送)
                 if isinstance(value_raw, dict):
                     value_scalar = {int(k): float(v) for k, v in value_raw.items()}
-                elif hasattr(value_raw, 'tolist'):
-                    # Tensor -> list
+                elif hasattr(value_raw, 'sigmoid'):
+                    # Tensor: GPU 上で sigmoid を実行してから CPU 転送（1回のみ）
                     try:
-                        value_scalar = value_raw.sigmoid().detach().cpu().tolist()
+                        value_prob_tensor = value_raw.sigmoid()
+                        if value_prob_tensor.dim() == 0:
+                            value_scalar = float(value_prob_tensor.item())
+                        else:
+                            value_scalar = value_prob_tensor.cpu().tolist()
                     except (RuntimeError, AttributeError):
                         value_scalar = value_raw.detach().cpu().tolist()
                 elif isinstance(value_raw, (list, tuple)):
@@ -146,54 +289,100 @@ class LocalInferenceClient(InferenceClient):
                     # Single scalar value
                     value_scalar = float(value_raw)
                 
-                # Convert logits to policy dict
-                if hasattr(logits_raw, 'cpu'):
-                    logits = logits_raw.cpu().numpy().tolist()
-                elif isinstance(logits_raw, (list, tuple)):
-                    logits = list(logits_raw)
-                else:
-                    logits = [float(logits_raw)]
-                
-                # Align with legal actions
+                # GPU 上で policy を処理（CPU 転送を最小化）
                 n = len(legal_actions)
-                if len(logits) < n:
-                    logits.extend([float('-inf')] * (n - len(logits)))
-                elif len(logits) > n:
-                    logits = logits[:n]
-                # Defensive: sanitize logits (avoid NaN/inf poisoning softmax)
+                
+                # Canonical action keys がある場合は full head で softmax（GPU上）
+                policy_dict = {}
                 try:
-                    import math as _math
-                    for i, x in enumerate(logits):
-                        try:
-                            xf = float(x)
-                            if not _math.isfinite(xf):
-                                logits[i] = float('-inf')
-                        except Exception:
-                            logits[i] = float('-inf')
+                    if hasattr(model, 'canonical_action_keys') and hasattr(logits_raw, 'shape'):
+                        canonical_keys = model.canonical_action_keys()
+                        L = min(int(logits_raw.shape[0]), len(canonical_keys))
+                        if L > 0:
+                            # GPU 上で softmax を実行
+                            full_probs_tensor = torch.softmax(logits_raw[:L], dim=0)
+                            # CPU 転送は1回だけ
+                            full_probs = full_probs_tensor.cpu().tolist()
+                            key_to_prob = {canonical_keys[i]: float(full_probs[i]) for i in range(L)}
+                        else:
+                            key_to_prob = {}
+                    else:
+                        key_to_prob = {}
                 except Exception:
-                    pass
+                    key_to_prob = {}
                 
-                # Softmax
-                import math
-                mx = max(logits) if logits else 0.0
-                # if all are -inf, fallback uniform
-                if (not logits) or (mx == float('-inf')):
-                    probs = [1.0 / n] * n
+                # Fallback: truncated softmax（GPU上で処理）
+                if hasattr(logits_raw, 'shape') and n > 0:
+                    # GPU 上でロジットを切り出して softmax
+                    if logits_raw.shape[0] < n:
+                        pad = torch.full((n - logits_raw.shape[0],), float('-inf'), 
+                                       device=logits_raw.device, dtype=logits_raw.dtype)
+                        logits_trunc_tensor = torch.cat([logits_raw, pad], dim=0)
+                    else:
+                        logits_trunc_tensor = logits_raw[:n]
+                    # GPU 上で softmax を実行してから CPU 転送（1回のみ）
+                    probs_trunc_tensor = torch.softmax(logits_trunc_tensor, dim=0)
+                    probs_trunc = probs_trunc_tensor.cpu().tolist()
+                elif hasattr(logits_raw, 'tolist'):
+                    # 非 Tensor の場合は従来通り CPU 側で処理
+                    full_logits_list = logits_raw.detach().cpu().tolist()
+                    logits_trunc = full_logits_list[:n] if n > 0 else []
+                    if len(logits_trunc) < n:
+                        logits_trunc.extend([float('-inf')] * (n - len(logits_trunc)))
+                    import math
+                    if n > 0:
+                        mx = max(logits_trunc) if logits_trunc else 0.0
+                        if (not logits_trunc) or (mx == float('-inf')):
+                            probs_trunc = [1.0 / n] * n
+                        else:
+                            exps = [math.exp(x - mx) for x in logits_trunc]
+                            s = sum(exps)
+                            probs_trunc = [e / s for e in exps] if s > 0 else [1.0 / n] * n
+                    else:
+                        probs_trunc = []
                 else:
-                    exps = [math.exp(x - mx) for x in logits]
-                    s = sum(exps)
-                    probs = [e / s for e in exps] if s > 0 else [1.0 / n] * n
-                
-                # legal_actions は List[List[str]] だが、辞書のキーは hashable である必要があるため tuple に変換
-                policy_dict = {(tuple(legal_actions[i]) if isinstance(legal_actions[i], list) else legal_actions[i]): probs[i] for i in range(n)}
+                    probs_trunc = [1.0 / n] * n if n > 0 else []
+
+                # Build policy dict for legal actions: prefer canonical mapping, else fallback to truncated softmax
+                fallback_used = False
+                fallback_keys = []
+                for i in range(n):
+                    a = legal_actions[i]
+                    act_key_obj = (tuple(a) if isinstance(a, list) else a)
+                    k = _action_key(a)
+                    p = key_to_prob.get(k, None)
+                    if p is None:
+                        p = float(probs_trunc[i]) if i < len(probs_trunc) else 0.0
+                        fallback_used = True
+                        if len(fallback_keys) < 5:  # Collect first 5 for debugging
+                            fallback_keys.append(k)
+                    policy_dict[act_key_obj] = p
+                if fallback_used:
+                    try:
+                        if hasattr(self.agent, '_log_fallback_once'):
+                            msg = f"[WARN] policy fallback: used prefix-n softmax for {sum(1 for i in range(n) if _action_key(legal_actions[i]) not in key_to_prob)}/{n} actions"
+                            if fallback_keys:
+                                msg += f" (first keys: {fallback_keys[:3]})"
+                            self.agent._log_fallback_once(
+                                "policy_fallback_prefix_softmax",
+                                msg,
+                            )
+                        elif getattr(self.agent, 'logger', None) and hasattr(self.agent.logger, 'log_text'):
+                            self.agent.logger.log_text("[WARN] policy fallback: used prefix-n softmax for some actions")
+                        else:
+                            print("[WARN] policy fallback: used prefix-n softmax for some actions")
+                    except Exception:
+                        pass
                 return policy_dict, value_scalar
                 
         except (ImportError, RuntimeError, AttributeError, ValueError) as e:
             # Model forward failed - log if possible and use fallback
             # Note: cannot reliably access agent.logger here, so just use fallback
             n = len(legal_actions) if legal_actions else 1
-            # Fallback でも同様に tuple に変換
-            policy = {(tuple(a) if isinstance(a, list) else a): 1.0 / n for a in legal_actions} if legal_actions else {}
+            policy = {}
+            for a in legal_actions:
+                act_key = (tuple(a) if isinstance(a, list) else a)
+                policy[act_key] = 1.0 / n
             return policy, 0.5
 
 
@@ -415,18 +604,57 @@ class ReplaySnapshotDataset(Dataset):
         s = self.samples[index]
         import numpy as _np
         # π 復元 (u16規格優先)
-        if 'pi_q' in s and s.get('pi_format') == 'u16_norm65535':
-            pi_q = s.get('pi_q')
-            try:
-                arr = pi_q.astype(_np.float32, copy=False) if hasattr(pi_q, 'astype') else _np.asarray(list(pi_q), dtype=_np.float32)
-                s_q = float(arr.sum())
-                pi_arr = (arr / s_q) if s_q > 0 else (_np.ones_like(arr, dtype=_np.float32) / max(1, arr.size))
-            except Exception:
+        try:
+            if 'pi_q' in s:
+                pf = s.get('pi_format')
+                try:
+                    is_u16 = bool(pf == 'u16_norm65535')
+                except Exception:
+                    is_u16 = str(pf) == 'u16_norm65535'
+                if is_u16:
+                    pi_q = s.get('pi_q')
+                    try:
+                        arr = pi_q.astype(_np.float32, copy=False) if hasattr(pi_q, 'astype') else _np.asarray(list(pi_q), dtype=_np.float32)
+                        s_q = float(arr.sum())
+                        pi_arr = (arr / s_q) if s_q > 0 else (_np.ones_like(arr, dtype=_np.float32) / max(1, arr.size))
+                    except Exception:
+                        raw = s.get('pi')
+                        if raw is None:
+                            pi_arr = _np.zeros((0,), dtype=_np.float32)
+                        else:
+                            try:
+                                pi_arr = _np.asarray(list(raw), dtype=_np.float32)
+                            except Exception:
+                                try:
+                                    pi_arr = _np.asarray(raw, dtype=_np.float32)
+                                except Exception:
+                                    pi_arr = _np.zeros((0,), dtype=_np.float32)
+                else:
+                    raw = s.get('pi')
+                    if raw is None:
+                        pi_arr = _np.zeros((0,), dtype=_np.float32)
+                    else:
+                        try:
+                            pi_arr = _np.asarray(list(raw), dtype=_np.float32)
+                        except Exception:
+                            try:
+                                pi_arr = _np.asarray(raw, dtype=_np.float32)
+                            except Exception:
+                                pi_arr = _np.zeros((0,), dtype=_np.float32)
+            else:
                 raw = s.get('pi')
-                pi_arr = _np.asarray(list(raw), dtype=_np.float32) if raw else _np.zeros((0,), dtype=_np.float32)
-        else:
-            raw = s.get('pi')
-            pi_arr = _np.asarray(list(raw), dtype=_np.float32) if raw else _np.zeros((0,), dtype=_np.float32)
+                if raw is None:
+                    pi_arr = _np.zeros((0,), dtype=_np.float32)
+                else:
+                    try:
+                        pi_arr = _np.asarray(list(raw), dtype=_np.float32)
+                    except Exception:
+                        try:
+                            pi_arr = _np.asarray(raw, dtype=_np.float32)
+                        except Exception:
+                            pi_arr = _np.zeros((0,), dtype=_np.float32)
+        except Exception:
+            pi_arr = _np.zeros((0,), dtype=_np.float32)
         # value target
         v_target = _extract_value(s)
         v_target = float(v_target) if v_target is not None else None
@@ -497,8 +725,9 @@ def collate_prepare_batch(batch_items: List[Dict[str, Any]], agent_ref: Any, uid
 
     Returns same dict as _prepare_batch. fast_full_input_np は通常 None (fast path 未使用)。
     """
+    # First, try the normal fast path via Agent._prepare_batch
     try:
-        return agent_ref._prepare_batch(batch_items, uid2weight=uid2weight, fast_full_input_np=fast_full_input_np)  # type: ignore[attr-defined]
+        prep = agent_ref._prepare_batch(batch_items, uid2weight=uid2weight, fast_full_input_np=fast_full_input_np)  # type: ignore[attr-defined]
     except Exception:
         # フォールバック: 以前の加工済み形式に類似した最低限の構造
         import numpy as _np
@@ -508,8 +737,17 @@ def collate_prepare_batch(batch_items: List[Dict[str, Any]], agent_ref: Any, uid
         is_weights = []
         lengths = []
         for s in batch_items:
-            raw = s.get('pi') or []
-            arr = _np.asarray(list(raw), dtype=_np.float32) if raw else _np.zeros((0,), dtype=_np.float32)
+            raw = s.get('pi')
+            if raw is None:
+                arr = _np.zeros((0,), dtype=_np.float32)
+            else:
+                try:
+                    arr = _np.asarray(list(raw), dtype=_np.float32)
+                except Exception:
+                    try:
+                        arr = _np.asarray(raw, dtype=_np.float32)
+                    except Exception:
+                        arr = _np.zeros((0,), dtype=_np.float32)
             if arr.size == 0:
                 continue
             pi_arrays.append(arr)
@@ -527,7 +765,7 @@ def collate_prepare_batch(batch_items: List[Dict[str, Any]], agent_ref: Any, uid
             except Exception:
                 iw = 1.0
             is_weights.append(iw)
-        return {
+        prep = {
             'states': states,
             'pi_arrays': pi_arrays,
             'v_targets': v_targets,
@@ -536,6 +774,77 @@ def collate_prepare_batch(batch_items: List[Dict[str, Any]], agent_ref: Any, uid
             'used_uids': [],
             'fast_full_input_np': fast_full_input_np,
         }
+
+    # Attempt to build a fast numpy 2D array for full_input if possible.
+    # This allows the training loop to call torch.from_numpy(...).to(device, non_blocking=True)
+    try:
+        if prep.get('fast_full_input_np', None) is None:
+            states = prep.get('states', []) or []
+            if states:
+                import numpy as _np
+                # Try to get expected_dim from the agent's model if available
+                expected_dim = None
+                try:
+                    expected_dim = int(getattr(getattr(agent_ref, 'model', None), 'full_feature_dim', 0) or 0)
+                except Exception:
+                    expected_dim = None
+
+                arrs = []
+                all_ok = True
+                for s in states:
+                    full = None
+                    # state may be dict or already array-like
+                    if isinstance(s, dict):
+                        if 'full_input' in s and s.get('full_input') is not None:
+                            full = s.get('full_input')
+                        elif 'full_compact' in s and isinstance(s.get('full_compact'), dict) and s.get('full_compact').get('format') == 'cfv1':
+                            cf = s.get('full_compact')
+                            bin_len = int(cf.get('binary_len', 0) or 0)
+                            packed = cf.get('packed_bits', b'')
+                            floats = cf.get('floats', None)
+                            if isinstance(packed, (bytes, bytearray)) and bin_len > 0:
+                                bits_arr = _np.unpackbits(_np.frombuffer(packed, dtype=_np.uint8))[:bin_len].astype(_np.float32)
+                            else:
+                                bits_arr = _np.zeros(bin_len, dtype=_np.float32)
+                            if floats is not None:
+                                try:
+                                    floats_arr = _np.asarray(floats, dtype=_np.float16).astype(_np.float32)
+                                except Exception:
+                                    floats_arr = _np.asarray(list(floats), dtype=_np.float32)
+                            else:
+                                floats_arr = _np.zeros(0, dtype=_np.float32)
+                            full = _np.concatenate([bits_arr, floats_arr])
+                    else:
+                        # array-like
+                        try:
+                            import numpy as _np
+                            if hasattr(s, 'dtype'):
+                                full = _np.asarray(s, dtype=_np.float32)
+                        except Exception:
+                            full = None
+
+                    if full is None:
+                        all_ok = False
+                        break
+
+                    vec = _np.asarray(list(full), dtype=_np.float32)
+                    if expected_dim and vec.size != expected_dim:
+                        if vec.size < expected_dim:
+                            pad = _np.zeros(expected_dim, dtype=_np.float32)
+                            pad[:vec.size] = vec
+                            vec = pad
+                        else:
+                            vec = vec[:expected_dim]
+                    arrs.append(vec)
+
+                if all_ok and arrs:
+                    fast_np = _np.stack(arrs, axis=0)
+                    prep['fast_full_input_np'] = fast_np
+    except Exception:
+        # best-effort: do not fail on numpy conversion
+        pass
+
+    return prep
 
 
 class TrainStepMixin:
@@ -562,8 +871,82 @@ class TrainStepMixin:
         lengths: List[int] = []
         hand_labels: List[Optional[_np.ndarray]] = []
         used_uids: List[int] = []
+        pids_list: List[int] = []
+        terminals_list: List[float] = []
+        active_mask_list: List[float] = []
         skip_full = bool(self.config.get('use_full_features') and self.config.get('skip_zero_padded_full_samples', True))
-        for sample in batch:
+        # Fast-path: vectorized normalization for batches where every sample
+        # stores quantized policy in 'pi_q' with format 'u16_norm65535'. This
+        # avoids per-sample astype/sum/div operations.
+        vector_pi_arrays = None
+        _vector_attempted = False
+        _vector_exc = None
+        def _pi_format_is_u16(sample_obj: Any) -> bool:
+            pf = sample_obj.get('pi_format') if isinstance(sample_obj, dict) else None
+            try:
+                return bool(pf == 'u16_norm65535')
+            except Exception:
+                try:
+                    return str(pf) == 'u16_norm65535'
+                except Exception:
+                    return False
+
+        try:
+            if (len(batch) > 0) and all(isinstance(s, dict) and ('pi_q' in s) and _pi_format_is_u16(s) for s in batch):
+                _vector_attempted = True
+                pi_q_list = []
+                max_len = 0
+                for s in batch:
+                    pq = s.get('pi_q')
+                    if pq is None:
+                        pq = []
+                    if hasattr(pq, 'astype'):
+                        arr = _np.asarray(pq, dtype=_np.uint16)
+                    else:
+                        try:
+                            arr = _np.asarray(list(pq), dtype=_np.uint16)
+                        except Exception:
+                            arr = _np.asarray(pq, dtype=_np.uint16)
+                    pi_q_list.append(arr)
+                    if arr.size > max_len:
+                        max_len = arr.size
+                if max_len > 0:
+                    stacked = _np.zeros((len(pi_q_list), max_len), dtype=_np.float32)
+                    lengths_local = []
+                    for i, arr in enumerate(pi_q_list):
+                        L = arr.size
+                        lengths_local.append(L)
+                        if L > 0:
+                            stacked[i, :L] = arr.astype(_np.float32, copy=False)
+                    sums = stacked.sum(axis=1, keepdims=True)
+                    sums[sums == 0] = 1.0
+                    normalized = stacked / sums
+                    vector_pi_arrays = []
+                    for i, L in enumerate(lengths_local):
+                        if L > 0:
+                            vector_pi_arrays.append(normalized[i, :L])
+                        else:
+                            vector_pi_arrays.append(_np.zeros((0,), dtype=_np.float32))
+        except Exception as _ve:
+            vector_pi_arrays = None
+            _vector_exc = _ve
+        # If we attempted the vectorized path but it failed, log once so user can inspect
+        if _vector_attempted and vector_pi_arrays is None:
+            try:
+                logger_obj = getattr(self, 'logger', None)
+                msg = f"[TRAIN_PREP] vectorized pi normalization failed, falling back to per-sample processing: {_vector_exc}"
+                if logger_obj is not None and hasattr(logger_obj, 'log_text'):
+                    try:
+                        logger_obj.log_text(msg)
+                    except Exception:
+                        print(msg)
+                else:
+                    print(msg)
+            except Exception:
+                # never raise from logging
+                pass
+
+        for idx, sample in enumerate(batch):
             if not isinstance(sample, dict):
                 continue
             v_target = _extract_value(sample)
@@ -581,31 +964,46 @@ class TrainStepMixin:
             if bool(self.config.get('debug_value_mix', False)) and len(v_targets_q) < 5:
                 print(f"[DEBUG_VALUE_MIX] _prepare_batch sample[{len(v_targets_q)}]: value_q={v_target_q}, value={v_target}")
             
-            # π 復元
+            # π 復元 (vectorized fast-path if available)
             try:
-                if 'pi_q' in sample and sample.get('pi_format') == 'u16_norm65535':
-                    pi_q = sample.get('pi_q')
-                    if hasattr(pi_q, 'astype'):
-                        arr = pi_q.astype(_np.float32, copy=False)
-                    else:
-                        arr = _np.asarray(list(pi_q), dtype=_np.float32)
-                    s_q = float(arr.sum())
-                    if s_q > 0:
-                        pi_arr = arr / s_q
-                    else:
-                        if arr.size == 0:
-                            continue
-                        pi_arr = _np.ones_like(arr, dtype=_np.float32) / arr.size
+                if vector_pi_arrays is not None:
+                    pi_arr = vector_pi_arrays[idx]
                 else:
-                    raw_pi = sample.get('pi')
-                    if not raw_pi:
-                        continue
-                    pi_arr = _np.asarray(list(raw_pi), dtype=_np.float32)
+                    if 'pi_q' in sample and _pi_format_is_u16(sample):
+                        pi_q = sample.get('pi_q')
+                        if hasattr(pi_q, 'astype'):
+                            arr = pi_q.astype(_np.float32, copy=False)
+                        else:
+                            arr = _np.asarray(list(pi_q), dtype=_np.float32)
+                        s_q = float(arr.sum())
+                        if s_q > 0:
+                            pi_arr = arr / s_q
+                        else:
+                            if arr.size == 0:
+                                continue
+                            pi_arr = _np.ones_like(arr, dtype=_np.float32) / arr.size
+                    else:
+                        raw_pi = sample.get('pi')
+                        if raw_pi is None:
+                            continue
+                        try:
+                            pi_arr = _np.asarray(list(raw_pi), dtype=_np.float32)
+                        except Exception:
+                            try:
+                                pi_arr = _np.asarray(raw_pi, dtype=_np.float32)
+                            except Exception:
+                                continue
             except Exception:
                 raw_pi = sample.get('pi')
-                if not raw_pi:
+                if raw_pi is None:
                     continue
-                pi_arr = _np.asarray(list(raw_pi), dtype=_np.float32)
+                try:
+                    pi_arr = _np.asarray(list(raw_pi), dtype=_np.float32)
+                except Exception:
+                    try:
+                        pi_arr = _np.asarray(raw_pi, dtype=_np.float32)
+                    except Exception:
+                        continue
             if pi_arr.size == 0:
                 continue
             # Defensive: ensure pi is a valid distribution (non-negative, finite, sums to 1)
@@ -635,6 +1033,26 @@ class TrainStepMixin:
                     s_pid = int(sample.get('state', {}).get('self_player_id', sample.get('player_id', 0)))
                 except Exception:
                     s_pid = int(getattr(self, 'player_id', 0) or 0)
+            # record pid
+            try:
+                pids_list.append(int(s_pid))
+            except Exception:
+                pids_list.append(int(getattr(self, 'player_id', 0) or 0))
+            # terminal flag
+            try:
+                is_term = False
+                if isinstance(st_can, dict):
+                    is_term = bool(st_can.get('is_terminal', False))
+                else:
+                    is_term = bool(sample.get('is_terminal', False))
+                terminals_list.append(1.0 if is_term else 0.0)
+            except Exception:
+                terminals_list.append(0.0)
+            # active mask (1.0 if not finished, else 0.0)
+            try:
+                active_mask_list.append(0.0 if _is_player_finished_in_state(st_can, int(s_pid)) else 1.0)
+            except Exception:
+                active_mask_list.append(1.0)
             # Policy actions are absolute card identifiers (not relative indices),
             # so do not attempt to rotate/roll the policy target by player chunks.
             states.append(st_can)
@@ -674,6 +1092,9 @@ class TrainStepMixin:
             'lengths': lengths,
             'hand_labels': hand_labels,
             'used_uids': used_uids,
+            'pids': _np.asarray(pids_list, dtype=_np.int32),
+            'terminals': _np.asarray(terminals_list, dtype=_np.float32),
+            'active_mask': _np.asarray(active_mask_list, dtype=_np.float32),
             'fast_full_input_np': fast_full_input_np,
         }
 
@@ -1048,10 +1469,13 @@ class TrainStepMixin:
                 prefetch = int(self.config.get('dataloader_prefetch_factor', 2) or 2)
                 import torch as _t
                 pin = bool(self.config.get('dataloader_pin_memory', True) and _t.cuda.is_available())
+                persistent = bool(self.config.get('dataloader_persistent_workers', False)) and num_workers > 0
                 collate_fn = partial(collate_prepare_batch, agent_ref=self, uid2weight=uid2weight_local, fast_full_input_np=None)
                 _dl_kwargs = dict(batch_size=len(sel_indices), sampler=sp, num_workers=num_workers, pin_memory=pin, collate_fn=collate_fn, drop_last=False)
                 if num_workers > 0:
                     _dl_kwargs['prefetch_factor'] = prefetch
+                    if persistent:
+                        _dl_kwargs['persistent_workers'] = True
                 dl = DataLoader(ds, **_dl_kwargs)
                 prepared_batch = next(iter(dl))
             except Exception:
@@ -1070,7 +1494,44 @@ class TrainStepMixin:
                     is_weights_list = prepared_batch['is_weights']
                     lengths = prepared_batch['lengths']
                     used_uids.extend(prepared_batch.get('used_uids', []))
+                    # fast_full_input_np may be provided by collate; prefer it for efficient transfer
+                    fast_full_input_np = prepared_batch.get('fast_full_input_np', None)
                 else:
+                    # Attempt to build a fast 2D numpy array for full_input from the
+                    # raw batch to allow _prepare_batch to skip per-sample construction.
+                    fast_full_input_np = None
+                    try:
+                        import numpy as _np
+                        states_raw = [s.get('state') for s in batch]
+                        arrs = []
+                        all_ok = True
+                        max_len = 0
+                        for st in states_raw:
+                            if not isinstance(st, dict):
+                                all_ok = False
+                                break
+                            fi = st.get('full_input', None)
+                            if fi is None:
+                                all_ok = False
+                                break
+                            a = _np.asarray(fi, dtype=_np.float32)
+                            arrs.append(a)
+                            if a.shape[0] > max_len:
+                                max_len = a.shape[0]
+                        if all_ok and arrs:
+                            if all(a.shape[0] == max_len for a in arrs):
+                                fast_full_input_np = _np.stack(arrs, axis=0)
+                            else:
+                                # pad shorter rows to max_len
+                                stacked = _np.zeros((len(arrs), max_len), dtype=_np.float32)
+                                for i, a in enumerate(arrs):
+                                    L = a.shape[0]
+                                    if L > 0:
+                                        stacked[i, :L] = a
+                                fast_full_input_np = stacked
+                    except Exception:
+                        fast_full_input_np = None
+
                     prep = self._prepare_batch(batch, uid2weight, fast_full_input_np)
                     states = prep['states']
                     pi_arrays = prep['pi_arrays']
@@ -1079,14 +1540,48 @@ class TrainStepMixin:
                     is_weights_list = prep['is_weights']
                     lengths = prep['lengths']
                     used_uids.extend(prep['used_uids'])
+                    # if _prepare_batch returned a fast numpy buffer, use it
+                    fast_full_input_np = prep.get('fast_full_input_np', None)
                 if states:
                     # モデル一括 forward（belief ヘッド出力も取得）
                     import torch
                     try:
                         if fast_full_input_np is not None:
                             import torch as _t
-                            xs = _t.from_numpy(fast_full_input_np).to(self.model.device).float()
+                            # Log first use of fast_full_input_np for visibility
+                            try:
+                                if not getattr(self, '_fast_full_input_used_logged', False):
+                                    logger_obj = getattr(self, 'logger', None)
+                                    shape = getattr(fast_full_input_np, 'shape', None)
+                                    msg = f"[TRAIN_FAST_FULL] using fast_full_input_np shape={shape}"
+                                    if logger_obj is not None and hasattr(logger_obj, 'log_text'):
+                                        try:
+                                            logger_obj.log_text(msg)
+                                        except Exception:
+                                            print(msg)
+                                    else:
+                                        print(msg)
+                                    self._fast_full_input_used_logged = True  # type: ignore[attr-defined]
+                            except Exception:
+                                pass
+                            # move once with non_blocking to overlap host->device copy with compute
+                            xs = _t.from_numpy(fast_full_input_np).to(self.model.device, non_blocking=True).float()
                         else:
+                            # Log fallback to per-sample encoding once to help diagnose why fast path is unused
+                            try:
+                                if states and not getattr(self, '_fast_full_input_fallback_logged', False):
+                                    logger_obj = getattr(self, 'logger', None)
+                                    msg = "[TRAIN_FAST_FULL] fast_full_input_np unavailable — falling back to per-sample _encode_state"
+                                    if logger_obj is not None and hasattr(logger_obj, 'log_text'):
+                                        try:
+                                            logger_obj.log_text(msg)
+                                        except Exception:
+                                            print(msg)
+                                    else:
+                                        print(msg)
+                                    self._fast_full_input_fallback_logged = True  # type: ignore[attr-defined]
+                            except Exception:
+                                pass
                             xs = torch.stack([self.model._encode_state(s) for s in states], dim=0)
                     except Exception:
                         xs = None
@@ -1178,18 +1673,38 @@ class TrainStepMixin:
                     # NOTE: ここは「学習グラフに含める必要がある」ため no_grad / detach を絶対に使わない。
                     # (保存時の player_id と学習エージェントの player_id が異なるバッチを許容するため)
                     try:
-                        # states は現在バッチの state dict リスト
-                        pids_list = []
-                        for st in states:
+                        # Try to use precomputed pid/terminal/active arrays returned by _prepare_batch
+                        pids_src = None
+                        active_src = None
+                        if 'prepared_batch' in locals() and prepared_batch is not None:
+                            pids_src = prepared_batch.get('pids', None)
+                            active_src = prepared_batch.get('active_mask', None)
+                        elif 'prep' in locals() and prep is not None:
+                            pids_src = prep.get('pids', None)
+                            active_src = prep.get('active_mask', None)
+
+                        pids_t = None
+                        if pids_src is not None:
                             try:
-                                if isinstance(st, dict) and ('self_player_id' in st):
-                                    pids_list.append(int(st.get('self_player_id')))
-                                else:
-                                    # fallback: use agent.player_id if missing
-                                    pids_list.append(int(getattr(self, 'player_id', 0)))
+                                # prefer direct Tensor conversion to avoid Python list roundtrip
+                                pids_t = torch.as_tensor(pids_src, dtype=torch.long, device=device)
+                                if pids_t.dim() == 0:
+                                    pids_t = pids_t.view(-1)
                             except Exception:
-                                pids_list.append(int(getattr(self, 'player_id', 0)))
-                        pids_t = torch.tensor(pids_list, device=device, dtype=torch.long)
+                                pids_t = None
+
+                        if pids_t is None:
+                            # fallback: extract from states and build tensor
+                            pids_list = []
+                            for st in states:
+                                try:
+                                    if isinstance(st, dict) and ('self_player_id' in st):
+                                        pids_list.append(int(st.get('self_player_id')))
+                                    else:
+                                        pids_list.append(int(getattr(self, 'player_id', 0)))
+                                except Exception:
+                                    pids_list.append(int(getattr(self, 'player_id', 0)))
+                            pids_t = torch.tensor(pids_list, device=device, dtype=torch.long)
                         # value_logits_batch: [B, num_players] (or variants)
                         if hasattr(value_logits_batch, 'dim') and value_logits_batch.dim() == 2:
                             num_cols = int(value_logits_batch.size(1))
@@ -1200,15 +1715,10 @@ class TrainStepMixin:
                                 pids_norm = pids_t.clamp(min=0, max=num_cols - 1)
                                 v_logits = value_logits_batch.gather(1, pids_norm.unsqueeze(1)).squeeze(1)
                         elif hasattr(value_logits_batch, 'dim') and value_logits_batch.dim() == 1:
-                            # Two possibilities for 1D:
-                            # - model returned per-sample scalar logits as a 1D tensor of length B
-                            # - model returned a per-player vector (num_players,) for the whole batch
                             try:
                                 if int(value_logits_batch.numel()) == int(pids_t.numel()):
-                                    # per-sample logits
                                     v_logits = value_logits_batch.view(-1)
                                 else:
-                                    # treat as per-player vector: select by pid
                                     sel = int(pids_list[0]) if pids_list else int(getattr(self, 'player_id', 0))
                                     sel = max(0, min(sel, int(value_logits_batch.numel()) - 1))
                                     v_logits = value_logits_batch[sel].unsqueeze(0)
@@ -1217,8 +1727,45 @@ class TrainStepMixin:
                                 sel = max(0, min(sel, int(value_logits_batch.numel()) - 1))
                                 v_logits = value_logits_batch[sel].unsqueeze(0)
                         else:
-                            # fallback
                             v_logits = value_logits_batch[:, 0]
+                        # Build value_active_t from precomputed active mask if available
+                        if active_src is not None:
+                            try:
+                                # convert directly from numpy-like to tensor on device
+                                value_active_t = torch.as_tensor(active_src, dtype=torch.float32, device=device).view(-1)
+                                if value_active_t.numel() != B:
+                                    raise Exception("active_src length mismatch")
+                            except Exception:
+                                value_active_list = []
+                                import numpy as _np
+                                pids_arr = None
+                                try:
+                                    if hasattr(pids_list, 'tolist'):
+                                        pids_arr = _np.asarray(pids_list)
+                                    else:
+                                        pids_arr = _np.asarray(pids_t.cpu().numpy())
+                                except Exception:
+                                    pids_arr = _np.asarray(pids_t.cpu().numpy())
+                                for st_i, pid_i in zip(states, pids_arr):
+                                    try:
+                                        value_active_list.append(0.0 if _is_player_finished_in_state(st_i, int(pid_i)) else 1.0)
+                                    except Exception:
+                                        value_active_list.append(1.0)
+                                if len(value_active_list) != B:
+                                    value_active_t = torch.ones((B,), dtype=torch.float32, device=device)
+                                else:
+                                    value_active_t = torch.tensor(value_active_list, dtype=torch.float32, device=device).view(-1)
+                        else:
+                            value_active_list = []
+                            for st_i, pid_i in zip(states, pids_list):
+                                try:
+                                    value_active_list.append(0.0 if _is_player_finished_in_state(st_i, int(pid_i)) else 1.0)
+                                except Exception:
+                                    value_active_list.append(1.0)
+                            if len(value_active_list) != B:
+                                value_active_t = torch.ones((B,), dtype=torch.float32, device=device)
+                            else:
+                                value_active_t = torch.tensor(value_active_list, dtype=torch.float32, device=device).view(-1)
                     except Exception:
                         try:
                             import torch as _t
@@ -1241,17 +1788,19 @@ class TrainStepMixin:
                     # "あがり"(finished) 後のプレイヤーは value loss から除外する。
                     # 選択した視点 player_id が既に rankings 等に含まれている場合、そのサンプルの value 誤差を 0 にする。
                     try:
-                        value_active_list = []
-                        for st_i, pid_i in zip(states, pids_list if 'pids_list' in locals() else []):
-                            try:
-                                value_active_list.append(0.0 if _is_player_finished_in_state(st_i, int(pid_i)) else 1.0)
-                            except Exception:
-                                value_active_list.append(1.0)
-                        if len(value_active_list) != B:
-                            # Fallback: assume all active
-                            value_active_t = torch.ones((B,), dtype=torch.float32, device=device)
-                        else:
-                            value_active_t = torch.tensor(value_active_list, dtype=torch.float32, device=device).view(-1)
+                        # value_active_t may have been built from precomputed active mask earlier.
+                        if 'value_active_t' not in locals():
+                            value_active_list = []
+                            for st_i, pid_i in zip(states, pids_list if 'pids_list' in locals() else []):
+                                try:
+                                    value_active_list.append(0.0 if _is_player_finished_in_state(st_i, int(pid_i)) else 1.0)
+                                except Exception:
+                                    value_active_list.append(1.0)
+                            if len(value_active_list) != B:
+                                # Fallback: assume all active
+                                value_active_t = torch.ones((B,), dtype=torch.float32, device=device)
+                            else:
+                                value_active_t = torch.tensor(value_active_list, dtype=torch.float32, device=device).view(-1)
                     except Exception:
                         value_active_t = torch.ones((B,), dtype=torch.float32, device=device)
                     # Optionally boost terminal samples via config 'terminal_sample_boost'
@@ -1265,16 +1814,33 @@ class TrainStepMixin:
                     # Apply terminal-sample boost using a mask with identical length/device
                     if term_boost != 1.0:
                         try:
-                            term_mask_list = []
-                            for st in states:
+                            # try to use precomputed terminals if available
+                            term_src = None
+                            if 'prepared_batch' in locals() and prepared_batch is not None:
+                                term_src = prepared_batch.get('terminals', None)
+                            elif 'prep' in locals() and prep is not None:
+                                term_src = prep.get('terminals', None)
+                            if term_src is not None:
                                 try:
-                                    is_term = False
-                                    if isinstance(st, dict):
-                                        is_term = bool(st.get('is_terminal', False)) or (int(st.get('hand_size', -1)) == 0)
-                                    term_mask_list.append(1.0 if is_term else 0.0)
+                                    # Prefer direct tensor conversion
+                                    term_mask_t = torch.as_tensor(term_src, dtype=is_weights_t.dtype, device=is_weights_t.device).view(-1)
+                                    # normalize to 0/1
+                                    term_mask_t = (term_mask_t != 0).to(dtype=is_weights_t.dtype, device=is_weights_t.device)
                                 except Exception:
-                                    term_mask_list.append(0.0)
-                            term_mask_t = torch.tensor(term_mask_list, dtype=is_weights_t.dtype, device=is_weights_t.device).view(-1)
+                                    term_mask_list = []
+                                    term_mask_t = None
+                            else:
+                                term_mask_list = []
+                                for st in states:
+                                    try:
+                                        is_term = False
+                                        if isinstance(st, dict):
+                                            is_term = bool(st.get('is_terminal', False)) or (int(st.get('hand_size', -1)) == 0)
+                                        term_mask_list.append(1.0 if is_term else 0.0)
+                                    except Exception:
+                                        term_mask_list.append(0.0)
+                            if 'term_mask_t' not in locals() or term_mask_t is None:
+                                term_mask_t = torch.tensor(term_mask_list, dtype=is_weights_t.dtype, device=is_weights_t.device).view(-1)
                             boost_factor = float(term_boost)
                             boost_vec = 1.0 + (boost_factor - 1.0) * term_mask_t
                             is_weights_t = is_weights_t * boost_vec
@@ -1648,7 +2214,7 @@ class TrainStepMixin:
                             except Exception:
                                 # サンプル単体の失敗は無視 (tgt=0, mask=0)
                                 continue
-                        # 損失計算: マスク有効領域のみBCE、Focal、動的pos_weight
+                        # 損失計算: マスク有効領域のみBCE（Focal term を廃止）、動的pos_weightは保持
                         active = mask.sum().detach()
                         if active.item() > 0:
                             try:
@@ -1658,19 +2224,9 @@ class TrainStepMixin:
                                 pos_w = ((1.0 - p) / (p + eps)).clamp(1.0, 20.0)
                                 import torch.nn.functional as F
                                 base_loss = F.binary_cross_entropy_with_logits(hand_logits_batch, tgt, reduction='none')
-                                # Focal項
-                                try:
-                                    gamma = float(self.config.get('hand_focal_gamma', 2.0))
-                                except Exception:
-                                    gamma = 2.0
-                                if gamma and gamma > 0.0:
-                                    p_sig = torch.sigmoid(hand_logits_batch)
-                                    pt = p_sig * tgt + (1.0 - p_sig) * (1.0 - tgt)
-                                    focal = (1.0 - pt).clamp(min=1e-4).pow(gamma)
-                                else:
-                                    focal = 1.0
                                 w_class = 1.0 + (pos_w - 1.0) * tgt
-                                final_loss = (base_loss * focal * w_class * mask).sum() / (active + eps)
+                                # No focal term: use standard BCE with dynamic class weighting and mask
+                                final_loss = (base_loss * w_class * mask).sum() / (active + eps)
                             except Exception:
                                 import torch.nn as _nn
                                 final_loss = _nn.BCEWithLogitsLoss(reduction='mean')(hand_logits_batch, tgt)
@@ -1716,17 +2272,25 @@ class TrainStepMixin:
                         legal_actions = None
                     except Exception:
                         legal_actions = None
-                if 'pi_q' in sample and sample.get('pi_format') == 'u16_norm65535':
+                if 'pi_q' in sample:
+                    pf = sample.get('pi_format')
                     try:
-                        import numpy as _np
-                        pi_q = sample['pi_q']
-                        pi_arr = pi_q.astype(_np.float32) if hasattr(pi_q, 'astype') else _np.asarray(list(pi_q), dtype=_np.float32)
-                        s_q = float(pi_arr.sum())
-                        if s_q <= 0:
-                            pi_target = [1.0 / len(pi_arr)] * int(len(pi_arr)) if len(pi_arr) > 0 else []
-                        else:
-                            pi_target = (pi_arr / s_q).tolist()
+                        is_u16 = bool(pf == 'u16_norm65535')
                     except Exception:
+                        is_u16 = str(pf) == 'u16_norm65535'
+                    if is_u16:
+                        try:
+                            import numpy as _np
+                            pi_q = sample['pi_q']
+                            pi_arr = pi_q.astype(_np.float32) if hasattr(pi_q, 'astype') else _np.asarray(list(pi_q), dtype=_np.float32)
+                            s_q = float(pi_arr.sum())
+                            if s_q <= 0:
+                                pi_target = [1.0 / len(pi_arr)] * int(len(pi_arr)) if len(pi_arr) > 0 else []
+                            else:
+                                pi_target = (pi_arr / s_q).tolist()
+                        except Exception:
+                            pi_target = sample.get('pi')
+                    else:
                         pi_target = sample.get('pi')
                 else:
                     pi_target = sample.get('pi')
@@ -1926,19 +2490,9 @@ class TrainStepMixin:
                                 p = (pos_area / (active + eps)).clamp(min=eps, max=1.0)
                                 pos_w = ((1.0 - p) / (p + eps)).clamp(1.0, 20.0)
                                 base_loss = F.binary_cross_entropy_with_logits(hand_logits.float(), tgt, reduction='none')
-                                # Focal term (1 - pt)^gamma applied only to hand prediction
-                                try:
-                                    gamma = float(self.config.get('hand_focal_gamma', 2.0))
-                                except Exception:
-                                    gamma = 2.0
-                                if gamma and gamma > 0.0:
-                                    p_hat = torch.sigmoid(hand_logits.float())
-                                    pt = p_hat * tgt + (1.0 - p_hat) * (1.0 - tgt)
-                                    focal = (1.0 - pt).clamp(min=1e-4).pow(gamma)
-                                else:
-                                    focal = 1.0
+                                # Focal term removed: use standard BCE with dynamic class weighting and mask
                                 w_class = 1.0 + (pos_w - 1.0) * tgt
-                                hloss = (base_loss * focal * w_class * mask_sample).sum() / (active + eps)
+                                hloss = (base_loss * w_class * mask_sample).sum() / (active + eps)
                             except Exception:
                                 import torch.nn as _nn
                                 hloss = _nn.BCEWithLogitsLoss(reduction='mean')(hand_logits.float(), tgt)
@@ -2366,7 +2920,7 @@ class TrainStepMixin:
             weight_norm = None
 
         # Debug: quantify value_head update magnitude (delta)
-        if bool(self.config.get('debug_value_flow', True)) and bool(self.config.get('debug_value_delta_in_train_step', False)):
+        if bool(self.config.get('debug_value_flow', False)) and bool(self.config.get('debug_value_delta_in_train_step', False)):
             try:
                 import math as _m
 
